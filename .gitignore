@@ -4,6 +4,12 @@ dist/
 *.zip
 *.o
 
+# ───────── CMake ─────────
+build-cmake/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+
 # ───────── 第三方依赖 ─────────
 node_modules/
 

@@ -47,7 +47,30 @@ floral/
 
 ## 编译
 
-需要 **MinGW-w64 g++**（含 `windres`）。在仓库根目录：
+### 方式一：CMake（推荐，MinGW / MSVC 都行）
+
+```powershell
+# MinGW（Ninja 或 Makefiles 都可以）
+cmake -S . -B build-cmake -G Ninja -DFLORAL_PORTABLE=ON
+cmake --build build-cmake
+
+# 装好 Visual Studio Build Tools 之后，用 MSVC 编
+cmake -S . -B build-cmake -G "Visual Studio 17 2022" -DFLORAL_PORTABLE=ON
+cmake --build build-cmake --config Release
+```
+
+两个版本一起编：
+
+```powershell
+.\scripts\build-cmake.ps1
+```
+
+CMake 选项：`-DFLORAL_PORTABLE=ON`（静态运行库）、`-DFLORAL_NO_TOGETHER=ON`（去掉一起听）、
+`-DFLORAL_EMBED_SERVICES=OFF`（不内嵌接口服务）。
+
+### 方式二：PowerShell 脚本（MinGW）
+
+需要 **MinGW-w64 g++**（含 ``windres``）。在仓库根目录：
 
 ```powershell
 # 开发版
