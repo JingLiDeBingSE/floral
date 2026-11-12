@@ -1,4 +1,4 @@
-# 编译 Floral（C++ / Win32 + Direct2D）
+﻿# 编译 Floral（C++ / Win32 + Direct2D）
 #
 #   从仓库根目录执行：
 #     .\scripts\build.ps1                       开发版

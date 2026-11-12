@@ -1,4 +1,4 @@
-# 打包 Floral
+﻿# 打包 Floral
 #
 #   .\scripts\pack.ps1          普通版（不含一起听）→ Floral-便携版.zip
 #   .\pack.ps1 -NoTogether      同上

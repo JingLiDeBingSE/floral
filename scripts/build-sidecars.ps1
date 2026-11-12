@@ -1,4 +1,4 @@
-# 组装 sidecars.zip：node 运行时 + 网易云 / QQ / 一起听 三个本地服务
+﻿# 组装 sidecars.zip：node 运行时 + 网易云 / QQ / 一起听 三个本地服务
 #   .\build-sidecars.ps1
 #
 # 产物：build\sidecars.zip（由 src/app.rc 内嵌进 exe）
