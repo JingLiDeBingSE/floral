@@ -7,6 +7,7 @@
 #include "audio.h"
 
 #include <wininet.h>
+#include <winsock2.h>
 #include <thread>
 #include <mutex>
 #include <map>
@@ -1361,6 +1362,9 @@ static std::wstring SidecarRoot() { return LocalDir() + L"\\sidecars"; }
 #define SIDECARS_VERSION L"2026-11-07-1"
 
 static bool ExtractSidecars() {
+    // The listen-together helper and the NetEase/QQ services may start on different threads at once
+    static std::mutex mx;
+    std::lock_guard<std::mutex> lk(mx);
     std::wstring root = SidecarRoot();
     CreateDirectoryW(root.c_str(), nullptr);
     std::wstring okFile = root + L"\\.ok";
@@ -2385,11 +2389,36 @@ static std::wstring LocalDir() {
     return d;
 }
 
-/** Make sure 127.0.0.1:3000 is served: check whether it's already running, else unpack the embedded exe and start it */
+/* Whether a local service accepts connections on the port. Windows reports a refused
+   connection only after retrying for about 2 s, so a short wait decides it instead */
+static bool PortListening(unsigned short port) {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+    bool listening = false;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s != INVALID_SOCKET) {
+        u_long nonBlocking = 1;
+        ioctlsocket(s, FIONBIO, &nonBlocking);
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        connect(s, (const sockaddr*)&addr, sizeof(addr));
+        fd_set connected;
+        FD_ZERO(&connected);
+        FD_SET(s, &connected);
+        timeval wait = { 0, 200 * 1000 };
+        listening = select(0, nullptr, &connected, nullptr, &wait) == 1;
+        closesocket(s);
+    }
+    WSACleanup();
+    return listening;
+}
+
 /* Start a Node-style sidecar: skip if already running, else unpack and launch it, then wait for the port */
 static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
-                             const wchar_t* probe, HANDLE* procOut, const char* name) {
-    if (!HttpGet(probe).empty()) return true;              // already running
+                             unsigned short port, HANDLE* procOut, const char* name) {
+    if (PortListening(port)) return true;                  // already running
 
     if (!ExtractSidecars()) {
         Logf("ERR", "%s：sidecars 解压失败", name);
@@ -2413,44 +2442,46 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
     if (procOut) *procOut = pi.hProcess; else CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    for (int i = 0; i < 80; i++) {                        // wait up to 20s
-        if (!HttpGet(probe).empty()) break;
+    for (int i = 0; i < 80; i++) {                        // wait up to about 36 s
+        if (PortListening(port)) break;
         Sleep(250);
     }
     Logf("APP", "%s 已启动", name);
     return true;
 }
 
-static void EnsureSidecar() {
-    // Both the startup thread and login threads call this; concurrent calls would extract and launch services twice
-    static std::mutex mx;
-    std::lock_guard<std::mutex> lk(mx);
 #ifndef FLORAL_NO_TOGETHER
-    // Listen-together helper: MQTT credentials are passed via environment variables
+/* Listen-together helper: MQTT credentials are passed via environment variables */
+static void StartTogetherHelper() {
     SetEnvironmentVariableW(L"FLORAL_MQTT_HOST", L"k9bf6e3a.ala.cn-shenzhen.emqxsl.cn");
     SetEnvironmentVariableW(L"FLORAL_MQTT_PORT", L"8883");
     SetEnvironmentVariableW(L"FLORAL_MQTT_USER", L"Floral");
     SetEnvironmentVariableW(L"FLORAL_MQTT_PASS", L"qwertyuiop!@#$%^&*()");
     SetEnvironmentVariableW(L"FLORAL_LISTEN_PORT", L"4100");
-    StartNodeSidecar(L"together", L"together-server.js",
-                     L"http://127.0.0.1:4100/health", nullptr, "一起听助手");
+    StartNodeSidecar(L"together", L"together-server.js", 4100, nullptr, "一起听助手");
+}
 #endif
+
+/* Start the API service of the current music source */
+static void EnsureSidecar() {
+    // Both the startup thread and login threads call this; concurrent calls would extract and launch services twice
+    static std::mutex mx;
+    std::lock_guard<std::mutex> lk(mx);
 
     if (g_source == 2) {                                  // QQ
         StartNodeSidecar(L"qq",
                          L"node_modules/@yakult-green-tea/qq-music-api/dist/src/app.js",
-                         L"http://127.0.0.1:3200/", &g_qqProc, "QQ 接口服务");
+                         3200, &g_qqProc, "QQ 接口服务");
         return;
     }
     if (g_source == 1) {                                  // NetEase
         SetEnvironmentVariableW(L"REAL_IP", L"116.25.146.177");   // without this every request is a 502
-        StartNodeSidecar(L"netease", L"server.js",
-                         L"http://127.0.0.1:4000/", &g_apiProc, "网易云接口服务");
+        StartNodeSidecar(L"netease", L"server.js", 4000, &g_apiProc, "网易云接口服务");
         return;
     }
 
     // Kugou: embedded single-file pkg exe, no node needed
-    if (!HttpGet(L"http://127.0.0.1:3000/").empty()) return;
+    if (PortListening(3000)) return;
 
     std::string bytes;
     if (!ReadRes(IDR_KUGOU_API, bytes) || bytes.size() < 100000) return;
@@ -2487,7 +2518,7 @@ static void EnsureSidecar() {
         }
     }
     for (int i = 0; i < 30; i++) {
-        if (!HttpGet(L"http://127.0.0.1:3000/").empty()) break;
+        if (PortListening(3000)) break;
         Sleep(200);
     }
 }
@@ -6701,6 +6732,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             FetchPlaylistsAsync();
         }
     }).detach();
+#ifndef FLORAL_NO_TOGETHER
+    std::thread(StartTogetherHelper).detach();   // login and playlists do not depend on it, so it starts separately
+#endif
     if (!GfxInit()) {
         MessageBoxW(nullptr, T(L"图形初始化失败", L"Graphics init failed"), T(L"错误", L"Error"), MB_ICONERROR);
         return 1;
