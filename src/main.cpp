@@ -4617,8 +4617,7 @@ static void PushLocalState(bool force) {
     TogetherPushState(s.hash,
                       g_source == 2 ? "qq" : (g_source == 1 ? "netease" : "kugou"),
                       posMs, a.playing,
-                      std::string(s.title.begin(), s.title.end()),
-                      std::string(s.artist.begin(), s.artist.end()));
+                      Narrow(s.title), Narrow(s.artist));
 }
 static bool Animate() {
 #ifndef FLORAL_NO_TOGETHER
