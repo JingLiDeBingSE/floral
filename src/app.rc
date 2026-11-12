@@ -1,0 +1,9 @@
+#include "resource.h"
+
+/* 只内嵌「程序」，不内嵌任何歌单数据 / 登录状态 */
+
+/* 酷狗接口服务（pkg 打好的单文件 exe） */
+IDR_KUGOU_API   RCDATA  "../sidecars/kugou-api/bin/app_win.exe"
+
+/* 网易云 / QQ 的接口服务 + node 运行时：首次运行时解压到 %LOCALAPPDATA%\KugouPlayer\sidecars */
+IDR_SIDECARS    RCDATA  "../build/sidecars.zip"

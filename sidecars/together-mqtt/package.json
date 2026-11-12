@@ -1,0 +1,8 @@
+﻿{
+    "private":  true,
+    "name":  "floral-together",
+    "version":  "1.0.0",
+    "dependencies":  {
+                         "mqtt":  "^5.10.1"
+                     }
+}
