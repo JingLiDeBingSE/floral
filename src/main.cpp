@@ -28,10 +28,10 @@
 #include <algorithm>
 
 App g_app;
-static HWND g_hwnd = nullptr;      // 主窗口（用于主动重绘）
+static HWND g_hwnd = nullptr;      // main window (drives explicit redraws)
 
 /* ══════════════════════════════════════════
-   绘制基础设施
+   Drawing infrastructure
    ══════════════════════════════════════════ */
 static ID2D1Factory*          g_d2d    = nullptr;
 static IDWriteFactory*        g_dw     = nullptr;
@@ -40,19 +40,19 @@ static ID2D1RenderTarget*     g_rt     = nullptr;
 static ID2D1SolidColorBrush*  g_brush  = nullptr;
 static ID2D1HwndRenderTarget* g_hwndRt = nullptr;
 
-/** 整层透明度（用于页面切换淡入淡出） */
+/** Whole-layer opacity (for page transition fades) */
 static float g_alpha = 1.0f;
 
-/** 额外的整体透明度倍率（运动模糊的拖影用） */
+/** Extra global opacity multiplier (for motion-blur trails) */
 static float g_alphaMul = 1.0f;
-static float g_plEnter  = 1.0f;   // 歌单页淡入 0→1
-static float g_gridEnter = 1.0f;  // 选歌页进场 0→1
-static bool      g_scrollDrag = false;   // 拖滚动条中
+static float g_plEnter  = 1.0f;   // playlist page fade-in 0→1
+static float g_gridEnter = 1.0f;  // song grid entrance 0→1
+static bool      g_scrollDrag = false;   // dragging the scrollbar
 
-/** 鼠标动过、需要重画（由定时器统一驱动，避免高频鼠标事件打爆重绘） */
+/** Mouse moved, redraw needed (driven by the timer so high-frequency mouse events cannot flood the redraw) */
 static bool g_mouseDirty = false;
 
-/* 面板进出场的统一包装：淡入 + 围绕锚点 0.96→1 缩放；t 小时不接收点击 */
+/* Common wrapper for panel enter/exit: fade + 0.96→1 scale around the anchor; while t is small, clicks are ignored */
 struct PanelFx {
     float  oldMul;
     size_t hitMark;
@@ -70,36 +70,36 @@ struct PanelFx {
     ~PanelFx() {
         if (g_rt) g_rt->SetTransform(D2D1::Matrix3x2F::Identity());
         g_alphaMul = oldMul;
-        // 只裁剪面板内部的按钮：面板刚出现时按钮还小，先不响应\n        if (t < 0.55f && g_app.hits.size() > hitMark) g_app.hits.resize(hitMark);
+        // Clip only the buttons inside the panel: they are still tiny right after it appears, so ignore them for now\n        if (t < 0.55f && g_app.hits.size() > hitMark) g_app.hits.resize(hitMark);
     }
 };
-static std::atomic<bool> g_coverDirty{ false };   // 后台线程解好封面后置位，驱动定时器重绘
+static std::atomic<bool> g_coverDirty{ false };   // set by workers once a cover is decoded; drives timer redraws
 
-/** 滚动后要等鼠标真正动一下，才允许悬停放大（免得滚完自己弹开） */
+/** After scrolling, wait for the mouse to actually move before allowing hover zoom (so it does not pop open by itself) */
 static bool g_hoverArmed = true;
 
-/** 滚动瞬时速度（像素/秒），用于驱动运动模糊 */
+/** Instant scroll velocity (px/s), drives motion blur */
 static float g_scrollVel = 0.0f;
 static float g_prevScroll = 0.0f;
 
-/* 调试用：--fps 在标题栏显示实测帧率 */
+/* Debug: --fps shows the measured frame rate in the title bar */
 static bool g_showFps = false;
 static int  g_paintCount = 0;
 
-/* 开屏动画：logo+文字浮现渐隐 → 曲目从右侧飞入排好 → 标题栏浮现 */
+/* Boot animation: logo+text fade in then out → tracks fly in from the right and settle → title bar appears */
 static float g_introT = 0.0f;
 static bool  g_introDone = false;
-static std::atomic<bool> g_bootRefreshPending{ false };   // 启动时还要刷新歌单
-static bool  g_loadDone  = false;    // 启动资源加载完成（歌单 + 封面）
+static std::atomic<bool> g_bootRefreshPending{ false };   // playlist still needs refreshing at startup
+static bool  g_loadDone  = false;    // startup resources loaded (playlists + covers)
 static float g_loadT     = 0.0f;
 
-static const float SPLASH_IN       = 0.40f;   // logo 淡入
-static const float SPLASH_HOLD_END = 0.75f;   // 停留到这一刻
-static const float SPLASH_OUT      = 1.10f;   // 淡出结束（曲目随即开始）
+static const float SPLASH_IN       = 0.40f;   // logo fade-in
+static const float SPLASH_HOLD_END = 0.75f;   // hold until this moment
+static const float SPLASH_OUT      = 1.10f;   // fade-out ends (tracks start right after)
 static const float INTRO_TILE_START = 1.10f;
-static const float INTRO_STAGGER    = 0.05f;  // 每块间隔
-static const float INTRO_FLY        = 0.42f;  // 单块飞行时长
-static const float INTRO_BAR        = 0.85f;  // 标题栏开始浮现（相对曲目开始）
+static const float INTRO_STAGGER    = 0.05f;  // interval per tile
+static const float INTRO_FLY        = 0.42f;  // flight duration per tile
+static const float INTRO_BAR        = 0.85f;  // title bar starts appearing (relative to track start)
 
 static D2D1_COLOR_F Col(UINT32 rgb, float a = 1.0f) {
     return D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f,
@@ -114,20 +114,20 @@ static bool Inside(const D2D1_RECT_F& r, const POINT& p) {
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
 
-/* 封面配色：8 组莫兰迪渐变色块（浅 → 中） */
+/* Cover palette: 8 Morandi gradient swatches (light → mid) */
 struct CoverPair { UINT32 a, b; };
 static const CoverPair COVERS[8] = {
-    { 0xF9E1E8, 0xE2B3C2 },   // 玫瑰
-    { 0xF3DCE6, 0xD2A8BE },   // 藕荷
-    { 0xE6DDEB, 0xC3B2D2 },   // 灰紫
-    { 0xDCE6EF, 0xB2C4D8 },   // 雾蓝
-    { 0xE3EBE0, 0xBACBB6 },   // 灰绿
-    { 0xEFE6D9, 0xD6C3A8 },   // 沙
-    { 0xF0DED5, 0xD3B3A2 },   // 灰橙
-    { 0xE9E3E9, 0xC0B0BE },   // 灰粉
+    { 0xF9E1E8, 0xE2B3C2 },   // rose
+    { 0xF3DCE6, 0xD2A8BE },   // mauve
+    { 0xE6DDEB, 0xC3B2D2 },   // gray violet
+    { 0xDCE6EF, 0xB2C4D8 },   // mist blue
+    { 0xE3EBE0, 0xBACBB6 },   // sage
+    { 0xEFE6D9, 0xD6C3A8 },   // sand
+    { 0xF0DED5, 0xD3B3A2 },   // clay
+    { 0xE9E3E9, 0xC0B0BE },   // blush
 };
 
-/* 封面图片缓存 */
+/* Cover image cache */
 struct CoverSrc { std::wstring path; IWICFormatConverter* conv = nullptr; };
 static std::vector<CoverSrc> g_coverSrcs;
 
@@ -135,11 +135,11 @@ struct CoverBmp {
     IWICFormatConverter* src = nullptr;
     ID2D1RenderTarget* rt = nullptr;
     ID2D1Bitmap* bmp = nullptr;
-    ID2D1BitmapBrush* brush = nullptr;   // 圆角填充用，避免每帧建 Layer
+    ID2D1BitmapBrush* brush = nullptr;   // for rounded fills; avoids creating a Layer every frame
 };
 static std::vector<CoverBmp> g_coverBmps;
 
-/* 文本格式缓存 */
+/* Text format cache */
 struct FmtEntry { float size; DWRITE_FONT_WEIGHT weight; IDWriteTextFormat* f; };
 static std::vector<FmtEntry> g_fmts;
 
@@ -156,7 +156,7 @@ static IDWriteTextFormat* Fmt(float size, DWRITE_FONT_WEIGHT weight) {
     return f;
 }
 
-/** 两个颜色按比例混合 */
+/** Blend two colors by ratio */
 static UINT32 MixColor(UINT32 a, UINT32 b, float t) {
     int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
     int br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
@@ -166,7 +166,7 @@ static UINT32 MixColor(UINT32 a, UINT32 b, float t) {
     return (UINT32)((r << 16) | (g << 8) | bl);
 }
 
-/** 用当前主题色生成 8 组占位渐变（没有封面时用） */
+/** Build 8 placeholder gradients from the current theme (used when there is no cover) */
 static ID2D1LinearGradientBrush* g_covBrush[8] = { nullptr };
 static void BuildCoverBrushes(ID2D1RenderTarget* rt) {
     for (int i = 0; i < 8; i++) {
@@ -175,7 +175,7 @@ static void BuildCoverBrushes(ID2D1RenderTarget* rt) {
     if (!rt) return;
 
     for (int i = 0; i < 8; i++) {
-        // 浅端在 SELECT/ACCENT 之间来回，深端压到底色系
+        // light end oscillates between SELECT/ACCENT; dark end is pressed toward the base palette
         float t1 = 0.25f + 0.10f * (i % 4);
         float t2 = 0.55f + 0.08f * ((i / 2) % 3);
         UINT32 lite = MixColor(UI::ACCENT, UI::PANEL, t1);
@@ -200,13 +200,13 @@ static void BuildCoverBrushes(ID2D1RenderTarget* rt) {
     }
 }
 
-/* 封面占位渐变画刷：8 个，按渲染目标缓存，避免每帧重建 */
+/* Cover placeholder gradient brushes: 8, cached per render target to avoid rebuilding every frame */
 
-/* 封面淡入：记录每张图"第一次能画"的时刻，150ms 内从 0 淡到 1 */
+/* Cover fade-in: records when each image first becomes drawable, fading 0→1 over 150ms */
 static std::map<std::wstring, ULONGLONG> g_coverSeen;
 
-static bool  g_noCoverFade = false;     // 截图模式：不淡入，直接满
-static float g_coverFadeOverride = -1.0f;  // 截图模式：定格淡入进度
+static bool  g_noCoverFade = false;     // screenshot mode: no fade-in, straight to full
+static float g_coverFadeOverride = -1.0f;  // screenshot mode: freeze fade progress
 
 static void MarkCoverReady(const std::wstring& path) {
     if (path.empty()) return;
@@ -218,7 +218,7 @@ static float CoverFade(const std::wstring& path) {
     if (g_coverFadeOverride >= 0.0f) return g_coverFadeOverride;
     if (g_noCoverFade || path.empty()) return 1.0f;
     auto it = g_coverSeen.find(path);
-    if (it == g_coverSeen.end()) return 1.0f;        // 没记录：当作早就好了
+    if (it == g_coverSeen.end()) return 1.0f;        // not recorded: treat as ready long ago
     float t = (float)(GetTickCount64() - it->second) / 150.0f;
     return t >= 1.0f ? 1.0f : t;
 }
@@ -229,7 +229,7 @@ static void Bind(ID2D1RenderTarget* rt) {
     for (int i = 0; i < 8; i++) {
         if (g_covBrush[i]) { g_covBrush[i]->Release(); g_covBrush[i] = nullptr; }
     }
-    // 位图/画刷都绑定在渲染目标上，换目标要重建
+    // bitmaps/brushes are bound to the render target, so rebuild them when it changes
     for (auto& b : g_coverBmps) {
         if (b.brush) b.brush->Release();
         if (b.bmp) b.bmp->Release();
@@ -330,7 +330,7 @@ static void Text(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F&
     g_rt->DrawTextW(s.c_str(), (UINT32)s.size(), f, r, g_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
-/* 单行文字，超出部分省略号（歌单卡片里用） */
+/* Single line of text, ellipsized when it overflows (used in playlist cards) */
 static void TextEllipsis(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F& r,
                          UINT32 c, float a = 1.0f) {
     if (!f || !g_brush || !g_dw || s.empty()) return;
@@ -341,7 +341,7 @@ static void TextEllipsis(const std::wstring& s, IDWriteTextFormat* f, const D2D1
     D2D1_POINT_2F origin = D2D1::Point2F(r.left, r.top);
     g_brush->SetColor(Col(c, a));
 
-    // 先量一遍：放得下就直接画，放不下才做省略号
+    // measure first: draw directly if it fits, only trim when it does not
     DWRITE_TEXT_METRICS tm{};
     bool fits = SUCCEEDED(layout->GetMetrics(&tm)) && tm.widthIncludingTrailingWhitespace <= (r.right - r.left) + 0.5f;
     if (!fits) {
@@ -364,17 +364,17 @@ static std::wstring FormatTime(int sec) {
 }
 
 /* ══════════════════════════════════════════
-   网格布局（不规则拼块）
+   Grid layout (irregular tiles)
    ══════════════════════════════════════════ */
 struct TileBox {
-    float x, y, w, h;    // 相对内容原点（未减滚动）
-    int cw, ch;          // 占几个格子
+    float x, y, w, h;    // relative to the content origin (scroll not subtracted)
+    int cw, ch;          // how many cells it spans
 };
 
-/* 三份布局：
- *   g_base   —— 不含悬停，稳定，用于鼠标命中
- *   g_target —— 含悬停（该块撑到 2×2），其余块被挤开
- *   g_draw   —— 动画中的当前值，绘制用
+/* Three layouts:
+ *   g_base   —— no hover, stable, used for mouse hit-testing
+ *   g_target —— with hover (that tile grows to 2×2), the other tiles pushed aside
+ *   g_draw   —— current animated values, used for drawing
  */
 static std::vector<TileBox> g_base, g_target, g_draw;
 static float g_baseHeight = 0.0f;
@@ -384,19 +384,19 @@ static float g_layoutWidth = -1.0f;
 static int   g_layoutHover = -2;
 static bool  g_layoutDirty = false;
 
-/* 悬停块：原地锚定放大（不重排，避免整块跳到别处），靠边时朝中间长 */
+/* Hover tile: grows in place from its anchor (no reflow, so it does not jump elsewhere); near an edge it grows toward the center */
 static float g_cellSize = 140.0f;
 static int   g_colsNow = 6;
-static int   g_hvIdx = -1;               // 正在动画的悬停块
+static int   g_hvIdx = -1;               // hover tile currently animating
 static D2D1_RECT_F g_hvCur{};
 static D2D1_RECT_F g_hvTarget{};
-static bool  g_snapUI = false;           // 离屏截图时直接到终态
+static bool  g_snapUI = false;           // jump straight to the final state for offscreen screenshots
 
-/* 纵向分条索引：每帧只处理视口附近的那几条，不再扫全部 2000 块 */
+/* Vertical band index: each frame only touches the bands near the viewport instead of scanning all 2000 tiles */
 static const float BAND_H = 220.0f;
 static std::vector<std::vector<int>> g_baseBands, g_tgtBands;
 
-/* 本帧可见块（去重用 stamp） */
+/* Tiles visible this frame (deduplicated with a stamp) */
 static std::vector<int> g_vis;
 static std::vector<uint32_t> g_stamp;
 static uint32_t g_stampVal = 0;
@@ -410,7 +410,7 @@ static inline uint32_t Hash32(uint32_t x) {
     return x;
 }
 
-/** 每块占几格：大部分 1×1，少量横向/纵向长的，极少数 2×2 */
+/** Cells per tile: mostly 1×1, a few wide/tall ones, very rarely 2×2 */
 static void PickSize(int i, int cols, int& cw, int& ch) {
     int r = (int)(Hash32((uint32_t)i * 2654435761u) % 100u);
     if (cols >= 2 && r < 3)       { cw = 2; ch = 2; }
@@ -419,8 +419,8 @@ static void PickSize(int i, int cols, int& cw, int& ch) {
     else                          { cw = 1; ch = 1; }
 }
 
-/** 打包：hoverIdx 那块撑到 2×2，并锚定在 hoverCol 这一列（靠边缘时朝中间长）；
- *  其余块按最低空位顺延，自然被挤开。 */
+/** Packing: the hoverIdx tile grows to 2×2 and is anchored to column hoverCol (growing toward the center near an edge);
+ *  the other tiles shift to the lowest free slot and are pushed aside naturally. */
 static void PackLayout(float W, int count, int hoverIdx, int hoverCol,
                        std::vector<TileBox>& out, float& totalHeight) {
     int cols = (int)((W - UI::PAD * 2 + UI::GAP) / 150.0f);
@@ -447,7 +447,7 @@ static void PackLayout(float W, int count, int hoverIdx, int hoverCol,
             if (cw > cols) cw = cols;
         }
 
-        // 锚定列：右边缘往左长，其余往右长
+        // anchor column: grow leftward at the right edge, rightward otherwise
         int anchorCol = -1;
         if (anchored) {
             anchorCol = (std::min)(hoverCol < 0 ? 0 : hoverCol, cols - cw);
@@ -483,7 +483,7 @@ static void PackLayout(float W, int count, int hoverIdx, int hoverCol,
     totalHeight = rows * (cell + UI::GAP) - UI::GAP;
 }
 
-/** 把块按纵向分条，绘制/命中时只取相关条（复用容量，避免每次重排重分配） */
+/** Split tiles into vertical bands so drawing/hit-testing only reads the relevant ones (reuses capacity to avoid reallocating on every relayout) */
 static void BuildBands(const std::vector<TileBox>& boxes, std::vector<std::vector<int>>& bands) {
     if (boxes.empty()) { bands.clear(); return; }
 
@@ -492,7 +492,7 @@ static void BuildBands(const std::vector<TileBox>& boxes, std::vector<std::vecto
     int nb = (int)(maxY / BAND_H) + 1;
 
     if ((int)bands.size() != nb) bands.resize((size_t)nb);
-    for (auto& v : bands) v.clear();          // clear 保留 capacity
+    for (auto& v : bands) v.clear();          // clear keeps capacity
 
     for (int i = 0; i < (int)boxes.size(); i++) {
         const TileBox& b = boxes[(size_t)i];
@@ -510,14 +510,14 @@ static void EnsureBase(float W, int count) {
     BuildBands(g_base, g_baseBands);
     g_layoutCount = count;
     g_layoutWidth = W;
-    g_layoutHover = -2;                 // 强制重算目标
+    g_layoutHover = -2;                 // force the target layout to be recomputed
 }
 
 static void EnsureTarget(float W, int count, int hoverIdx) {
     EnsureBase(W, count);
     if (hoverIdx == g_layoutHover) return;
 
-    // 取这块在基础布局里的列，作为放大后的锚定列
+    // take this tile's column in the base layout as the anchor column after growing
     int hcol = -1;
     if (hoverIdx >= 0 && hoverIdx < (int)g_base.size()) {
         float pitch = g_cellSize + UI::GAP;
@@ -535,15 +535,15 @@ static void EnsureTarget(float W, int count, int hoverIdx) {
     }
 }
 
-/** 鼠标落在哪个块上（-1 表示没有）
- *  先判当前悬停块放大后的整块区域，否则放大出来的地方会被算到邻居头上 */
+/** Which tile the mouse is over (-1 = none)
+ *  Check the hovered tile's whole grown area first, otherwise the region it grew into would be attributed to its neighbours */
 static int HitTile(POINT p) {
     App& a = g_app;
     if (a.songs.empty()) return -1;
     if (p.y < GRID_TOP - 6) return -1;
     EnsureBase(a.width, (int)a.songs.size());
 
-    // 1) 已悬停的块：放大区域整体都算它的（用目标矩形，稳定不抖）
+    // 1) hovered tile: its whole grown area belongs to it (target rect, stable, no jitter)
     int cur = a.hoverTile;
     if (cur >= 0 && cur < (int)g_target.size()) {
         const TileBox& h = g_target[(size_t)cur];
@@ -551,7 +551,7 @@ static int HitTile(POINT p) {
         if (Inside(hr, p)) return cur;
     }
 
-    // 2) 其余按基础布局命中（分条查，不扫全表）
+    // 2) everything else hits the base layout (band lookup, no full scan)
     float cy = (float)p.y - GRID_TOP + a.scroll;
     int band = (int)(cy / BAND_H);
     if (band < 0 || band >= (int)g_baseBands.size()) return -1;
@@ -565,18 +565,18 @@ static int HitTile(POINT p) {
 }
 
 /* ══════════════════════════════════════════
-   封面
+   Covers
    ══════════════════════════════════════════ */
-/* ───────── 后台解码线程 ─────────
-   WIC 解码一张 400px 的 JPEG 要 2~4ms，放在 UI 线程上滚屏就是灾难。
-   这里改成后台线程解码，主线程只负责把解好的结果包成 D2D 位图。
+/* ───────── Background decode threads ─────────
+   Decoding a 400px JPEG with WIC takes 2~4ms; on the UI thread that is a disaster while scrolling.
+   So decoding runs on worker threads and the main thread only wraps the result into a D2D bitmap.
    ─────────────────────────────── */
 static std::mutex  g_decMutex;
 static std::deque<std::wstring> g_decQueue;
 static std::vector<std::pair<std::wstring, IWICFormatConverter*>> g_decDone;
 static std::vector<std::thread> g_decThreads;
 static std::atomic<bool> g_decRun{ false };
-static std::set<std::wstring> g_decRequested;      // 主线程独占
+static std::set<std::wstring> g_decRequested;      // main thread only
 
 static IWICFormatConverter* DecodeScaled(IWICImagingFactory* wic,
                                          const std::wstring& path, UINT maxSize) {
@@ -642,7 +642,7 @@ static void DecodeWorkerMain() {
             std::lock_guard<std::mutex> lk(g_decMutex);
             g_decDone.emplace_back(std::move(path), conv);
         }
-        g_coverDirty = true;            // 通知界面：有新封面可以用了
+        g_coverDirty = true;            // tell the UI a new cover is ready
     }
 
     if (wic) wic->Release();
@@ -657,21 +657,21 @@ static void QueueDecode(const std::wstring& path) {
     g_decQueue.push_back(path);
 }
 
-/* ── 封面按需下载：列表里没本地封面的歌，滚动到就下 ── */
+/* ── On-demand cover download: songs whose cover is not local are fetched when scrolled into view ── */
 static std::string  HttpGet(const std::wstring& url);
 static std::wstring FindProjectFile(const std::wstring& name);
 static std::wstring Widen(const std::string& s);
 
-/* 队列里带的是 url/hash 的副本，工作线程完全不碰 g_app（避免和清缓存/重载抢数据） */
+/* The queue carries copies of url/hash; worker threads never touch g_app (avoids racing cache clears/reloads) */
 struct CovJob {
     int         idx;
     std::string url;
     std::string hash;
 };
 
-extern std::string g_token, g_userid;   // 定义在下面
+extern std::string g_token, g_userid;   // defined below
 
-/* 歌单列表的跨线程交接 */
+/* Cross-thread hand-off of the playlist list */
 static std::mutex          g_plMx;
 static std::vector<Playlist> g_plPending;
 static std::atomic<bool>   g_plReady{ false };
@@ -679,7 +679,7 @@ static std::atomic<bool>   g_plReady{ false };
 static std::mutex        g_covMx;
 static std::vector<CovJob> g_covQueue;
 static std::vector<int>  g_covDone;
-static std::vector<char> g_covFlag;      // 0 未处理 / 1 排队中 / 2 处理过
+static std::vector<char> g_covFlag;      // 0 pending / 1 queued / 2 processed
 
 static std::wstring AssetDir() {
     std::wstring p = FindProjectFile(L"kugou-likes.tsv");
@@ -712,16 +712,16 @@ static void CoverWorkerMain() {
             std::lock_guard<std::mutex> lk(g_covMx);
             g_covDone.push_back(job.idx);
         }
-        g_coverDirty = true;            // 下载完了，叫界面来收
+        g_coverDirty = true;            // download finished, ask the UI to pick it up
     }
 }
 
 /* ══════════════════════════════════════════
-   歌单列表（选择页用）
+   Playlist list (for the picker page)
    ══════════════════════════════════════════ */
 static std::wstring PlaylistsFile() { return AssetDir() + L"\\playlists.tsv"; }
 
-/* ── 界面语言 ── */
+/* ── UI language ── */
 static std::wstring LangFile() { return AssetDir() + L"\\lang.txt"; }
 static void LoadLang() {
     FILE* f = nullptr;
@@ -753,7 +753,7 @@ static void LoadPlaylists() {
         std::string s = line;
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
         if (s.empty()) continue;
-        if (first && s.rfind("name\t", 0) == 0) { first = false; continue; }   // 表头
+        if (first && s.rfind("name\t", 0) == 0) { first = false; continue; }   // header row
         first = false;
         // name \t gcid \t count \t coverUrl
         std::vector<std::string> col;
@@ -795,7 +795,7 @@ static void SavePlaylists() {
     fclose(f);
 }
 
-/* ── 歌单封面：路径按 gcid 派生，文件存在就直接解码 ── */
+/* ── Playlist covers: path derived from gcid, decode directly if the file exists ── */
 static std::wstring PlCoverPath(const Playlist& pl) {
     std::string h = pl.gcid;
     for (char& c : h) if (!(isalnum((unsigned char)c) || c == '_' || c == '-')) c = '_';
@@ -816,12 +816,12 @@ static void RequestPlaylistCover(int i) {
         QueueDecode(path);
         return;
     }
-    if (g_plCovBusy.load() >= 4) return;      // 同时最多 4 个
+    if (g_plCovBusy.load() >= 4) return;      // at most 4 at a time
 
     g_plCovAsked.insert(pl.gcid);
     g_plCovBusy.fetch_add(1);
     std::string url = pl.coverUrl;
-    // 接口给的地址里有 {size} 占位符，换成实际尺寸
+    // the URL from the API has a {size} placeholder; substitute the actual size
     size_t szp = url.find("{size}");
     if (szp != std::string::npos) url.replace(szp, 6, "400");
     std::thread([url, path]() {
@@ -837,14 +837,14 @@ static void RequestPlaylistCover(int i) {
         g_coverDirty = true;
     }).detach();
 }
-/* 后台线程：从接口拉全部歌单并落盘 */
+/* Worker thread: fetch all playlists from the API and write them to disk */
 static void FetchPlaylistsAsync() {
     if (g_token.empty()) return;
     std::vector<KgPlaylist> got;
     std::wstring err;
     int n = KgFetchPlaylists(g_token, g_userid, got, err);
     if (n <= 0) {
-        g_bootRefreshPending = false;   // 失败也别把开屏卡住
+        g_bootRefreshPending = false;   // never hold up the splash screen, even on failure
         Logf("ERR", "拉歌单列表失败: %s", Narrow(err).c_str());
         return;
     }
@@ -861,11 +861,11 @@ static void FetchPlaylistsAsync() {
         g_plPending.push_back(std::move(pl));
     }
     g_plReady = true;
-    g_bootRefreshPending = false;       // 首屏只等这一件事
+    g_bootRefreshPending = false;       // the first screen waits on this alone
     Logf("APP", "歌单列表拉取完成 %d 个", n);
 }
-/** 主线程：把下好的封面接进缓存 */
-/** 还有没有封面相关的活没干完（定时器据此保持重绘） */
+/** Main thread: adopt downloaded covers into the cache */
+/** Is there any cover work left (the timer keeps redrawing while there is) */
 static bool CoverWorkPending() {
     {
         std::lock_guard<std::mutex> lk(g_covMx);
@@ -894,10 +894,10 @@ static void DrainCovers() {
         }
         if (i < (int)g_covFlag.size()) g_covFlag[(size_t)i] = 2;
     }
-    g_coverDirty = true;                // 有新封面进了解码队列
+    g_coverDirty = true;                // a new cover entered the decode queue
 }
 
-/** 视口里的歌如果没封面就排队下载（只在这里读 g_app，工作线程拿的是副本） */
+/** Queue a download for viewport songs without a cover (g_app is read only here; workers get copies) */
 static void RequestVisibleCovers() {
     std::lock_guard<std::mutex> lk(g_covMx);
     if (g_covFlag.size() != g_app.songs.size()) return;
@@ -914,7 +914,7 @@ static void RequestVisibleCovers() {
 static void StartDecoder() {
     if (g_decRun.load()) return;
     g_decRun.store(true);
-    // 按核数开，最多 8 个（解码是纯 CPU，WIC 每线程一个工厂）
+    // one per core, max 8 (decoding is pure CPU; WIC needs one factory per thread)
     unsigned n = std::thread::hardware_concurrency();
     if (n == 0) n = 4;
     if (n > 8) n = 8;
@@ -933,7 +933,7 @@ static void StopDecoder() {
     g_decQueue.clear();
 }
 
-/** 主线程：把后台解好的封面搬进缓存 */
+/** Main thread: move decoded covers into the cache */
 static void DrainDecoded() {
     std::vector<std::pair<std::wstring, IWICFormatConverter*>> tmp;
     {
@@ -942,18 +942,18 @@ static void DrainDecoded() {
         tmp.swap(g_decDone);
     }
     for (auto& p : tmp) { MarkCoverReady(p.first); g_coverSrcs.push_back({ std::move(p.first), p.second }); }
-    g_mouseDirty = true;              // 有新封面可用，触发一次重绘
+    g_mouseDirty = true;              // a new cover is available, trigger a redraw
 }
 
-static IWICFormatConverter* CoverSource(const std::wstring& path);   // 前置声明
+static IWICFormatConverter* CoverSource(const std::wstring& path);   // forward declaration
 
-/** 首屏封面是否都解好了（用于开屏多等一会儿） */
+/** Whether all first-screen covers are decoded (used to wait a little longer on the splash) */
 static bool CoversReadyForFirstScreen() {
-    // 启动只加载歌单封面，歌曲封面等真正进歌单时再按需解码
+    // startup loads only playlist covers; song covers are decoded on demand when the playlist is entered
     return true;
 }
-/** 把磁盘上已存在的封面补回 s.cover 并排进解码队列
-    之前只认 TSV 第 5 列，而导出的 tsv 这列是空的，导致已下载的封面被当成没有 */
+/** Re-adopt covers already on disk into s.cover and queue them for decoding
+    Previously only column 5 of the TSV was trusted, but exported tsv leaves it empty, so already-downloaded covers were treated as missing */
 static void AdoptLocalCovers() {
     int adopted = 0;
     for (int i = 0; i < (int)g_app.songs.size(); i++) {
@@ -962,13 +962,13 @@ static void AdoptLocalCovers() {
         std::wstring p = AssetDir() + L"\\covers\\" +
                          std::wstring(s.hash.begin(), s.hash.end()) + L".jpg";
         if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-        s.cover = p;            // 只记路径；解码等真正要画这张封面时再做
+        s.cover = p;            // path only; decode when the cover actually has to be drawn
         adopted++;
     }
     if (adopted) Logf("APP", "复用本地封面 %d 张", adopted);
 }
-/* 预建 D2D 位图：滚动时就不用现场创建+上传显存了 */
-static IWICFormatConverter* CoverSource(const std::wstring& path);   // 定义在后面
+/* Pre-build D2D bitmaps so scrolling does not create and upload them on the spot */
+static IWICFormatConverter* CoverSource(const std::wstring& path);   // defined below
 static CoverBmp* CoverEntry(const std::wstring& path);
 static size_t g_prewarmIdx = 0;
 static void PrewarmCovers(int budget) {
@@ -977,12 +977,12 @@ static void PrewarmCovers(int budget) {
     while (g_prewarmIdx < g_app.songs.size() && made < budget) {
         const Song& s = g_app.songs[g_prewarmIdx++];
         if (s.cover.empty()) continue;
-        if (!CoverSource(s.cover)) continue;      // 还没解好，下一轮再看
+        if (!CoverSource(s.cover)) continue;      // not decoded yet, try again next round
         if (CoverEntry(s.cover)) made++;
     }
 }
 
-/** 取封面（已解码才有） */
+/** Get a cover (only once decoded) */
 static IWICFormatConverter* CoverSource(const std::wstring& path) {
     if (path.empty()) return nullptr;
     for (auto& c : g_coverSrcs) if (c.path == path) return c.conv;
@@ -993,7 +993,7 @@ static ID2D1Bitmap* CoverBitmap(const std::wstring& path);
 static CoverBmp* CoverEntry(const std::wstring& path) {
     IWICFormatConverter* src = CoverSource(path);
     if (!src) {
-        QueueDecode(path);           // 还没解好：丢给后台，先画占位
+        QueueDecode(path);           // not decoded yet: hand it to the background, draw the placeholder meanwhile
         return nullptr;
     }
     for (auto& b : g_coverBmps)
@@ -1009,7 +1009,7 @@ static CoverBmp* CoverEntry(const std::wstring& path) {
     return &e;
 }
 
-/** 用位图画刷填充圆角矩形 —— 不用 Layer，比 PushLayer 快一个数量级 */
+/** Fill a rounded rect with a bitmap brush — no Layer, an order of magnitude faster than PushLayer */
 
 static void DrawBitmapRounded(CoverBmp* e, const D2D1_RECT_F& r, float rad, float alpha = 1.0f) {
     if (!e || !e->bmp) return;
@@ -1017,7 +1017,7 @@ static void DrawBitmapRounded(CoverBmp* e, const D2D1_RECT_F& r, float rad, floa
         D2D1_BITMAP_BRUSH_PROPERTIES props = D2D1::BitmapBrushProperties(
             D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP);
         if (FAILED(g_rt->CreateBitmapBrush(e->bmp, &props, nullptr, &e->brush))) {
-            // 画刷创建失败就直接铺矩形，至少不卡
+            // if the brush cannot be created, just draw the rect; at least it does not stall
             g_rt->DrawBitmap(e->bmp, &r, g_alpha * g_alphaMul * alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             return;
         }
@@ -1025,7 +1025,7 @@ static void DrawBitmapRounded(CoverBmp* e, const D2D1_RECT_F& r, float rad, floa
     D2D1_SIZE_F sz = e->bmp->GetSize();
     if (sz.width <= 0.0f || sz.height <= 0.0f) return;
 
-    // 等比裁切（cover）：取较大缩放比铺满，再居中裁掉溢出，绝不拉伸变形
+    // cover-fit: scale by the larger ratio to fill, then center-crop the overflow; never stretch
     float rw = r.right - r.left;
     float rh = r.bottom - r.top;
     float sc = (std::max)(rw / sz.width, rh / sz.height);
@@ -1034,18 +1034,18 @@ static void DrawBitmapRounded(CoverBmp* e, const D2D1_RECT_F& r, float rad, floa
 
     e->brush->SetTransform(D2D1::Matrix3x2F::Scale(sc, sc) *
                            D2D1::Matrix3x2F::Translation(ox, oy));
-    e->brush->SetOpacity(g_alpha * g_alphaMul * alpha);   // 位图画刷不吃颜色 alpha，得单独设
+    e->brush->SetOpacity(g_alpha * g_alphaMul * alpha);   // bitmap brushes ignore color alpha; set it separately
     g_rt->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), e->brush);
 }
 
 static void DrawCoverArt(const D2D1_RECT_F& r, const Song& s, int idx, float rad) {
     CoverBmp* e = CoverEntry(s.cover);
     float fade = e ? CoverFade(s.cover) : 0.0f;
-    if (e && fade >= 1.0f) {                 // 已经完全显示，直接铺
+    if (e && fade >= 1.0f) {                 // fully visible, draw directly
         DrawBitmapRounded(e, r, rad);
         return;
     }
-    // 没有封面：渐变占位 + 首字（画刷已缓存，不再每帧新建）
+    // no cover: gradient placeholder + first character (brushes are cached, not rebuilt every frame)
     int ci = ((idx % 8) + 8) % 8;
     if (g_covBrush[ci]) {
         g_covBrush[ci]->SetStartPoint(D2D1::Point2F(r.left, r.top));
@@ -1058,15 +1058,15 @@ static void DrawCoverArt(const D2D1_RECT_F& r, const Song& s, int idx, float rad
     if (s.title.empty()) return;
     std::wstring ch(1, s.title[0]);
     float size = (r.bottom - r.top) * 0.32f;
-    // 首字跟着淡出，避免和真图叠在一起
+    // the initial fades out with it so it does not overlap the real image
     Text(ch, Fmt(size, DWRITE_FONT_WEIGHT_SEMI_BOLD), r, 0xFFFFFF, DWRITE_TEXT_ALIGNMENT_CENTER,
          0.55f * (1.0f - fade));
 
-    if (e) DrawBitmapRounded(e, r, rad, fade * fade);   // 正在淡入：压在占位上面
+    if (e) DrawBitmapRounded(e, r, rad, fade * fade);   // fading in: drawn on top of the placeholder
 }
 
 /* ══════════════════════════════════════════
-   窗口按钮
+   Window buttons
    ══════════════════════════════════════════ */
 static D2D1_RECT_F BtnRect(int i, float W) {
     float x = W - UI::BTN_W * (float)(UI::BTN_COUNT - i);
@@ -1074,38 +1074,38 @@ static D2D1_RECT_F BtnRect(int i, float W) {
     return Rc(x, y, UI::BTN_W, UI::BTN_H);
 }
 
-/* ── 设置面板 ── */
-std::string  g_token, g_userid;      // 登录状态（LoadSession 填）
+/* ── Settings panel ── */
+std::string  g_token, g_userid;      // login state (filled by LoadSession)
 static bool         g_settingsOpen = false;
 
-/* 面板出现/消失：0 收起，1 展开。绘制时用 PanelFx 包一层，淡入 + 轻微缩放 */
-static float g_playIconMix = 0.0f;    // 0 = 播放三角，1 = 暂停双条（几何形变，可被打断）
-static float g_textT = 0.0f;          // 当前阶段已经过的时间
-static int   g_textPhase = 0;         // 0 静止 / 1 左滑淡出 / 2 右滑淡入
-static int   g_textDir = 1;           // +1 下一首（往左走）/ -1 上一首（往右走）
-static std::wstring g_outTitle, g_outArtist, g_outAlbum;   // 正在退场的旧文字
-static std::wstring g_curTitle, g_curArtist, g_curAlbum;   // 上一帧的三行（用来抓快照）
+/* Panel appear/disappear: 0 collapsed, 1 expanded. Drawing wraps it in PanelFx for a fade + slight scale */
+static float g_playIconMix = 0.0f;    // 0 = play triangle, 1 = pause bars (geometric morph, interruptible)
+static float g_textT = 0.0f;          // time elapsed in the current phase
+static int   g_textPhase = 0;         // 0 idle / 1 slide out left / 2 slide in from right
+static int   g_textDir = 1;           // +1 next track (moves left) / -1 previous track (moves right)
+static std::wstring g_outTitle, g_outArtist, g_outAlbum;   // old text that is leaving
+static std::wstring g_curTitle, g_curArtist, g_curAlbum;   // the previous frame's three lines (used to grab a snapshot)
 static float g_setT  = 0.0f;
 static float g_qualT = 0.0f;
 static float g_volT  = 0.0f;
 static float g_togT  = 0.0f;
-static std::wstring g_qrPath;            // 本次登录用的二维码文件（每次换名，避免命中旧位图）
-static bool         g_togOpen = false;      // 一起听面板
-static bool         g_togInput = false;     // 输入框聚焦
-static std::wstring g_togInputText;         // 输入中的连接码
-static std::wstring g_togMyCode;            // 我的连接码
-static bool         g_togBusy    = false;   // 正在开房/加入
-static bool         g_togHosting = false;   // 已开房但还没人进来
-static bool         g_togForcePush = false; // 下一次 PushLocalState 强制推（拖进度/加载变化）
-static bool         g_togIsHost  = false;   // 我是房主（能控播放）
-static int          g_togAddrIdx = -1;      // 选中第几个本机地址（-1 自动）
-static std::wstring g_togPeer;              // 对方昵称
-static bool         g_togLost = false;      // 断线提示
-static std::wstring g_togMsg;               // 面板内提示
+static std::wstring g_qrPath;            // QR code file for this login (renamed each time to avoid an old bitmap)
+static bool         g_togOpen = false;      // listen-together panel
+static bool         g_togInput = false;     // input field focused
+static std::wstring g_togInputText;         // connection code being typed
+static std::wstring g_togMyCode;            // my connection code
+static bool         g_togBusy    = false;   // opening a room / joining
+static bool         g_togHosting = false;   // room open but nobody has joined yet
+static bool         g_togForcePush = false; // force the next PushLocalState (seek/loading change)
+static bool         g_togIsHost  = false;   // I am the host (can control playback)
+static int          g_togAddrIdx = -1;      // selected local address index (-1 = auto)
+static std::wstring g_togPeer;              // peer nickname
+static bool         g_togLost = false;      // disconnect notice
+static std::wstring g_togMsg;               // in-panel message
 static ULONGLONG    g_togMsgAt = 0;
-/* Toast 的淡入淡出：进 180ms、出 300ms，淡入时上移 6px
-   返回透明度，dy 带回纵向偏移；返回 0 表示已经过期 */
-static float g_toastOverride = -1.0f;   // 截图模式：固定 toast 透明度
+/* Toast fade: 180ms in, 300ms out, moves up 6px while fading in
+   Returns opacity, dy carries the vertical offset; 0 means already expired */
+static float g_toastOverride = -1.0f;   // screenshot mode: fixed toast opacity
 static float ToastFade(ULONGLONG at, float life, float& dy) {
     dy = 0.0f;
     if (g_toastOverride >= 0.0f) { dy = 0.0f; return g_toastOverride; }
@@ -1113,21 +1113,21 @@ static float ToastFade(ULONGLONG at, float life, float& dy) {
     float t = (float)(GetTickCount64() - at) / 1000.0f;
     if (t < 0.0f || t > life) return 0.0f;
 
-    const float inT = 0.18f, outT = 0.30f;   // 注意：IN/OUT 是 SDK 宏，不能用作变量名
+    const float inT = 0.18f, outT = 0.30f;   // note: IN/OUT are SDK macros and cannot be used as variable names
     float a = 1.0f;
-    if (t < inT) {                      // 淡入 + 上移归位
+    if (t < inT) {                      // fade in + slide up into place
         float k = t / inT;
         a = k;
         dy = (1.0f - k) * 6.0f;
-    } else if (t > life - outT) {       // 淡出（用 ease-in：走得干脆）
+    } else if (t > life - outT) {       // fade out (ease-in: leaves decisively)
         float k = (t - (life - outT)) / outT;
         a = 1.0f - k * k;
     }
     return a < 0.0f ? 0.0f : a;
 }
 static void TogToast(const std::wstring& s) { g_togMsg = s; g_togMsgAt = GetTickCount64(); }
-static bool         g_loginChoose = false;   // 显示"选酷狗/网易云"的小面板
-static bool         g_loginAsked  = false;   // 已经自动弹过一次，避免反复弹
+static bool         g_loginChoose = false;   // show the "choose Kugou/NetEase" mini panel
+static bool         g_loginAsked  = false;   // auto-opened once already; avoid repeated popups
 static std::wstring g_settingsMsg;
 static ULONGLONG    g_settingsMsgAt = 0;
 static bool         g_loginRunning = false;
@@ -1135,8 +1135,8 @@ static std::string  g_loginUser0;
 static ULONGLONG    g_waitTsv = 0;
 static ULONGLONG    g_tsvBefore = 0;
 
-/* ── 登录态：启动时问一次接口，token 过期能提前发现，不用等播放失败 ── */
-static int          g_loginState = 0;    // 0 检查中 / 1 有效 / 2 失效或未登录
+/* ── Login state: ask the API once at startup so an expired token is caught early instead of waiting for playback to fail ── */
+static int          g_loginState = 0;    // 0 checking / 1 valid / 2 expired or not signed in
 static std::wstring g_nickname;
 static int          g_vipType = 0;
 
@@ -1152,7 +1152,7 @@ static ULONGLONG FileStamp(const std::wstring& p) {
     return ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
 }
 
-/** 递归删目录（删不掉就留着，下次启动再清） */
+/** Recursively delete a directory (leave it if it fails; clean up on the next start) */
 static void RemoveTree(const std::wstring& path) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((path + L"\\*").c_str(), &fd);
@@ -1168,35 +1168,35 @@ static void RemoveTree(const std::wstring& path) {
     RemoveDirectoryW(path.c_str());
 }
 
-/** 清掉本地缓存：封面图、音频、内存位图 */
+/** Clear local cache: cover images, audio, in-memory bitmaps */
 static void ClearCache() {
     wchar_t full[MAX_PATH] = { 0 };
     std::wstring rel = AssetDir();
     if (!GetFullPathNameW(rel.c_str(), MAX_PATH, full, nullptr)) wcscpy(full, rel.c_str());
     std::wstring dir = full;
 
-    // 1) 先放掉内存里的位图（否则 WIC 解码器还占着文件，删不掉）
+    // 1) release the in-memory bitmaps first (otherwise the WIC decoder still holds the files and they cannot be deleted)
     for (auto& b : g_coverBmps) {
         if (b.brush) b.brush->Release();
         if (b.bmp) b.bmp->Release();
     }
     g_coverBmps.clear();
-    // 关键：WIC 格式转换器握着文件句柄，不释放的话 DeleteFile 会报 32（占用）
+    // critical: WIC format converters hold file handles; without releasing them DeleteFile fails with 32 (in use)
     for (auto& c : g_coverSrcs) if (c.conv) c.conv->Release();
     g_coverSrcs.clear();
     g_decRequested.clear();
     for (auto& s : g_app.songs) s.cover.clear();
     std::fill(g_covFlag.begin(), g_covFlag.end(), 0);
 
-    // 2) 整目录改名再删——文件被占用时改名不受影响
+    // 2) rename the whole directory, then delete — renaming is unaffected by files in use
     const wchar_t* subs[2] = { L"covers", L"audio" };
     for (const wchar_t* sub : subs) {
         std::wstring a = dir + L"\\" + sub;
         std::wstring b = dir + L"\\" + sub + L"_old";
-        RemoveTree(b);                       // 清掉上次没删干净的
+        RemoveTree(b);                       // clean up leftovers from last time
         if (MoveFileW(a.c_str(), b.c_str())) {
             CreateDirectoryW(a.c_str(), nullptr);
-            RemoveTree(b);                   // 还删不掉就留到下次启动
+            RemoveTree(b);                   // still locked? leave it for the next start
         }
     }
 
@@ -1204,19 +1204,19 @@ static void ClearCache() {
 }
 
 
-/* ── 扫码登录 & 导出歌单（纯 C++，不再依赖 node） ── */
+/* ── QR code login & playlist export (pure C++, no more node) ── */
 static std::mutex   g_lgMx;
-static int          g_lgState = 0;      // 0 空闲 1 等扫码 2 已扫码 3 成功 4 失败
+static int          g_lgState = 0;      // 0 idle 1 waiting for scan 2 scanned 3 success 4 failed
 static std::string  g_lgToken, g_lgUserid;
 static std::wstring g_lgMsg;
-static int          g_expState = 0;     // 0 空闲 1 拉取中 2 完成 3 失败
+static int          g_expState = 0;     // 0 idle 1 fetching 2 done 3 failed
 static int          g_expCount = 0;
 static std::wstring g_expMsg;
 
-/** 写 kugou-session.json */
+/** Write kugou-session.json */
 static std::wstring LocalDir();
 
-/* ── 音源：0 酷狗 / 1 网易云 ── */
+/* ── Source: 0 Kugou / 1 NetEase ── */
 static int g_source = 0;
 static std::wstring SourceFile() { return LocalDir() + L"\\source.txt"; }
 static const wchar_t* SourceTag() { return g_source == 2 ? L"qq" : (g_source == 1 ? L"netease" : L"kugou"); }
@@ -1246,7 +1246,7 @@ static bool WriteSession(const std::string& uid, const std::string& tok) {
     return true;
 }
 
-/** 后台拉歌单写 tsv */
+/** Fetch playlists in the background and write the tsv */
 static void StartExport(const std::string& uid, const std::string& tok) {
     {
         std::lock_guard<std::mutex> lk(g_lgMx);
@@ -1265,11 +1265,11 @@ static void StartExport(const std::string& uid, const std::string& tok) {
     }).detach();
 }
 
-/** 确保本机 sidecar 在跑（定义在后面） */
-/* ── 内嵌 sidecar：首次运行解压到本地，之后直接复用 ── */
+/** Make sure the local sidecar is running (defined below) */
+/* ── Embedded sidecar: extracted locally on first run, reused afterwards ── */
 static std::wstring SidecarRoot() { return LocalDir() + L"\\sidecars"; }
 
-/* sidecars 的版本号：内容一变就递增，触发重新解压 */
+/* Sidecars version: bump it whenever the content changes to trigger re-extraction */
 #define SIDECARS_VERSION L"2026-11-07-1"
 
 static bool ExtractSidecars() {
@@ -1277,7 +1277,7 @@ static bool ExtractSidecars() {
     CreateDirectoryW(root.c_str(), nullptr);
     std::wstring okFile = root + L"\\.ok";
 
-    // 已有解压结果：版本对得上才复用，否则整个重来
+    // already extracted: reuse only if the version matches, otherwise start over
     if (GetFileAttributesW(okFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
         FILE* f = nullptr;
         _wfopen_s(&f, okFile.c_str(), L"rb");
@@ -1308,7 +1308,7 @@ static bool ExtractSidecars() {
     fwrite(p, 1, sz, f);
     fclose(f);
 
-    // Windows 10+ 自带 bsdtar，可以直接解 zip
+    // Windows 10+ ships bsdtar, which can extract a zip directly
     std::wstring cmd = L"tar.exe -xf \"" + zp + L"\" -C \"" + root + L"\"";
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -1335,13 +1335,13 @@ static bool ExtractSidecars() {
 }
 static void EnsureSidecar();
 
-/** 扫码登录：取二维码 → 轮询 → 成功把 token/userid 交给主线程应用 */
+/** QR login: get the QR code → poll → on success hand token/userid to the main thread to apply */
 static void StartRelogin() {
     if (g_loginRunning) return;
-    // 每次用新文件名：同路径会命中封面位图缓存，导致界面一直显示旧二维码
+    // use a new file name each time: the same path hits the cover bitmap cache and keeps showing the old QR code
     g_qrPath = AssetDir() + L"\\qr-" + std::to_wstring((unsigned long long)GetTickCount64()) + L".png";
     std::wstring qr = g_qrPath;
-    if (g_source == 2) {                       // QQ 音乐扫码
+    if (g_source == 2) {                       // QQ Music QR login
         DeleteFileW(qr.c_str());
         g_loginRunning = true;
         { std::lock_guard<std::mutex> lk(g_lgMx); g_lgState = 1; g_lgMsg.clear(); }
@@ -1374,13 +1374,13 @@ static void StartRelogin() {
         }).detach();
         return;
     }
-    if (g_source == 1) {                       // 网易云扫码
+    if (g_source == 1) {                       // NetEase QR login
         DeleteFileW(qr.c_str());
         g_loginRunning = true;
         { std::lock_guard<std::mutex> lk(g_lgMx); g_lgState = 1; g_lgMsg.clear(); }
         SettingsToast(T(L"用网易云音乐 App 扫码", L"Scan with the NetEase Music app"));
         std::thread([qr]() {
-            EnsureSidecar();          // 切平台后本地服务可能没起
+            EnsureSidecar();          // the local service may not be running after switching platforms
             std::wstring err;
             if (!NgLoginStart(qr, err)) {
                 std::lock_guard<std::mutex> lk(g_lgMx);
@@ -1391,7 +1391,7 @@ static void StartRelogin() {
                 int st = NgLoginPoll(ck, e);
                 if (st == 2) {
                     std::lock_guard<std::mutex> lk(g_lgMx);
-                    g_lgToken = ck; g_lgUserid = "1";   // 网易云用 cookie，userid 占位
+                    g_lgToken = ck; g_lgUserid = "1";   // NetEase uses a cookie; userid is a placeholder
                     g_lgState = 3; return;
                 }
                 if (st == 3 || st == 4) {
@@ -1441,7 +1441,7 @@ static void StartRelogin() {
                 g_lgMsg = e;
                 return;
             }
-            {   // 用户中途点了「关闭」就别继续轮询了
+            {   // stop polling if the user clicked "close" meanwhile
                 std::lock_guard<std::mutex> lk(g_lgMx);
                 if (g_lgState == 0) return;
             }
@@ -1455,7 +1455,7 @@ static void StartRelogin() {
 
 static void StartRelogin_old_unused();
 
-/* 设置卡片的位置：绘制和"模态点击区"共用 */
+/* Settings card position: shared by drawing and the "modal hit area" */
 static D2D1_RECT_F SettingsCardRect(float W, float H) {
     const float cw = 560.0f, ch = 352.0f;
     return Rc((W - cw) * 0.5f, (H - ch) * 0.5f, cw, ch);
@@ -1474,7 +1474,7 @@ static void DrawSettings(float W, float H) {
          Rc(card.left + 24, card.top + 18, 200, 28), UI::TEXT);
 
 
-    // 当前账号状态：启动时查过接口才有确定结论
+    // current account state: conclusive only after the startup API check
     {
         std::wstring who;
         UINT32 col = UI::TEXT2;
@@ -1504,8 +1504,8 @@ static void DrawSettings(float W, float H) {
 
     const wchar_t* names[3] = { T(L"清空缓存", L"Clear cache"), T(L"重新登录", L"Sign in again"), T(L"切换主题", L"Change theme") };
     const int kinds[3] = { HK_SET_CLEAR, HK_SET_LOGIN, HK_SET_THEME };
-    const int btnCount = (ThemeCount() > 1) ? 3 : 2;     // 只有一套配色时不显示切换
-    for (int i = 0; i < btnCount && !g_loginChoose; i++) {   // 选平台时把按钮收起来
+    const int btnCount = (ThemeCount() > 1) ? 3 : 2;     // no toggle when there is only one palette
+    for (int i = 0; i < btnCount && !g_loginChoose; i++) {   // hide the buttons while choosing a platform
         D2D1_RECT_F b = Rc(card.left + 24, card.top + 74 + i * 58, 250, 44);
         bool hot = Inside(b, g_app.mouse);
         FillRound(b, 10.0f, hot ? UI::SELECT : UI::BG);
@@ -1516,7 +1516,7 @@ static void DrawSettings(float W, float H) {
         g_app.hits.push_back(h);
     }
 
-    // ── 语言 ──
+    // ── Language ──
     {
         float ly = card.top + 74.0f + (float)btnCount * 58.0f;
         Text(T(L"界面语言", L"Language"), Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
@@ -1547,7 +1547,7 @@ static void DrawSettings(float W, float H) {
         }
     }
 
-    // 先选平台，再出二维码
+    // choose a platform first, then show the QR code
     if (g_loginChoose && !g_loginRunning) {
         Text(T(L"选择要登录的平台", L"Choose a platform"), Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
              Rc(card.right - 300, card.top + 74, 270, 20), UI::TEXT2);
@@ -1563,7 +1563,7 @@ static void DrawSettings(float W, float H) {
         }
     }
 
-    // 登录中：右边显示二维码
+    // logging in: show the QR code on the right
     std::wstring qr = g_qrPath;
     if (g_loginRunning && GetFileAttributesW(qr.c_str()) != INVALID_FILE_ATTRIBUTES) {
         if (CoverBmp* e = CoverEntry(qr)) {
@@ -1571,7 +1571,7 @@ static void DrawSettings(float W, float H) {
             FillRound(Rc(q.left - 6, q.top - 6, 162, 162), 10.0f, 0xFFFFFF);
             DrawBitmapRounded(e, q, 8.0f);
 
-            // 轮询状态：让人看得出程序在等
+            // polling state: makes it visible that the program is waiting
             int st = 0;
             { std::lock_guard<std::mutex> lk(g_lgMx); st = g_lgState; }
             const wchar_t* s = (st == 2) ? T(L"已扫码，请手机上确认", L"Scanned, confirm on phone")
@@ -1607,7 +1607,7 @@ static void DrawWindowButtons(float W) {
         g_app.hits.push_back(h);
     }
 
-    // 设置按钮：三个窗口按钮左边
+    // settings button: left of the three window buttons
     D2D1_RECT_F g = Rc(BtnRect(0, W).left - 40.0f, BtnRect(0, W).top + 2.0f, 32.0f,
                        (BtnRect(0, W).bottom - BtnRect(0, W).top) - 4.0f);
     bool hot = Inside(g, g_app.mouse);
@@ -1617,7 +1617,7 @@ static void DrawWindowButtons(float W) {
         float cx = (g.left + g.right) * 0.5f;
         float cy = (g.top + g.bottom) * 0.5f;
         UINT32 fg = (hot || g_settingsOpen) ? UI::TEXT : UI::TEXT2;
-        // 三根滑杆，当设置图标
+        // three sliders as the settings icon
         for (int k = 0; k < 3; k++) {
             float y = cy - 6.0f + k * 6.0f;
             Line(cx - 8.0f, y, cx + 8.0f, y, fg, 1.4f);
@@ -1630,29 +1630,29 @@ static void DrawWindowButtons(float W) {
     g_app.hits.push_back(hg);
 }
 
-/** 登录提示条的位置：绘制和 WM_NCHITTEST 共用 */
+/** Login pill position: shared by drawing and WM_NCHITTEST */
 static D2D1_RECT_F LoginPillRect(float W) {
     float rightEdge = W - (UI::BTN_W * UI::BTN_COUNT + 76.0f);
-    float tw = 168.0f;                   // 按最长的"接口服务未响应 · 点此查看"留
+    float tw = 168.0f;                   // sized for the longest "service not responding · click to check"
     return Rc(rightEdge - tw - 12.0f, UI::TITLE_H * 0.5f - 11.0f, tw, 22.0f);
 }
 
 static void DrawTitleBar(float W) {
 
 
-    // 顶栏底色：和页面同色，不透明。进场/退场时这层跟着裁剪一起「扫」进来
+    // title bar background: same color as the page, opaque. During enter/exit this layer gets "wiped" in along with the clip
     FillRect(Rc(0, 0, W, UI::TITLE_H), UI::BG, 1.0f);
 
     Text(L"Floral", Fmt(15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
          Rc(UI::PAD, 0, 240, UI::TITLE_H), UI::TEXT);
-    {   // 点左上角回歌单选择页
+    {   // click the top-left corner to go back to the playlist picker
         Hit hb; hb.r = Rc(UI::PAD - 6, 0, 90, UI::TITLE_H); hb.kind = HK_PL_PICK;
         g_app.hits.push_back(hb);
     }
 
     float rightEdge = W - (UI::BTN_W * UI::BTN_COUNT + 76.0f);
 
-    // 回歌单选择页：2×2 小方块，放在唱片按钮左边
+    // back to the playlist picker: 2×2 small squares, left of the disc button
     {
         float bx2 = BtnRect(0, W).left - 40.0f - 44.0f - 44.0f;
         D2D1_RECT_F pb2 = Rc(bx2, 13.0f, 32.0f, 26.0f);
@@ -1673,10 +1673,10 @@ static void DrawTitleBar(float W) {
             Hit hp3; hp3.r = pb2; hp3.kind = HK_PICKER;
             g_app.hits.push_back(hp3);
         }
-        if (!onPicker) rightEdge = pb2.left - 12.0f;   // 让歌曲数别压到按钮上
+        if (!onPicker) rightEdge = pb2.left - 12.0f;   // keep the song count off the button
     }
 
-    // 进入播放页：小唱片图标，放在设置左边
+    // go to the player page: small disc icon, left of the settings button
     {
         float bx = BtnRect(0, W).left - 40.0f - 44.0f;
         D2D1_RECT_F pb = Rc(bx, 13.0f, 32.0f, 26.0f);
@@ -1692,7 +1692,7 @@ static void DrawTitleBar(float W) {
         rightEdge = (std::min)(rightEdge, pb.left - 12.0f);
     }
 
-    // 登录失效 / 接口没起来时给个能点的提示条，别让人等到播放失败才发现
+    // when the session is invalid or the service is down, show a clickable pill instead of letting people find out when playback fails
     if (g_loginState == 2 || g_loginState == 3) {
         const wchar_t* tip;
         UINT32 fg;
@@ -1727,13 +1727,13 @@ static void DrawTitleBar(float W) {
 }
 
 /* ══════════════════════════════════════════
-   网格页
+   Grid page
    ══════════════════════════════════════════ */
 static void DrawTile(const D2D1_RECT_F& t, const Song& s, int idx, float anim) {
     const float w = t.right - t.left;
     const float h = t.bottom - t.top;
 
-    // 阴影
+    // Shadow
     if (anim > 0.02f) {
         D2D1_RECT_F sh = Rc(t.left + 4, t.top + 14, w - 8, h - 10);
         FillRound(sh, UI::R_TILE, UI::SHADOW, 0.18f * anim);
@@ -1742,7 +1742,7 @@ static void DrawTile(const D2D1_RECT_F& t, const Song& s, int idx, float anim) {
     DrawCoverArt(t, s, idx, UI::R_TILE);
 
     if (anim > 0.01f) {
-        // 底部压暗：圆角渐变直接填充，顶部 alpha 为 0，看不出圆角
+        // Bottom scrim: fill the rounded gradient directly; top alpha is 0, so the corner radius is invisible
         float sh = h * 0.46f;
         FillRoundGradV(Rc(t.left, t.bottom - sh, w, sh), UI::R_TILE,
                        0x000000, 0.0f, 0x000000, 0.66f * anim);
@@ -1754,7 +1754,7 @@ static void DrawTile(const D2D1_RECT_F& t, const Song& s, int idx, float anim) {
              Rc(t.left + 16, t.bottom - 34, w - 64, 18), 0xFFFFFF,
              DWRITE_TEXT_ALIGNMENT_LEADING, anim * 0.8f);
 
-        // 播放圆标（三角）
+        // Play badge (triangle)
         float r = 17.0f;
         D2D1_RECT_F chip = Rc(t.right - 16 - r * 2, t.bottom - 16 - r * 2, r * 2, r * 2);
         FillRound(chip, r, 0xFFFFFF, 0.92f * anim);
@@ -1778,12 +1778,12 @@ static void DrawGrid() {
     }
 
     if (a.page == Page::Grid && a.pageAnim < 0.02f) {
-        // 滚动中、以及滚动后鼠标没再动过，都不放大
+        // No zoom while scrolling, and until the mouse moves again after scrolling
         bool gliding = std::fabs(a.scrollTarget - a.scroll) > 0.5f;
         a.hoverTile = (gliding || !g_hoverArmed || g_settingsOpen) ? -1 : HitTile(a.mouse);
     }
     int hov = (a.page == Page::Grid && a.pageAnim < 0.02f) ? a.hoverTile : -1;
-    EnsureTarget(W, n, hov);         // 锚定列 + 局部重排：既挤开又不瞬移
+    EnsureTarget(W, n, hov);         // anchor column + local reflow: push neighbors aside without teleporting
 
     float viewH = (std::max)(0.0f, H - GRID_TOP - UI::PAD);
     a.maxScroll = (std::max)(0.0f, g_gridHeight - viewH);
@@ -1792,7 +1792,7 @@ static void DrawGrid() {
     if (a.scroll > a.maxScroll) a.scroll = a.maxScroll;
     if (a.scroll < 0) a.scroll = 0;
 
-    // ── 滚动条（右侧，可拖） ──
+    // ── Scrollbar (right side, draggable) ──
     if (a.maxScroll > 1.0f) {
         const float sbW = 6.0f;
         const float top = GRID_TOP;
@@ -1816,7 +1816,7 @@ static void DrawGrid() {
         }
     }
 
-    // 只收集视口附近（上下各多留一条）的块
+    // Collect only bands near the viewport (one extra above and below)
     {
         float vy0 = a.scroll - 150.0f;
         float vy1 = a.scroll + H + 150.0f;
@@ -1838,8 +1838,8 @@ static void DrawGrid() {
         }
     }
 
-    // 命中区用"实际画出来的"布局（含悬停放大与挤开后的位置），点哪算哪
-    // 进场飞入没落地前先不给点击，免得点空
+    // Hit areas use the as-drawn layout (including hover zoom and displacement), so clicks land on what you see
+    // No clicks until the fly-in lands, to avoid empty hit areas
     if (g_alpha > 0.5f && g_gridEnter > 0.85f) {
         for (int i : g_vis) {
             const TileBox& b = g_target[(size_t)i];
@@ -1851,12 +1851,12 @@ static void DrawGrid() {
         }
     }
 
-    // 视口里缺封面的歌，按需下载
+    // Fetch covers on demand for viewport songs that lack one
     RequestVisibleCovers();
 
     g_rt->PushAxisAlignedClip(D2D1::RectF(0, GRID_TOP - 10, W, H), D2D1_ANTIALIAS_MODE_ALIASED);
 
-    // 运动模糊：剩余距离和瞬时速度取较大者，保证滑行期间一定有拖影
+    // Motion blur: take the larger of remaining distance and instantaneous speed, so the glide always leaves a trail
     float glide = std::fabs(a.scrollTarget - a.scroll);
     float bDist = (std::min)(1.0f, glide / 80.0f);
     float bVel = (std::min)(1.0f, g_scrollVel / 1400.0f);
@@ -1864,14 +1864,14 @@ static void DrawGrid() {
     float blurDir = (a.scrollTarget >= a.scroll) ? 1.0f : -1.0f;
 
     const bool blurOn = blur > 0.04f;
-    const float step = 3.0f + 9.0f * blur;          // 最快时拖影约 60px
+    const float step = 3.0f + 9.0f * blur;          // trail is ~60px at max speed
     const float ghostA[5] = { 0.30f, 0.24f, 0.18f, 0.12f, 0.07f };
 
-    // 进场进度：0→1.45 就是"逐个从右侧飞入"的行程
+    // Enter progress: 0→1.45 is the "fly in from the right one by one" run
     const bool entering = (g_gridEnter < 0.999f);
     const float entT = g_gridEnter * 1.45f;
 
-    // 先画普通块，再画悬停块（保证它盖在邻居上面）
+    // Draw normal tiles first, then the hovered one (so it covers its neighbors)
     int order = 0;
     for (int pass = 0; pass < 2; pass++) {
         for (int i : g_vis) {
@@ -1882,14 +1882,14 @@ static void DrawGrid() {
 
             float enterA = 1.0f, enterDx = 0.0f;
             if (entering) {
-                const int ord = (order < 18) ? order : 18;       // 错开最多 18 档，尾部不滞后
+                const int ord = (order < 18) ? order : 18;       // stagger at most 18 slots so the tail isn't late
                 order++;
-                float p = (entT - (float)ord * 0.05f) / 0.42f;   // 错开 50ms，单块 420ms
+                float p = (entT - (float)ord * 0.05f) / 0.42f;   // 50ms apart, 420ms per tile
                 if (p <= 0.0f) continue;
                 if (p > 1.0f) p = 1.0f;
                 float e = 1.0f - powf(1.0f - p, 3.0f);
                 enterA = e;
-                enterDx = (1.0f - e) * (W + 60.0f - d.x);        // 从窗口右侧飞进来
+                enterDx = (1.0f - e) * (W + 60.0f - d.x);        // flies in from the right edge
             }
 
             if (blurOn && !isHover && !entering) {
@@ -1912,23 +1912,23 @@ static void DrawGrid() {
 }
 
 /* ══════════════════════════════════════════
-   播放页：左侧转动的 CD + 上下专辑盒子，右侧歌曲信息
+   Player page: spinning CD on the left + album cases above/below, song info on the right
    ══════════════════════════════════════════ */
 static int   g_switchFrom = -1, g_switchTo = -1, g_switchDir = 1;
-static float g_switchT = 1.0f;          // 0..1，1 表示不在切歌
-static float g_discAngle = 0.0f;        // 唱片转动角度（度）
-static float g_lineT = 0.0f;            // 收起线的伸出进度 0..1
-static int   g_casePrev0 = -1, g_caseNext0 = -1;   // 切歌瞬间，盒子里原来放的是哪两首
+static float g_switchT = 1.0f;          // 0..1; 1 means no track switch in progress
+static float g_discAngle = 0.0f;        // disc rotation angle (degrees)
+static float g_lineT = 0.0f;            // divider unfold progress 0..1
+static int   g_casePrev0 = -1, g_caseNext0 = -1;   // at switch time, which two songs the cases held before
 
-/* 退播放页的转场：整屏淡出 → 网格像开屏那样从右边飞入 */
+/* Leaving the player page: full-screen fade out → grid flies in from the right like the intro */
 static bool  g_exitOn = false;
 static float g_exitT = 1.0f;
 
-/* 进播放页的转场：0..1 走完全程 */
+/* Entering the player page: 0..1 runs the whole transition */
 static bool  g_enterOn = false;
 static float g_enterT = 1.0f;
 static int   g_enterIdx = -1;
-static D2D1_RECT_F g_enterFrom{};       // 点击时那格在屏幕上的位置
+static D2D1_RECT_F g_enterFrom{};       // on-screen rect of the clicked tile
 
 static D2D1_RECT_F LerpRect(const D2D1_RECT_F& a, const D2D1_RECT_F& b, float t) {
     return D2D1::RectF(a.left + (b.left - a.left) * t,
@@ -1948,7 +1948,7 @@ static void StrokeCircle(float cx, float cy, float r, UINT32 c, float a = 1.0f, 
     g_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), g_brush, w);
 }
 
-/** 画一张 CD：黑胶底 + 转动的封面 + 纹路 + 中心孔 */
+/** Draw a CD: vinyl base + rotating cover + grooves + center hole */
 static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDeg, float alpha) {
     if (alpha <= 0.01f) return;
     const float rad = (r.right - r.left) * 0.5f;
@@ -1957,11 +1957,11 @@ static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDe
     const float cy = (r.top + r.bottom) * 0.5f;
     const float artR = rad * 0.66f;
 
-    // 黑胶底 + 外圈
+    // Vinyl base + outer ring
     FillCircle(cx, cy, rad, UI::DISC, alpha);
 
-    // 转动的封面（椭圆填充 + 位图画刷，不用 Layer）
-    // 淡入期间先铺占位渐变，再把真图压上去
+    // Rotating cover (ellipse fill with a bitmap brush; no Layer)
+    // During fade-in, lay the placeholder gradient first, then draw the real art on top
     CoverBmp* ce = CoverEntry(s.cover);
     float coverFade = ce ? CoverFade(s.cover) : 0.0f;
     bool haveBrush = false;
@@ -1976,7 +1976,7 @@ static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDe
         haveBrush = (ce->brush != nullptr) && sz.width > 0 && sz.height > 0;
     }
 
-    if (!haveBrush || coverFade < 1.0f) {          // 占位（也作为淡入的底）
+    if (!haveBrush || coverFade < 1.0f) {          // placeholder (also the fade-in base)
         int ci = ((idx % 8) + 8) % 8;
         if (g_covBrush[ci]) {
             g_covBrush[ci]->SetStartPoint(D2D1::Point2F(cx, cy - artR));
@@ -1996,26 +1996,26 @@ static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDe
         g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), artR, artR), ce->brush);
     }
 
-    // 黑胶纹路
+    // Vinyl grooves
     for (int i = 1; i <= 3; i++) {
         float rr = artR + (rad - artR) * (i / 4.0f);
         StrokeCircle(cx, cy, rr, UI::DISC_GROOVE, 0.55f * alpha, 1.0f);
     }
-    // 固定高光，增强"圆盘"感
+    // Fixed highlight to sell the disc shape
     if (g_brush) {
         for (int k = 0; k < 2; k++) {
             float a0 = -1.9f + k * 0.26f;
             StrokeCircle(cx, cy, rad * (0.90f - k * 0.05f), UI::DISC_GROOVE, 0.35f * alpha, 1.4f);
         }
     }
-    // 中心孔
+    // Center hole
     FillCircle(cx, cy, rad * 0.05f, UI::BG, alpha);
     StrokeCircle(cx, cy, rad * 0.05f, UI::DISC_GROOVE, 0.6f * alpha, 1.0f);
-    // 外边缘
+    // Outer edge
     StrokeCircle(cx, cy, rad - 0.5f, 0x000000, 0.18f * alpha, 1.0f);
 }
 
-/** 小专辑盒子里的封面 */
+/** Cover inside a small album case */
 static void DrawBoxCover(float cx, float cy, float size, int idx, float alpha) {
     App& a = g_app;
     if (idx < 0 || idx >= (int)a.songs.size() || alpha <= 0.01f) return;
@@ -2028,7 +2028,7 @@ static void DrawBoxCover(float cx, float cy, float size, int idx, float alpha) {
     g_alphaMul = 1.0f;
 }
 
-/** CD 专辑盒（照实物）：透明塑料外壳 → 深灰托盘 → 内页封面 */
+/** CD jewel case (modeled on the real thing): clear plastic shell → dark gray tray → booklet cover */
 static void DrawCase(const D2D1_RECT_F& r, int idx, float alpha) {
     App& a = g_app;
     if (idx < 0 || idx >= (int)a.songs.size() || alpha <= 0.01f) return;
@@ -2037,34 +2037,34 @@ static void DrawCase(const D2D1_RECT_F& r, int idx, float alpha) {
 
     const float w = r.right - r.left;
     const float h = r.bottom - r.top;
-    const float rad  = (std::max)(3.0f, w * 0.012f);     // 硬边盒子
-    const float rim  = (std::max)(4.0f, w * 0.026f);     // 透明塑料边
-    const float tray = (std::max)(5.0f, w * 0.030f);     // 深色托盘
+    const float rad  = (std::max)(3.0f, w * 0.012f);     // hard-edged box
+    const float rim  = (std::max)(4.0f, w * 0.026f);     // clear plastic rim
+    const float tray = (std::max)(5.0f, w * 0.030f);     // dark tray
 
-    // 1) 透明塑料外壳
+    // 1) Clear plastic shell
     FillRoundGrad(r, rad, 0xFDFBFC, 0xDED3D8);
 
-    // 2) 深灰托盘
+    // 2) Dark gray tray
     D2D1_RECT_F tr = Rc(r.left + rim, r.top + rim, w - rim * 2.0f, h - rim * 2.0f);
     FillRoundGrad(tr, rad, 0x4C464A, 0x312B2F);
 
-    // 3) 内页封面
+    // 3) Booklet cover
     D2D1_RECT_F inner = Rc(tr.left + tray, tr.top + tray,
                            w - (rim + tray) * 2.0f, h - (rim + tray) * 2.0f);
     DrawCoverArt(inner, a.songs[idx], idx, rad);
 
-    // 4) 内页上沿反光
+    // 4) Gloss along the top of the booklet
     FillRound(Rc(inner.left, inner.top, inner.right - inner.left,
                  (std::max)(6.0f, h * 0.04f)), rad, 0xFFFFFF, 0.14f);
 
-    // 5) 塑料边高光 + 外轮廓
+    // 5) Plastic rim highlight + outer outline
     StrokeRound(Rc(r.left + 1, r.top + 1, w - 2, h - 2), rad, 0xFFFFFF, 0.55f, 1.0f);
     StrokeRound(r, rad, 0x000000, 0.18f, 1.0f);
 
     g_alphaMul = 1.0f;
 }
 
-/** 唱片的封套：和 CD 一样大，只露出顶部/底部一条边；可整体倾斜 */
+/** Record sleeve: as big as the CD, exposing only a strip at the top/bottom; can be tilted as a whole */
 static void DrawSleeve(const D2D1_RECT_F& full, const D2D1_RECT_F& strip,
                        int idx, float alpha, float angleDeg) {
     if (idx < 0 || idx >= (int)g_app.songs.size() || alpha <= 0.01f) return;
@@ -2072,7 +2072,7 @@ static void DrawSleeve(const D2D1_RECT_F& full, const D2D1_RECT_F& strip,
     D2D1::Matrix3x2F saved;
     g_rt->GetTransform(&saved);
 
-    // 先压裁剪区（此时还是单位矩阵，保证是水平的），再旋转绘制
+    // Set the clip first (identity transform, so it stays horizontal), then rotate for drawing
     g_rt->PushAxisAlignedClip(strip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     float pcx = (full.left + full.right) * 0.5f;
@@ -2085,33 +2085,33 @@ static void DrawSleeve(const D2D1_RECT_F& full, const D2D1_RECT_F& strip,
     g_rt->PopAxisAlignedClip();
 }
 
-/* ── 音频 ── */
-static bool g_audioOk = false;      // 当前这首有没有真的在放
+/* ── Audio ── */
+static bool g_audioOk = false;      // whether the current track is really playing
 
-/* ── 播放加载动画 ── */
+/* ── Playback loading animation ── */
 static bool      g_audioLoading = false;
 static bool      g_audioError = false;
-static int       g_audioErrKind = 0;      // 1 解析失败 / 2 打不开（解不了）
+static int       g_audioErrKind = 0;      // 1 resolve failed / 2 cannot open (undecodable)
 static ULONGLONG g_loadingSince = 0;
-static ULONGLONG g_loadingMin = 0;        // 至少显示到这一刻，太快会看不见
-static int       g_audioRetry = 0;        // 打开成功却不出声时，允许自动重试一次
-static float     g_spinAngle = 0.0f;      // 弧度
+static ULONGLONG g_loadingMin = 0;        // show at least until this tick; anything faster is invisible
+static int       g_audioRetry = 0;        // allow one automatic retry when open succeeds but no sound comes out
+static float     g_spinAngle = 0.0f;      // radians
 
 
-/* 播放地址解析（后台线程做 HTTP，主线程只负责开 MCI） */
+/* Play URL resolution (HTTP on a worker thread; the main thread only opens MCI) */
 static std::mutex    g_urlMx;
 static std::wstring  g_urlReady;
-static int           g_urlState = 0;   // 0 空闲 1 解析中 2 好了 3 失败
+static int           g_urlState = 0;   // 0 idle, 1 resolving, 2 ready, 3 failed
 
-/* 开音频搬到后台线程：预缓冲要等网络，卡在 UI 线程会有明显顿感 */
+/* Audio open runs on a worker thread: prebuffering waits on the network and would visibly stall the UI thread */
 static std::mutex       g_openMx;
-static std::atomic<int> g_openGen{ 0 };     // 每次请求 +1，过时的线程结果直接丢
-static std::atomic<int> g_openResult{ 0 };  // 0 无 / 1 成功 / -1 失败
-static std::wstring     g_openUrl;          // 最近一次尝试的地址（UI 线程读）
+static std::atomic<int> g_openGen{ 0 };     // +1 per request; stale thread results are dropped
+static std::atomic<int> g_openResult{ 0 };  // 0 none / 1 ok / -1 failed
+static std::wstring     g_openUrl;          // last attempted URL (read by the UI thread)
 
-/* 关音频也要下后台：停设备 + join 下载线程实测 16~31ms，卡在 UI 上就是掉一帧 */
+/* Closing audio also goes async: stopping the device + joining the download thread measures 16~31ms, which drops a frame on the UI thread */
 static void BeginCloseAsync() {
-    ++g_openGen;            // 让在途的 open 作废
+    ++g_openGen;            // invalidate in-flight opens
     g_openResult = 0;
     std::thread([] {
         std::lock_guard<std::mutex> lk(g_openMx);
@@ -2126,9 +2126,9 @@ static void BeginOpenAsync(const std::wstring& url) {
     g_openResult = 0;
     std::thread([url, gen]() {
         std::lock_guard<std::mutex> lk(g_openMx);
-        if (g_openGen.load() != gen) return;           // 已经被更新的请求取代
-        bool ok = AudioOpen(url);                      // 这里会阻塞到预缓冲完成
-        if (g_openGen.load() != gen) {                 // 期间又切歌了：丢掉
+        if (g_openGen.load() != gen) return;           // already superseded by a newer request
+        bool ok = AudioOpen(url);                      // blocks until prebuffering completes
+        if (g_openGen.load() != gen) {                 // track changed meanwhile: discard
             if (ok) AudioClose();
             return;
         }
@@ -2139,32 +2139,32 @@ static int           g_urlIdx = -1;
 
 static std::string   g_token2_unused;
 
-/* 淡入淡出 */
-static float g_vol = 1.0f;              // 淡入淡出用的系数
-static float g_userVol = 0.8f;          // 用户音量 0..1
-static bool  g_volOpen = false;         // 音量面板展开
+/* Fade in/out */
+static float g_vol = 1.0f;              // fade factor
+static float g_userVol = 0.8f;          // user volume 0..1
+static bool  g_volOpen = false;         // volume panel expanded
 static bool  g_volDrag = false;
-static D2D1_RECT_F g_volTrack{};        // 弹出面板里滑杆的矩形（拖拽要用）
+static D2D1_RECT_F g_volTrack{};        // slider rect inside the popup (needed for dragging)
 static bool  g_volMuted = false;
 static float g_volBeforeMute = 0.8f;
 
-/** 实际下发给 MCI 的音量：淡入淡出系数 × 用户音量 */
+/** Volume actually handed to MCI: fade factor × user volume */
 static void ApplyVolume() {
     if (g_audioOk) AudioSetVolume((int)(g_vol * g_userVol * 900.0f + 0.5f));
 }
 
 static std::wstring LocalDir();
 
-/* ── 音质选择 ── */
-static int  g_quality = 1;              // 0 128K / 1 320K / 2 无损
+/* ── Quality selection ── */
+static int  g_quality = 1;              // 0 128K / 1 320K / 2 lossless
 static bool g_qualOpen = false;
-// MCI 只能解 mp3，FLAC 无损会 open 失败，所以只提供这两档
+// MCI only decodes mp3; lossless FLAC fails to open, so only these two tiers are offered
 static const int      kQualCount = 3;
 static const wchar_t* kQualName[3] = { T(L"标准", L"Standard"), T(L"高品", L"High"), T(L"无损", L"Lossless") };
 static const char*    kQualApi[3]  = { "128", "320", "flac" };
 
-/* 当前这首歌实际有哪些档位：bit0=标准 bit1=高品 bit2=无损
-   未知(0xFF) 时三档全显示；解析完按拿到的档位收窄 */
+/* Which tiers the current song actually has: bit0=standard bit1=high bit2=lossless
+   Unknown (0xFF) shows all three; once resolved it narrows to the tiers returned */
 static std::mutex    g_qmMx;
 static int           g_qmIdx = -1;
 static unsigned char g_qmMask = 0xFF;
@@ -2218,14 +2218,14 @@ static void LoadVolume() {
     if (v >= 0 && v <= 100) g_userVol = v / 100.0f;
 }
 
-/** 音量按钮 + 弹出的滑杆（画在下一首右边） */
+/** Volume button + popup slider (drawn to the right of the next button) */
 static void DrawVolume(float px, float by, float cy);
-static int   g_fadeDir = 0;            // +1 淡入 -1 淡出
-static int   g_pendingDir = 0;         // 淡出结束后要切的歌
-static int   g_pendingPick = -1;       // 选歌界面点了别的歌：等旧歌淡出后再装新的
-static int   g_pendingSeekMs = -1;     // 重装后要跳到的位置（切音质时用）
+static int   g_fadeDir = 0;            // +1 fade in, -1 fade out
+static int   g_pendingDir = 0;         // track to switch to after fade-out finishes
+static int   g_pendingPick = -1;       // another song was picked in the list: load it after the old one fades out
+static int   g_pendingSeekMs = -1;     // position to seek to after reload (used when changing quality)
 
-/* 进度条拖动 */
+/* Progress bar dragging */
 static bool      g_seekDrag = false;
 static ULONGLONG g_lastSeek = 0;
 
@@ -2252,7 +2252,7 @@ static std::string HttpGet(const std::wstring& url) {
     HINTERNET hInet = InternetOpenW(L"KugouPlayer/1.0", INTERNET_OPEN_TYPE_DIRECT,
                                     nullptr, nullptr, 0);
     if (!hInet) return out;
-    // 默认超时是分钟级：接口没起来时会把工作线程挂住，必须自己设
+    // Default timeouts are minute-scale; a dead service would hang the worker thread, so set them explicitly
     DWORD ct = 5000, rt = 8000;
     InternetSetOptionW(hInet, INTERNET_OPTION_CONNECT_TIMEOUT, &ct, sizeof(ct));
     InternetSetOptionW(hInet, INTERNET_OPTION_SEND_TIMEOUT, &ct, sizeof(ct));
@@ -2271,7 +2271,7 @@ static std::string HttpGet(const std::wstring& url) {
     return out;
 }
 
-/* ── 内嵌资源：接口服务 exe + 歌单默认数据 ── */
+/* ── Embedded resources: service exe + default playlist data ── */
 static bool ReadRes(int id, std::string& out) {
     HRSRC h = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
     if (!h) return false;
@@ -2287,7 +2287,7 @@ static bool ReadRes(int id, std::string& out) {
 
 
 static HANDLE g_apiProc = nullptr;
-static HANDLE g_qqProc   = nullptr;      // 自己拉起来的接口服务，退出时要收掉
+static HANDLE g_qqProc   = nullptr;      // service we spawned ourselves; must be reaped on exit
 
 static std::wstring LocalDir() {
     wchar_t buf[MAX_PATH] = { 0 };
@@ -2297,11 +2297,11 @@ static std::wstring LocalDir() {
     return d;
 }
 
-/** 确保 127.0.0.1:3000 有服务：先看有没有在跑，没有再解压内嵌的 exe 拉起来 */
-/* 启动一个 Node 类型的 sidecar：已在跑就跳过，否则解压并拉起，最后等端口就绪 */
+/** Make sure 127.0.0.1:3000 is served: check whether it's already running, else unpack the embedded exe and start it */
+/* Start a Node-style sidecar: skip if already running, else unpack and launch it, then wait for the port */
 static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
                              const wchar_t* probe, HANDLE* procOut, const char* name) {
-    if (!HttpGet(probe).empty()) return true;              // 已在跑
+    if (!HttpGet(probe).empty()) return true;              // already running
 
     if (!ExtractSidecars()) {
         Logf("ERR", "%s：sidecars 解压失败", name);
@@ -2325,7 +2325,7 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
     if (procOut) *procOut = pi.hProcess; else CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    for (int i = 0; i < 80; i++) {                        // 最多等 20 秒
+    for (int i = 0; i < 80; i++) {                        // wait up to 20s
         if (!HttpGet(probe).empty()) break;
         Sleep(250);
     }
@@ -2335,7 +2335,7 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
 
 static void EnsureSidecar() {
 #ifndef FLORAL_NO_TOGETHER
-    // 一起听助手：MQTT 凭据通过环境变量传进去
+    // Listen-together helper: MQTT credentials are passed via environment variables
     SetEnvironmentVariableW(L"FLORAL_MQTT_HOST", L"k9bf6e3a.ala.cn-shenzhen.emqxsl.cn");
     SetEnvironmentVariableW(L"FLORAL_MQTT_PORT", L"8883");
     SetEnvironmentVariableW(L"FLORAL_MQTT_USER", L"Floral");
@@ -2351,14 +2351,14 @@ static void EnsureSidecar() {
                          L"http://127.0.0.1:3200/", &g_qqProc, "QQ 接口服务");
         return;
     }
-    if (g_source == 1) {                                  // 网易云
-        SetEnvironmentVariableW(L"REAL_IP", L"116.25.146.177");   // 不加这个全是 502
+    if (g_source == 1) {                                  // NetEase
+        SetEnvironmentVariableW(L"REAL_IP", L"116.25.146.177");   // without this every request is a 502
         StartNodeSidecar(L"netease", L"server.js",
                          L"http://127.0.0.1:4000/", &g_apiProc, "网易云接口服务");
         return;
     }
 
-    // 酷狗：内嵌的 pkg 单文件 exe，不需要 node
+    // Kugou: embedded single-file pkg exe, no node needed
     if (!HttpGet(L"http://127.0.0.1:3000/").empty()) return;
 
     std::string bytes;
@@ -2401,7 +2401,7 @@ static void EnsureSidecar() {
     }
 }
 
-/** 取 JSON 里的字符串字段，容忍冒号/逗号后的空白（node 写的 json 带空格） */
+/** Read a JSON string field, tolerating whitespace after the colon/comma (node-written json has spaces) */
 static std::string JsonStr(const std::string& s, const char* key) {
     std::string k = std::string("\"") + key + "\"";
     size_t p = s.find(k);
@@ -2451,7 +2451,7 @@ static std::wstring Widen(const std::string& s) {
     return w;
 }
 
-/** 读 kugou-session.json 里的 token / userid */
+/** Read token / userid from kugou-session.json */
 static void LoadSession() {
     std::wstring p = FindProjectFile(L"kugou-session.json");
     if (p.empty()) return;
@@ -2463,7 +2463,7 @@ static void LoadSession() {
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
     fclose(f);
-    if (g_source == 1 || g_source == 2) {     // 网易云 / QQ：整条 cookie 当 token
+    if (g_source == 1 || g_source == 2) {     // NetEase / QQ: the whole cookie is the token
         g_token = JsonStr(s, "cookie");
         g_userid = g_token.empty() ? "" : "1";
         return;
@@ -2478,7 +2478,7 @@ static void LoadSession() {
     }
 }
 
-/** 取 JSON 里的整数字段，容忍空白 */
+/** Read a JSON integer field, tolerating whitespace */
 static int JsonInt(const std::string& s, const char* key) {
     std::string k = std::string("\"") + key + "\"";
     size_t p = s.find(k);
@@ -2490,7 +2490,7 @@ static int JsonInt(const std::string& s, const char* key) {
     return atoi(s.c_str() + p);
 }
 
-/** 设备 id（酷狗风控要 dfid），带 1 小时缓存，多线程共用 */
+/** Device id (Kugou risk control wants dfid), cached for 1 hour, shared across threads */
 static std::string GetDfid() {
     static std::mutex  mx;
     static std::string cached;
@@ -2514,7 +2514,7 @@ static ULONGLONG g_lastLoginCheck = 0;
 static void CheckLoginAsync();
 static void Trace(const char* fmt, ...);
 
-/** 播放失败了：顺手复查一次登录态（15 秒内不重复查），失效就直接亮提示条 */
+/** Playback failed: also recheck sign-in state (at most once per 15s); if invalid, raise the banner right away */
 static void RecheckLoginOnFailure() {
     ULONGLONG now = GetTickCount64();
     if (now - g_lastLoginCheck < 15000) return;
@@ -2525,14 +2525,14 @@ static void RecheckLoginOnFailure() {
 static void CheckLoginAsync() {
     g_lastLoginCheck = GetTickCount64();
     if (g_userid.empty() || g_token.empty()) {
-        g_loginState = 2;                // 连 session 文件都没有，不用发请求
+        g_loginState = 2;                // no session file at all, no need to send a request
         return;
     }
     std::string uid = g_userid, tok = g_token;
     int src = g_source;
     Trace("login check start");
     std::thread([uid, tok, src]() {
-        if (src == 2) {                       // QQ：查 3200 的 /login/status
+        if (src == 2) {                       // QQ: query /login/status on 3200
             std::string raw = HttpGet(Widen("http://127.0.0.1:3200/login/status?cookie=qqmusic_session%3D" +
                                             UrlEnc(tok)));
             if (raw.empty()) { g_loginState = 3; return; }
@@ -2541,7 +2541,7 @@ static void CheckLoginAsync() {
             g_loginState = 1;
             return;
         }
-        if (src == 1) {                       // 网易云：查 4000 的 /user/account
+        if (src == 1) {                       // NetEase: query /user/account on 4000
             std::string raw = HttpGet(Widen("http://127.0.0.1:4000/user/account?cookie=" +
                                             UrlEnc(NgTrimCookie(tok))));
             if (raw.empty()) { g_loginState = 3; return; }
@@ -2561,7 +2561,7 @@ static void CheckLoginAsync() {
         std::string r = HttpGet(Widen("http://127.0.0.1:3000/user/detail?cookie=" +
                                       UrlEnc(cookie)));
         Trace("login resp len=%d", (int)r.size());
-        if (r.empty()) {                 // 接口没响应，不是登录的问题
+        if (r.empty()) {                 // no response from the service; not a sign-in problem
             g_loginState = 3;
             return;
         }
@@ -2575,9 +2575,9 @@ static void CheckLoginAsync() {
     }).detach();
 }
 
-/** 解析一首歌的播放地址（会阻塞，只在后台线程里调） */
+/** Resolve a song's play URL (blocking; only call from worker threads) */
 static std::wstring ResolvePlayUrl(int idx) {
-    // 一进来就把要用的字段拷出来，之后不再碰 g_app（可能在别的线程被重建）
+    // Copy the fields we need up front and never touch g_app again (it may be rebuilt on another thread)
     std::string hash, cookie;
     long long mixId = 0, albumId = 0;
     {
@@ -2591,9 +2591,9 @@ static std::wstring ResolvePlayUrl(int idx) {
     }
     if (hash.empty()) return L"";
 
-    // dfid 有缓存就用缓存（GetDfid 内部加锁，多个解析线程可以同时进）
+    // Reuse the cached dfid when available (GetDfid locks internally, so resolver threads may enter concurrently)
     Logf("SRC", "解析 qq id=%s 档位=%d", hash.c_str(), g_quality);
-    if (g_source == 2) {                       // QQ 音乐
+    if (g_source == 2) {                       // QQ Music
         std::wstring e;
         int got = -1;
         std::wstring u = QqResolveUrl(hash, g_token, g_quality, e, &got);
@@ -2608,7 +2608,7 @@ static std::wstring ResolvePlayUrl(int idx) {
         return u;
     }
     Logf("SRC", "解析 qq id=%s 档位=%d", hash.c_str(), g_quality);
-    if (g_source == 2) {                       // QQ 音乐
+    if (g_source == 2) {                       // QQ Music
         std::wstring e;
         int got = -1;
         std::wstring u = QqResolveUrl(hash, g_token, g_quality, e, &got);
@@ -2622,7 +2622,7 @@ static std::wstring ResolvePlayUrl(int idx) {
         }
         return u;
     }
-    if (g_source == 1) {                       // 网易云
+    if (g_source == 1) {                       // NetEase
         static const char* lv[3] = { "standard", "exhigh", "lossless" };
         std::wstring e;
         Logf("SRC", "解析 netease id=%s 档位=%d", hash.c_str(), g_quality);
@@ -2641,7 +2641,7 @@ static std::wstring ResolvePlayUrl(int idx) {
             "http://127.0.0.1:3000/song/url?id=%s&album_audio_id=%lld&album_id=%lld&quality=%s&cookie=%s",
             hash.c_str(), mixId, albumId, kQualApi[g_quality], UrlEnc(cookie).c_str());
 
-    // 不是每首歌都有无损/高品：先按请求档位试，拿不到就逐级往下退
+    // Not every song has lossless/high: try the requested tier first, then step down one level at a time
     std::string lastResp;
     for (int q = g_quality; q >= 0; q--) {
         char u2[2048];
@@ -2662,7 +2662,7 @@ static std::wstring ResolvePlayUrl(int idx) {
         }
     }
 
-    {   // 失败时把请求和返回写出来，方便排查
+    {   // on failure dump the request and response to ease debugging
         FILE* lf = nullptr;
         _wfopen_s(&lf, (AssetDir() + L"\\url_debug.txt").c_str(), L"wb");
         if (lf) {
@@ -2675,7 +2675,7 @@ static std::wstring ResolvePlayUrl(int idx) {
     return L"";
 }
 
-/** 找这一首的本地音频：audio/<hash>.mp3（有就用本地，没有就流播） */
+/** Find this song's local audio: audio/<hash>.mp3 (use it when present, else stream) */
 static std::wstring FindAudio(int idx) {
     App& a = g_app;
     if (idx < 0 || idx >= (int)a.songs.size()) return L"";
@@ -2684,7 +2684,7 @@ static std::wstring FindAudio(int idx) {
     return FindProjectFile(L"audio\\" + std::wstring(h.begin(), h.end()) + L".mp3");
 }
 
-/** 追踪日志：默认关闭，加 --trace 启动才写（打包版不产生垃圾文件） */
+/** Trace log: off by default, only written when started with --trace (keeps the packaged build litter-free) */
 static bool g_traceOn = false;
 
 static void Trace(const char* fmt, ...) {
@@ -2710,7 +2710,7 @@ static void StartFadeIn() {
     g_fadeDir = 1;
 }
 
-/* ── 地址预取：当前这首开始放，就顺手把下一首的地址解析好 ── */
+/* ── URL prefetch: when the current track starts playing, resolve the next one too ── */
 static std::mutex g_preMx;
 static std::map<int, std::wstring> g_urlCache;
 static std::vector<int> g_preFetching;
@@ -2733,7 +2733,7 @@ static void PrefetchUrl(int idx) {
     }).detach();
 }
 
-/** 换曲目：先看本地文件，没有就后台解析地址流播 */
+/** Change track: try the local file first, else resolve the URL in the background and stream */
 static void LoadAudioFor(int idx) {
     Trace("LoadAudioFor idx=%d", idx);
     BeginCloseAsync();
@@ -2742,7 +2742,7 @@ static void LoadAudioFor(int idx) {
     g_pendingDir = 0;
     g_audioError = false;
     g_audioErrKind = 0;
-    g_audioLoading = true;              // 先挂上"加载中"，出位置就撤
+    g_audioLoading = true;              // raise "loading" first; clear it once there's a position
     g_loadingSince = GetTickCount64();
 
     std::wstring local = FindAudio(idx);
@@ -2750,11 +2750,11 @@ static void LoadAudioFor(int idx) {
         AudioPlay();
         g_audioOk = true;
         StartFadeIn();
-        g_audioLoading = false;        // 本地文件，不用转圈
+        g_audioLoading = false;        // local file, no spinner needed
         return;
     }
 
-    // 预取过的地址直接用，省一次往返
+    // Reuse a prefetched URL to save a round trip
     std::wstring cached;
     {
         std::lock_guard<std::mutex> lk(g_preMx);
@@ -2764,7 +2764,7 @@ static void LoadAudioFor(int idx) {
     Logf("AUD", "尝试打开本地缓存 idx=%d", idx);
     if (!cached.empty()) {
         g_loadingMin = GetTickCount64() + 300;
-        BeginOpenAsync(cached);                  // 网络流：后台开，别卡 UI
+        BeginOpenAsync(cached);                  // network stream: open in the background, don't stall the UI
         PrefetchUrl((idx + 1) % (int)g_app.songs.size());
         return;
     }
@@ -2775,7 +2775,7 @@ static void LoadAudioFor(int idx) {
         g_urlReady.clear();
         g_urlIdx = idx;
     }
-    g_loadingMin = GetTickCount64() + 600;   // 流播至少让圈转 0.6 秒
+    g_loadingMin = GetTickCount64() + 600;   // keep the spinner up at least 0.6s when streaming
     std::thread([idx]() {
         Trace("resolve start idx=%d", idx);
         std::wstring u = ResolvePlayUrl(idx);
@@ -2797,7 +2797,7 @@ static void SwitchTrackNow(int dir) {
     int from = a.current;
     int to = (from + dir % n + n) % n;
 
-    // 记住切换前盒子里放的是哪两首，动画期间先显示它们
+    // Remember which two songs the cases held before switching so they show during the animation
     g_casePrev0 = (from - 1 + n) % n;
     g_caseNext0 = (from + 1) % n;
 
@@ -2810,12 +2810,12 @@ static void SwitchTrackNow(int dir) {
     a.current = to;
     a.pos = 0.0;
     a.playing = true;
-    g_audioRetry = 0;              // 新的一首，重试次数归零
+    g_audioRetry = 0;              // new song: reset the retry count
 
     LoadAudioFor(to);
 }
 
-/** 切歌入口：音频正在放就先淡出，淡完再真切，避免硬切爆音 */
+/** Track-switch entry: fade out first if audio is playing, then switch, avoiding a hard-cut pop */
 static void SwitchTrack(int dir) {
     if (g_audioOk && g_pendingDir == 0 && g_fadeDir >= 0) {
         g_pendingDir = dir;
@@ -2825,7 +2825,7 @@ static void SwitchTrack(int dir) {
     SwitchTrackNow(dir);
 }
 
-/** 方格上的歌曲信息（压暗底 + 曲名 + 歌手） */
+/** Song info on a tile (scrim + title + artist) */
 static void DrawTileInfo(const D2D1_RECT_F& r, const Song& s, float a) {
     float w = r.right - r.left;
     float h = r.bottom - r.top;
@@ -2847,7 +2847,7 @@ static void DrawTileInfo(const D2D1_RECT_F& r, const Song& s, float a) {
          DWRITE_TEXT_ALIGNMENT_LEADING, a * 0.85f);
 }
 
-/** 格子 → CD 的形变：discK=0 是方图，1 是圆盘；infoK 控制方框上的歌曲信息 */
+/** Tile → CD morph: discK=0 is the square art, 1 the disc; infoK drives the song info on the square */
 static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float discK, float infoK) {
     if (discK < 0.0f) discK = 0.0f;
     if (discK > 1.0f) discK = 1.0f;
@@ -2857,28 +2857,28 @@ static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float di
         return;
     }
 
-    // 全程连续：黑胶盘从小长到满，封面同时往中心缩。没有"到某个值才出现"的开关
+    // Fully continuous: the vinyl grows from small to full while the cover shrinks toward the center. No "appears at some threshold" switch
     const float e = discK * discK * (3.0f - 2.0f * discK);      // smoothstep
     const float w = r.right - r.left;
     const float cx = (r.left + r.right) * 0.5f;
     const float cy = (r.top + r.bottom) * 0.5f;
     const float R  = w * 0.5f;
 
-    // 先算封面，再让黑胶"从封面边缘往外长"——环的厚度从 0 连续增加，
-    // 不会出现"某一帧突然多出一圈黑"的跳变
-    const float artR  = R + (R * 0.66f - R) * e;                // R → 0.66R（和 DrawDisc 一致）
-    const float discR = artR + (R - artR) * e;                  // 从 artR 长到 R
+    // Compute the cover first, then grow the vinyl outward from the cover edge — the ring thickness grows continuously from 0,
+    // so there is no "a black ring suddenly appears on one frame" jump
+    const float artR  = R + (R * 0.66f - R) * e;                // R → 0.66R (matches DrawDisc)
+    const float discR = artR + (R - artR) * e;                  // grows from artR to R
     FillCircle(cx, cy, discR, 0x2A2026, 1.0f);
-    const float radius = UI::R_TILE + (artR - UI::R_TILE) * e;  // 圆角 → 正圆
+    const float radius = UI::R_TILE + (artR - UI::R_TILE) * e;  // rounded square → perfect circle
     DrawCoverArt(Rc(cx - artR, cy - artR, artR * 2.0f, artR * 2.0f), s, idx, radius);
 
-    // 还是方框形态时，歌曲信息跟着淡出
+    // While still in square form, the song info fades out with it
     if (infoK > 0.0f && e < 0.55f) {
         float ia = infoK * (1.0f - e / 0.55f);
         if (ia > 0.0f) DrawTileInfo(r, s, ia);
     }
 
-    // 纹路和中心孔：跟着盘面一起淡出来
+    // Grooves and center hole: fade in together with the disc
     if (e > 0.15f) {
         float k = (e - 0.15f) / 0.85f;
         StrokeCircle(cx, cy, discR * 0.93f, 0xFFFFFF, 0.05f * k, 1.0f);
@@ -2890,7 +2890,7 @@ static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float di
 
 static void DrawSpinner(float cx, float cy, float r, float ang, float alpha);
 
-/** 转场用：直接扫布局取视口内的块，不依赖分条索引（分条表可能是空的/过期的） */
+/** For transitions: scan the layout directly for tiles in the viewport, without relying on the band index (the band table may be empty or stale) */
 static const std::vector<TileBox>& TransBoxes() {
     return (g_draw.size() == g_base.size()) ? g_draw : g_base;
 }
@@ -2907,13 +2907,13 @@ static void CollectVisible(float W, float H, std::vector<int>& out) {
     }
 }
 
-/** 进播放页的转场（只画到主盘就位，之后交给 DrawPlayerPage） */
+/** Transition into the player page (draws only until the main disc is in place, then DrawPlayerPage takes over) */
 static void DrawEntering() {
     App& a = g_app;
     const float W = a.width, H = a.height;
     const int n = (int)a.songs.size();
     const bool hasSel = (g_enterIdx >= 0 && g_enterIdx < n);
-    if (n == 0) return;                 // 一首歌都没有，没什么可散的
+    if (n == 0) return;                 // no songs at all, nothing to scatter
 
     const float lineY = UI::TITLE_H + 4.0f;
     const float dd = (std::min)(W * 0.42f, H * 0.62f);
@@ -2925,8 +2925,8 @@ static void DrawEntering() {
     auto ease = [](float x) { return x * x * (3.0f - 2.0f * x); };
     auto clamp01 = [](float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
 
-    // ── 1. 其他格子化作 CD：从原位直接飞向正上 / 正下 ──
-    // 注意：转场期间网格层不画了，所以这里从第 0 帧就要把它们画在原位
+    // ── 1. Other tiles turn into CDs: fly straight up / down from where they are ──
+    // Note: the grid layer isn't drawn during the transition, so they must be drawn in place from frame 0
     {
         CollectVisible(W, H, g_vis);
         const std::vector<TileBox>& boxes = TransBoxes();
@@ -2938,14 +2938,14 @@ static void DrawEntering() {
             float c0y = bx.y + GRID_TOP - a.scroll + bx.h * 0.5f;
             if (c0y < -200.0f || c0y > H + 200.0f) continue;
 
-            // 离中轴越远越晚出发
+            // the farther from the center axis, the later it starts
             float sx = std::fabs(c0x - W * 0.5f) / (W * 0.5f);
             float eo = clamp01((t - 0.10f - sx * 0.10f) / 0.50f);
-            if (eo >= 1.0f) continue;                  // 已经飞没了
+            if (eo >= 1.0f) continue;                  // already flown away
 
             float e = (eo <= 0.0f) ? 0.0f : ease(eo);
             float dirY = (c0y < cy) ? -1.0f : 1.0f;
-            float tx = W * 0.5f;                                   // 正上 / 正下
+            float tx = W * 0.5f;                                   // straight up / down
             float ty = (dirY < 0) ? (-dd * 0.75f) : (H + dd * 0.75f);
 
             float nx = c0x + (tx - c0x) * e;
@@ -2956,8 +2956,8 @@ static void DrawEntering() {
         }
     }
 
-    // ── 2. 选中的那首：先挪到正中等着，等其他 CD 全飞完了再变盘就位 ──
-    //    从顶部按钮进来又没有当前歌曲时没有这一格，整段跳过
+    // ── 2. The selected one: move it to the center and wait; only once all the other CDs have flown away does it morph into the disc ──
+    //    When entered from the top button and there is no current song this tile doesn't exist, so the whole block is skipped
     if (hasSel) {
         D2D1_RECT_F k1 = Rc(W * 0.5f - dd * 0.40f, (lineY + H) * 0.5f - dd * 0.40f,
                             dd * 0.80f, dd * 0.80f);
@@ -2969,7 +2969,7 @@ static void DrawEntering() {
             r = LerpRect(g_enterFrom, k1, p);
             discK = 0.0f;
         } else if (t < 0.66f) {
-            r = k1;                 // 停在正中，等别人走干净
+            r = k1;                 // rest at the center, waiting for the others to clear out
             discK = 0.0f;
         } else {
             float p = clamp01((t - 0.66f) / 0.14f);
@@ -2980,7 +2980,7 @@ static void DrawEntering() {
         DrawMorphDisc(r, a.songs[(size_t)g_enterIdx], g_enterIdx, discK, 1.0f);
     }
 
-    // ── 3. 分隔线 ──
+    // ── 3. Divider ──
     {
         float e = g_lineT * g_lineT * (3.0f - 2.0f * g_lineT);
         float lw = W * e;
@@ -2989,8 +2989,8 @@ static void DrawEntering() {
 }
 
 
-/** 环形加载圈：一段逐渐变亮的圆弧，转起来当 spinner */
-/* 极简加载环：一根细轨道 + 一段圆弧扫过，圆头端帽，无发光 */
+/** Ring loader: an arc that gradually brightens, spun as a spinner */
+/* Minimal loader ring: a thin track + one sweeping arc, round caps, no glow */
 static void StrokeArc(float cx, float cy, float r, float startDeg, float sweepDeg,
                       UINT32 col, float alpha, float w) {
     if (!g_d2d || !g_brush || !g_rt || r < 1.0f) return;
@@ -3023,19 +3023,19 @@ static void StrokeArc(float cx, float cy, float r, float startDeg, float sweepDe
     g_brush->SetColor(Col(col));
     g_brush->SetOpacity(alpha * g_alphaMul);
     g_rt->DrawGeometry(geo, g_brush, w, ss);
-    g_brush->SetOpacity(1.0f);          // 画笔是共享的，用完必须复位
+    g_brush->SetOpacity(1.0f);          // brush is shared, must be reset after use
     if (ss) ss->Release();
     geo->Release();
 }
 
 static void DrawSpinner(float cx, float cy, float r, float ang, float alpha) {
     const float w = 2.0f;
-    // 轨道：整圈很淡
+    // track: full circle, very faint
     StrokeCircle(cx, cy, r, UI::ACCENT, alpha * 0.13f, w);
-    // 扫过的弧：100°，圆头
+    // sweeping arc: 100°, round caps
     StrokeArc(cx, cy, r, ang, 100.0f, UI::ACCENT, alpha * 0.95f, w);
 }
-/** 任意实心多边形 */
+/** Arbitrary filled polygon */
 static void FillPoly(const D2D1_POINT_2F* p, int n, UINT32 col, float a) {
     if (!g_d2d || !g_brush || n < 3) return;
     ID2D1PathGeometry* geo = nullptr;
@@ -3050,11 +3050,11 @@ static void FillPoly(const D2D1_POINT_2F* p, int n, UINT32 col, float a) {
     g_brush->SetColor(Col(col));
     g_brush->SetOpacity(a * g_alphaMul);
     g_rt->FillGeometry(geo, g_brush);
-    g_brush->SetOpacity(1.0f);          // 同上
+    g_brush->SetOpacity(1.0f);          // same as above
     geo->Release();
 }
 
-/** 喇叭图标：一条闭合路径画主体，声波用旋钮式弧线 */
+/** Speaker icon: body drawn as one closed path, sound waves as knob-style arcs */
 static void DrawSpeakerIcon(float cx, float cy, float s, bool muted, float vol) {
     UINT32 col = muted ? UI::TEXT3 : UI::TEXT2;
     D2D1_POINT_2F pts[6] = {
@@ -3067,12 +3067,12 @@ static void DrawSpeakerIcon(float cx, float cy, float s, bool muted, float vol) 
     };
     FillPoly(pts, 6, col, 1.0f);
 
-    if (muted || vol <= 0.02f) {                 // 静音：叉
+    if (muted || vol <= 0.02f) {                 // muted: cross
         Line(cx + s * 0.55f, cy - s * 0.5f, cx + s * 1.5f, cy + s * 0.5f, UI::TEXT3, 1.7f);
         Line(cx + s * 1.5f, cy - s * 0.5f, cx + s * 0.55f, cy + s * 0.5f, UI::TEXT3, 1.7f);
         return;
     }
-    // 一到三圈声波：半径递增，透明度递减
+    // one to three sound waves: radius increases, opacity decreases
     int waves = (vol > 0.7f) ? 3 : (vol > 0.35f ? 2 : 1);
     float base = cx + s * 0.38f;
     for (int w = 0; w < waves; w++) {
@@ -3089,7 +3089,7 @@ static void DrawSpeakerIcon(float cx, float cy, float s, bool muted, float vol) 
     }
 }
 
-/** 实心三角（旧接口保留） */
+/** Filled triangle (legacy interface kept) */
 static void FillTri(float x1, float y1, float x2, float y2, float x3, float y3,
                     UINT32 col, float a) {
     if (!g_d2d || !g_brush) return;
@@ -3106,23 +3106,23 @@ static void FillTri(float x1, float y1, float x2, float y2, float x3, float y3,
     g_brush->SetColor(Col(col));
     g_brush->SetOpacity(a * g_alphaMul);
     g_rt->FillGeometry(geo, g_brush);
-    g_brush->SetOpacity(1.0f);          // 同上
+    g_brush->SetOpacity(1.0f);          // same as above
     geo->Release();
 }
 
-/** 音量按钮 + 弹出滑杆 */
+/** Volume button + pop-up slider */
 static void DrawVolume(float px, float by, float cy) {
     D2D1_RECT_F vb = Rc(px + 186, by, 40, 40);
     bool hv = Inside(vb, g_app.mouse);
     if (hv || g_volOpen) FillRound(vb, 20.0f, UI::HOVER);
 
-    // 喇叭图标
+    // speaker icon
     DrawSpeakerIcon(vb.left + 19.0f, by + 20.0f, 8.0f, g_volMuted, g_userVol);
     Hit hv2; hv2.r = vb; hv2.kind = HK_VOL;
     if (g_alpha > 0.5f) g_app.hits.push_back(hv2);
 
 
-    // ── 音质按钮（音量右边）──
+    // ── Quality button (right of volume) ──
     D2D1_RECT_F qb = Rc(vb.right + 10.0f, by + 8.0f, 52, 24);
     bool qh = Inside(qb, g_app.mouse);
     if (qh || g_qualOpen) FillRound(qb, 12.0f, UI::HOVER);
@@ -3149,7 +3149,7 @@ static void DrawVolume(float px, float by, float cy) {
         UINT32 fg = !avail ? 0xC9B8BE : (cur ? UI::ACCENT_TEXT : UI::TEXT2);
         Text(kQualName[i], Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL),
              Rc(row.left + 12, row.top, 60, rh), fg);
-        if (!avail) {                                  // 这首歌没有这一档
+        if (!avail) {                                  // this song doesn't have this tier
             Text(T(L"不可用", L"Unavailable"), Fmt(10.0f, DWRITE_FONT_WEIGHT_NORMAL),
                  Rc(row.right - 52, row.top, 44, rh), 0xC9B8BE,
                  DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -3158,10 +3158,10 @@ static void DrawVolume(float px, float by, float cy) {
             if (g_alpha > 0.5f) g_app.hits.push_back(hqi);
         }
     }
-    }   // ← 音质面板到此结束
+    }   // ← quality panel ends here
 
 #ifndef FLORAL_NO_TOGETHER
-    // ── 一起听按钮（音质右边）──
+    // ── Together Listening button (right of quality) ──
     {
         D2D1_RECT_F tb2 = Rc(qb.right + 10.0f, by, 40.0f, 40.0f);
         bool th2 = Inside(tb2, g_app.mouse);
@@ -3169,7 +3169,7 @@ static void DrawVolume(float px, float by, float cy) {
         if (th2 || g_togOpen) FillRound(tb2, 20.0f, UI::HOVER);
         UINT32 icol = on ? UI::ACCENT : UI::TEXT2;
         const float ccx = tb2.left + 20.0f, ccy = by + 22.0f;
-        // 耳麦：上半圆弧 + 两侧耳罩
+        // headset: upper semicircle + earcups on both sides
         {
             const float rr = 8.5f;
             for (int k = 0; k <= 12; k++) {
@@ -3192,7 +3192,7 @@ static void DrawVolume(float px, float by, float cy) {
             if (tp.left < 12.0f) tp = Rc(12.0f, by + 46.0f, pw2, ph2);
             FillRound(Rc(tp.left + 3, tp.top + 8, pw2, ph2), 12.0f, UI::SHADOW, 0.14f);
             FillRound(tp, 12.0f, UI::PANEL);
-            {   // 卡片空白处吞掉点击，别一碰就关
+            {   // swallow clicks on the card's empty area so it doesn't close on any touch
                 Hit hcard; hcard.r = tp; hcard.kind = HK_TOG_CARD;
                 if (g_alpha > 0.5f) g_app.hits.push_back(hcard);
             }
@@ -3224,7 +3224,7 @@ static void DrawVolume(float px, float by, float cy) {
                 Hit hl; hl.r = lv; hl.kind = HK_TOG_LEAVE;
                 if (g_alpha > 0.5f) g_app.hits.push_back(hl);
             } else {
-                // 第一行：我的连接码
+                // first row: my connection code
                 Text(T(L"我的房间码", L"My room code"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
                      Rc(tp.left + 16, tp.top + 12, 100, 16), UI::TEXT3);
 
@@ -3243,7 +3243,7 @@ static void DrawVolume(float px, float by, float cy) {
                 hb2.kind = code.empty() ? HK_TOG_HOST : HK_TOG_COPY;
                 if (g_alpha > 0.5f) g_app.hits.push_back(hb2);
 
-                // 第二行：输入对方连接码
+                // second row: enter the peer's connection code
                 Text(T(L"输入房间码，回车加入", L"Enter room code, press Enter"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
                      Rc(tp.left + 16, tp.top + 92, pw2 - 32, 16), UI::TEXT3);
                 D2D1_RECT_F ib = Rc(tp.left + 16, tp.top + 112, pw2 - 116, 30);
@@ -3286,12 +3286,12 @@ static void DrawVolume(float px, float by, float cy) {
     }
 #endif  // FLORAL_NO_TOGETHER
 
-    if (g_volT <= 0.01f) return;         // ↓ 音量面板，两者互不影响
+    if (g_volT <= 0.01f) return;         // ↓ volume panel; the two don't affect each other
     PanelFx fxv(g_volT, vb.left + 20.0f, by + 20.0f);
 
-    // 弹出卡片
+    // pop-up card
     const float pw = 190.0f, ph = 54.0f;
-    // 开在按钮右边，别挡住进度条和时间；右边放不下就翻到左边
+    // open to the right of the button so it doesn't cover the progress bar and time; flip to the left if there's no room on the right
     D2D1_RECT_F pop = Rc(vb.right + 10, by - 6.0f, pw, ph);
     if (pop.right > g_app.width - 12.0f) pop = Rc(vb.left - 10 - pw, by - 6.0f, pw, ph);
     FillRound(Rc(pop.left + 3, pop.top + 8, pw, ph), 12.0f, UI::SHADOW, 0.14f);
@@ -3316,25 +3316,25 @@ static void DrawVolume(float px, float by, float cy) {
 
 static void DrawPlayerPage();
 
-/** 退出播放页：先整屏淡出，再让网格从右边飞入（和开屏同一套） */
+/** Leaving the player page: fade the whole screen out, then let the grid fly in from the right (same sequence as the splash) */
 static void DrawExiting() {
     App& a = g_app;
     const float W = a.width, H = a.height;
     const int n = (int)a.songs.size();
     const float t = g_exitT;
 
-    // ── 阶段 A：播放页整屏淡到底色 ──
+    // ── Phase A: fade the whole player page to the background color ──
     if (t < 0.22f) {
         DrawPlayerPage();
         g_alpha = 1.0f;
-        DrawTitleBar(W);                 // 顶栏也要一起淡掉，否则点击返回的瞬间会「啪」地消失
+        DrawTitleBar(W);                 // Fade the title bar out too, or it vanishes with a pop the moment Back is clicked
         a.hits.clear();
         FillRect(Rc(0, 0, W, H), UI::BG, t / 0.22f);
         return;
     }
     if (n == 0) return;
 
-    // ── 阶段 B：网格从右边飞入 ──
+    // ── Phase B: the grid flies in from the right ──
     const float tb = (t - 0.22f) / 0.78f;
     EnsureBase(W, n);
     EnsureTarget(W, n, -1);
@@ -3360,7 +3360,7 @@ static void DrawExiting() {
         g_alphaMul = 1.0f;
     }
 
-    // 顶栏统一由 DrawUI 在最上层画（不透明），这里不再重复画一条半透明的
+    // DrawUI draws the title bar opaquely on top; don't duplicate it with a translucent one here
 }
 
 static void DrawPlayerPage() {
@@ -3368,15 +3368,15 @@ static void DrawPlayerPage() {
     const float W = a.width, H = a.height;
     const int n = (int)a.songs.size();
     if (a.current < 0 || a.current >= n) {
-        // ── 还没选歌：空白唱片 + 提示 ──
+        // ── No song selected: blank record + hint ──
         const float lineY = UI::TITLE_H + 4.0f;
         const float dd = (std::min)(W * 0.42f, H * 0.62f);
         const float cx = dd * 0.10f;
         const float cy = (lineY + H) * 0.5f;
         {
-            // 空白唱片：黑胶盘面 + 几道纹路 + 中心贴纸（没有封面）
+            // Blank record: vinyl disc + a few grooves + center label (no cover art)
             float r = dd * 0.5f;
-            // 空唱片：底色 / 纹路 / 中心贴纸全部跟主题
+            // Empty record: base color / grooves / center label all follow the theme
             FillCircle(cx, cy, r, UI::DISC);
             for (int i = 1; i <= 4; i++) {
                 float rr = r * (0.50f + 0.11f * (float)i);
@@ -3386,7 +3386,7 @@ static void DrawPlayerPage() {
             FillCircle(cx, cy, r * 0.33f, MixColor(UI::SELECT, UI::PANEL, 0.35f));
             StrokeRound(Rc(cx - r * 0.33f, cy - r * 0.33f, r * 0.66f, r * 0.66f),
                         r * 0.33f, UI::BTN_CLOSE, 1.2f);
-            FillCircle(cx, cy, 4.5f, UI::PANEL);           // 轴孔
+            FillCircle(cx, cy, 4.5f, UI::PANEL);           // spindle hole
         }
 
         D2D1_RECT_F back = Rc(W * 0.46f - 6.0f, UI::TITLE_H + 18.0f, 96, 28);
@@ -3405,7 +3405,7 @@ static void DrawPlayerPage() {
     }
     const Song& s = a.songs[(size_t)a.current];
 
-    // 返回（放到右侧信息栏上方，左上角留给专辑盒子）
+    // Back button (above the info column on the right; top-left is kept for the album box)
     D2D1_RECT_F back = Rc(W * 0.46f - 6.0f, UI::TITLE_H + 18.0f, 96, 28);
     bool bh = Inside(back, a.mouse);
     if (bh) FillRound(back, UI::R_BTN, UI::HOVER);
@@ -3416,19 +3416,19 @@ static void DrawPlayerPage() {
     Hit hb; hb.r = back; hb.kind = HK_BACK;
     if (g_alpha > 0.5f) a.hits.push_back(hb);
 
-    // ── 左：主 CD 居中；上一首 / 下一首缩成小 CD 藏在左上、左下角，只露一角 ──
+    // ── Left: main CD centered; prev / next shrink into small CDs tucked in the top-left and bottom-left corners, only a sliver showing ──
     const float lineY = UI::TITLE_H + 4.0f;
     const float dd = (std::min)(W * 0.42f, H * 0.62f);
-    const float cx = dd * 0.10f;                            // 圆心略偏出左边缘
+    const float cx = dd * 0.10f;                            // disc center sits slightly past the left edge
     const float cy = (lineY + H) * 0.5f;
 
-    // 转场余下的部分：角落弹出、右侧浮现
+    // Rest of the transition: corners pop in, right side fades in
     float cornerK;
     {
         float k = (g_enterT - 0.80f) / 0.20f;
         k = (k < 0.0f) ? 0.0f : (k > 1.0f ? 1.0f : k);
         float ek = 1.0f - powf(1.0f - k, 3.0f);
-        // 弹过头一点再收回：0 → 118% → 100%
+        // Overshoot a little, then settle: 0 → 118% → 100%
         float pop = (ek <= 0.75f) ? (ek / 0.75f) * 1.18f
                                   : 1.18f - 0.18f * ((ek - 0.75f) / 0.25f);
         cornerK = (k <= 0.0f) ? 0.0f : pop;
@@ -3441,14 +3441,14 @@ static void DrawPlayerPage() {
 
     D2D1_RECT_F discRect = Rc(cx - dd * 0.5f, cy - dd * 0.5f, dd, dd);
 
-    // 角落小 CD：圆心压进角落，露出比四分之一多一点
+    // Corner mini CD: center pushed into the corner, showing a bit more than a quarter
     const float sr = (std::max)(28.0f, dd * 0.115f);
     D2D1_RECT_F discPrev = Rc(sr * 0.25f - sr, lineY + sr * 0.25f - sr, sr * 2, sr * 2);
     D2D1_RECT_F discNext = Rc(sr * 0.25f - sr, H - sr * 0.25f - sr, sr * 2, sr * 2);
 
     const bool switching = (g_switchT < 1.0f) && (g_switchFrom >= 0) && (g_switchFrom < n);
 
-    // 转场时角落从无到有地弹出
+    // Corners pop in from nothing during the transition
     if (cornerK < 1.0f) {
         auto shrink = [cornerK](const D2D1_RECT_F& r) {
             float mx = (r.left + r.right) * 0.5f;
@@ -3461,12 +3461,12 @@ static void DrawPlayerPage() {
         discNext = shrink(discNext);
     }
 
-    // 角落两张小的（裁到分隔线以下，不压标题）
-    // 上角：切歌期间保持"原来那张"，等旧盘落上去之后再换——正好被盖住，不会闪
+    // The two small corner discs (clipped below the divider so they don't cover the title)
+    // Top corner: keep the "old disc" while switching, swap after the outgoing disc lands on it — exactly when it's hidden, so no flicker
     int cornerPrev = prevIdx;
     if (switching && g_casePrev0 >= 0 && g_casePrev0 < n) cornerPrev = g_casePrev0;
 
-    // 飞行的起止点：完全在画面外，所以是"从看不见的地方转进来 / 转出去"
+    // Flight start/end points: fully off-screen, so discs "spin in from / out to nowhere"
     D2D1_RECT_F offPrev = Rc(-sr * 2.2f, lineY - sr * 2.2f, sr * 2, sr * 2);
     D2D1_RECT_F offNext = Rc(-sr * 2.2f, H + sr * 1.2f,    sr * 2, sr * 2);
 
@@ -3478,10 +3478,10 @@ static void DrawPlayerPage() {
 
         const bool fwd = (g_switchDir > 0);
 
-        // 正位这张去向 / 新的一张来处
+        // Where the centered disc goes / where the new one comes from
         D2D1_RECT_F toCorner   = fwd ? discPrev : discNext;
         D2D1_RECT_F fromCorner = fwd ? discNext : discPrev;
-        // 被挤走的那张 / 补进来的那张
+        // The disc being pushed out / the one sliding in
         D2D1_RECT_F pushOut = fwd ? discPrev : discNext;
         D2D1_RECT_F slideIn = fwd ? discNext : discPrev;
         D2D1_RECT_F outOff  = fwd ? offPrev  : offNext;
@@ -3491,22 +3491,22 @@ static void DrawPlayerPage() {
         int slideIdx  = fwd ? nextIdx : prevIdx;
         if (pushedIdx < 0 || pushedIdx >= n) pushedIdx = slideIdx;
 
-        // 角度都收敛到 g_discAngle，飞行途中各多转一整圈
+        // All angles converge to g_discAngle; each disc spins one extra full turn in flight
         float angOut = g_discAngle + 360.0f * e;
         float angIn  = g_discAngle + 360.0f * (1.0f - e);
 
-        // 1) 角落最老的那张：让位，转出画面
+        // 1) Oldest corner disc: yields, spins off-screen
         DrawDisc(LerpRect(pushOut, outOff, e), a.songs[(size_t)pushedIdx], pushedIdx, angOut, 1.0f);
-        // 2) 新的一张：从画面外补到角落
+        // 2) New disc: comes in from off-screen to the corner
         DrawDisc(LerpRect(inOff, slideIn, e), a.songs[(size_t)slideIdx], slideIdx, angIn, 1.0f);
-        // 3) 正位这张：缩进角落
+        // 3) Centered disc: shrinks into the corner
         DrawDisc(LerpRect(discRect, toCorner, e), a.songs[(size_t)g_switchFrom],
                  g_switchFrom, angOut, 1.0f);
-        // 4) 角落那张：放大转到正位（最上层）
+        // 4) Corner disc: grows and spins into the center (topmost)
         DrawDisc(LerpRect(fromCorner, discRect, e), s, a.current, angIn, 1.0f);
     } else {
         if (cornerK > 0.01f) {
-            // 角落两张小唱片静止不转，点一下切到那首
+            // Corner mini discs stay still; click one to switch to that song
             DrawDisc(discPrev, a.songs[(size_t)prevIdx], prevIdx, 0.0f, 1.0f);
             DrawDisc(discNext, a.songs[(size_t)nextIdx], nextIdx, 0.0f, 1.0f);
             if (g_alpha > 0.5f && !switching) {
@@ -3520,7 +3520,7 @@ static void DrawPlayerPage() {
     }
     g_rt->PopAxisAlignedClip();
 
-    // 加载中不改盘面，只在播放按钮上转小圈
+    // While loading, leave the disc alone; just spin a small ring on the play button
     const bool showSpin = g_audioLoading && (GetTickCount64() - g_loadingSince > 180);
     {
         float e = g_lineT * g_lineT * (3.0f - 2.0f * g_lineT);
@@ -3528,12 +3528,12 @@ static void DrawPlayerPage() {
         if (lw > 0.5f) Line(W - lw, lineY, W, lineY, 0xC9AEB8, 1.0f);
     }
 
-    // ── 右：歌曲信息 ──
+    // ── Right: song info ──
     const float px = (std::max)(W * 0.46f, cx + dd * 0.5f + 90.0f);
     const float pw = W - px - UI::PAD * 2;
     g_alphaMul = infoK;
     if (pw > 80.0f) {
-        // 三行：下一首往左滑出、从右滑入；上一首反过来。逐行错开 30ms
+        // Three rows: next slides out left and in from the right; prev is reversed. Rows staggered by 30ms
         const float SLIDE = 26.0f;
         auto drawSet = [&](const std::wstring& tt, const std::wstring& ar, const std::wstring& al,
                            float phase, bool entering) {
@@ -3549,13 +3549,13 @@ static void DrawPlayerPage() {
             };
             for (int i = 0; i < 3; i++) {
                 float t = lineT(i);
-                // 位移和透明度都走曲线：进场 ease-out 减速落位，退场 ease-in 加速离开
+                // Both offset and alpha are eased: enter decelerates (ease-out), exit accelerates (ease-in)
                 float e = entering ? (1.0f - powf(1.0f - t, 3.0f)) : (t * t);
                 float a = entering ? e : (1.0f - e);
                 if (a <= 0.01f) continue;
                 float dx = entering ? (1.0f - e) * SLIDE * (float)g_textDir
                                     : -e * SLIDE * (float)g_textDir;
-                dx = floorf(dx + 0.5f);          // 取整：亚像素会让字形每帧抖
+                dx = floorf(dx + 0.5f);          // Round to integers: subpixels make glyphs jitter every frame
                 Text(*rows[i].s, Fmt(rows[i].size, rows[i].w),
                      Rc(px + dx, rows[i].y, pw, rows[i].size + 12.0f),
                      rows[i].c, DWRITE_TEXT_ALIGNMENT_LEADING, a);
@@ -3565,11 +3565,11 @@ static void DrawPlayerPage() {
 
 
         if (g_textPhase == 1) {
-            drawSet(g_outTitle, g_outArtist, g_outAlbum, g_textT, false);   // 旧文字滑出
+            drawSet(g_outTitle, g_outArtist, g_outAlbum, g_textT, false);   // Old text slides out
         } else if (g_textPhase == 2) {
-            drawSet(s.title, s.artist, s.album, g_textT, true);             // 新文字滑入
+            drawSet(s.title, s.artist, s.album, g_textT, true);             // New text slides in
         } else {
-            drawSet(s.title, s.artist, s.album, 10.0f, true);               // 静止：直接满
+            drawSet(s.title, s.artist, s.album, 10.0f, true);               // Idle: fully shown
         }
 
         if (g_audioError) {
@@ -3577,7 +3577,7 @@ static void DrawPlayerPage() {
                  Rc(px, cy - 10, pw, 18), UI::ACCENT);
         }
 
-        // 进度
+        // Progress
         float barW = (std::min)(pw, 380.0f);
         float barY = cy + 10.0f;
         float ratio = s.durationSec > 0 ? (float)(a.pos / s.durationSec) : 0.0f;
@@ -3598,7 +3598,7 @@ static void DrawPlayerPage() {
              Rc(px + barW - 60, barY + 10, 60, 16), UI::TEXT3,
              DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-        // 上一首 / 播放 / 下一首
+        // Previous / Play / Next
         float by = cy + 58.0f;
         float r = 26.0f;
 
@@ -3617,23 +3617,23 @@ static void DrawPlayerPage() {
         if (showSpin) {
             DrawSpinner(bx, byy, r * 0.55f, g_spinAngle, 1.0f);
         } else {
-            // 暂停（两条竖线）与播放（三角）之间做 120ms 交叉淡化
-            // 播放 ⇄ 暂停：几何形变。两个四边形同时插值，
-            // 三角形的右顶点拆开长成右边的竖条，主体收成左边的竖条。
-            // 不做淡入淡出，所以任何时刻都只有一个实心图形，也不会空帧。
+            // Cross-fade between pause (two bars) and play (triangle) over 120ms
+            // Play ⇄ Pause: geometric morph. Two quads interpolate simultaneously,
+            // the triangle's right vertex splits and grows into the right bar, while the body shrinks into the left bar.
+            // No fading, so there is always exactly one solid shape and never an empty frame.
             {
                 float e = g_playIconMix;
-                e = e * e * (3.0f - 2.0f * e);            // smoothstep：起步和收尾都软
+                e = e * e * (3.0f - 2.0f * e);            // smoothstep: soft start and finish
                 auto L = [&](float a, float b) { return a + (b - a) * e; };
 
-                // 左块：三角形（顶点重复）→ 左竖条
+                // Left quad: triangle (duplicated vertex) → left bar
                 D2D1_POINT_2F left[4] = {
                     D2D1::Point2F(bx + L(-6.0f, -6.0f), byy + L(-9.5f, -8.0f)),
                     D2D1::Point2F(bx + L( 8.0f, -2.6f), byy + L( 0.0f, -8.0f)),
                     D2D1::Point2F(bx + L( 8.0f, -2.6f), byy + L( 0.0f,  8.0f)),
                     D2D1::Point2F(bx + L(-6.0f, -6.0f), byy + L( 9.5f,  8.0f)),
                 };
-                // 右块：全部缩在三角形顶点（不可见）→ 右竖条
+                // Right quad: collapsed into the triangle's vertex (invisible) → right bar
                 D2D1_POINT_2F right[4] = {
                     D2D1::Point2F(bx + L(8.0f, 2.6f), byy + L(0.0f, -8.0f)),
                     D2D1::Point2F(bx + L(8.0f, 6.0f), byy + L(0.0f, -8.0f)),
@@ -3657,10 +3657,10 @@ static void DrawPlayerPage() {
 
         DrawVolume(px, by, cy);
     }
-    g_alphaMul = 1.0f;      // 恢复，别影响标题栏
+    g_alphaMul = 1.0f;      // Restore, so the title bar isn't affected
 }
 
-/* ── 选中歌单：后台拉曲目 → 主线程换歌单 ── */
+/* ── Playlist selected: fetch tracks in the background → swap playlist on the main thread ── */
 static std::string PlSafe(const std::string& s) {
     std::string r = s;
     for (char& c : r) if (!(isalnum((unsigned char)c) || c == '_' || c == '-')) c = '_';
@@ -3669,7 +3669,7 @@ static std::string PlSafe(const std::string& s) {
 
 static std::mutex      g_plSwapMx;
 static std::atomic<bool> g_plBusy{ false };
-static std::wstring    g_plSwapFile;       // 拉好了的 tsv 文件名
+static std::wstring    g_plSwapFile;       // Name of the fetched tsv file
 static int             g_plSwapIdx = -1;
 static std::wstring    g_plSwapErr;
 
@@ -3678,7 +3678,7 @@ static void SelectPlaylistAsync(int idx) {
     if (g_plBusy.exchange(true)) return;
 
     std::string gcid = g_app.playlists[(size_t)idx].gcid;
-    const std::string safe = PlSafe(gcid);          // 注意：不能对两个临时对象取 begin/end
+    const std::string safe = PlSafe(gcid);          // Note: don't call begin/end on two temporaries
     std::wstring name = L"pl-" + std::wstring(safe.begin(), safe.end()) + L".tsv";
     std::wstring path = AssetDir() + L"\\" + name;
 
@@ -3696,7 +3696,7 @@ static void SelectPlaylistAsync(int idx) {
     }).detach();
 }
 
-/* 主线程：把拉好的歌单换进来 */
+/* Main thread: swap in the fetched playlist */
 static void DrainPlaylistSwap() {
     std::wstring file;
     std::wstring err;
@@ -3720,7 +3720,7 @@ static void DrainPlaylistSwap() {
         a.pageAnim = 0.0f;
         a.page = Page::Grid;
         a.plActive = idx;
-        g_gridEnter = 0.0f;          // 选歌页：曲目从右侧飞入
+        g_gridEnter = 0.0f;          // Song page: tracks fly in from the right
         g_coverDirty = true;
         Logf("APP", "歌单已切换：%d 首", (int)a.songs.size());
     } else if (!err.empty()) {
@@ -3728,15 +3728,15 @@ static void DrainPlaylistSwap() {
     }
 }
 /* ══════════════════════════════════════════
-   歌单选择页：圆形蜂窝排布，可拖动
+   Playlist picker: circular honeycomb layout, draggable
    ══════════════════════════════════════════ */
-static const float PL_D      = 96.0f;               // 圆直径
-static const float PL_PILL_W = 300.0f;              // 展开的胶囊宽度
-static const float PL_GAP    = 1.16f;               // 圆之间留够呼吸感
+static const float PL_D      = 96.0f;               // Disc diameter
+static const float PL_PILL_W = 300.0f;              // Width of the expanded pill
+static const float PL_GAP    = 1.16f;               // Leave enough breathing room between discs
 static const float PL_SQ3    = 1.7320508f;
 
-/* 正六边形排布：以中心为第 0 环向外扩散，
-   坐标为轴向坐标 (q, r)，相邻圆心距离 = 直径 */
+/* Hexagonal layout: ring 0 is the center, expanding outward;
+   coordinates are axial (q, r), adjacent centers are one diameter apart */
 struct PlCell { float x, y; };
 static std::vector<PlCell> g_plCells;
 static int                 g_plCellsFor = -1;
@@ -3746,18 +3746,18 @@ static void BuildPlCells(int n) {
     g_plCellsFor = n;
     if (n <= 0) return;
 
-    const float step = PL_D * PL_GAP;       // 相邻圆心距
+    const float step = PL_D * PL_GAP;       // Distance between adjacent centers
 
-    // 第 0 环：圆心
+    // Ring 0: the center
     g_plCells.push_back({ 0.0f, 0.0f });
 
     int left = n - 1;
     for (int ring = 1; left > 0; ring++) {
-        int cap = 6 * ring;                 // 这一环能放几个
+        int cap = 6 * ring;                 // How many fit in this ring
         int take = (left < cap) ? left : cap;
         if (take == cap) {
-            // 整环：走六边形点阵，保证邻居等距
-            // 环起点 (ring, 0)，依次沿 6 条边推进
+            // Full ring: walk the hexagonal lattice so neighbors stay equidistant
+            // Start at (ring, 0), then advance along the 6 edges in order
             const int dirs[6][2] = { { -1, 1 }, { -1, 0 }, { 0, -1 }, { 1, -1 }, { 1, 0 }, { 0, 1 } };
             int q = ring, r = 0;
             for (int d = 0; d < 6 && take > 0; d++) {
@@ -3770,8 +3770,8 @@ static void BuildPlCells(int n) {
                 }
             }
         } else {
-            // 不满一圈：先取这一环的全部格子，按角度排好，再等间隔挑 take 个
-            // 这样仍落在六边形点阵上，间距均匀，整体也是对称的六边形
+            // Partial ring: take all cells in this ring, sort by angle, then pick `take` at equal intervals
+            // This keeps cells on the hexagonal lattice with even spacing, and the whole stays a symmetric hexagon
             std::vector<PlCell> ringCells;
             const int dirs[6][2] = { { -1, 1 }, { -1, 0 }, { 0, -1 }, { 1, -1 }, { 1, 0 }, { 0, 1 } };
             int q = ring, r0 = 0;
@@ -3816,7 +3816,7 @@ static void PlContentSize(float& w, float& h) {
     h = (maxY - minY) + PL_D;
 }
 
-/* 平移范围：最外圈那些圆心最多拖到窗口边上（圆心连成的多边形就是边界） */
+/* Pan limits: outermost centers can be dragged at most to the window edge (the polygon of centers is the boundary) */
 static void PlClampPan() {
     App& a = g_app;
     if (g_plCellsFor != (int)a.playlists.size()) BuildPlCells((int)a.playlists.size());
@@ -3829,8 +3829,8 @@ static void PlClampPan() {
         minY = (std::min)(minY, c.y); maxY = (std::max)(maxY, c.y);
     }
 
-    // 判定点是窗口中心：拖动时它必须始终落在最外圈圆心围成的范围里
-    // 屏幕上中心恒为 (0,0)（内容坐标），即要求 minX+plX <= 0 <= maxX+plX
+    // The test point is the window center: while dragging it must stay inside the outermost ring's centers
+    // On screen the center is always (0,0) in content coords, i.e. require minX+plX <= 0 <= maxX+plX
     float minPanX = -maxX;
     float maxPanX = -minX;
     float minPanY = -maxY;
@@ -3845,7 +3845,7 @@ static void PlClampPan() {
     if (a.plY > maxPanY) a.plY = maxPanY;
 }
 
-/* 进入歌单页时把内容摆到正中 */
+/* Center the content when entering the playlist page */
 static void PlCenterContent() {
     g_app.plX = 0.0f;
     g_app.plY = 0.0f;
@@ -3858,8 +3858,8 @@ static void PlCenterContent() {
     PlClampPan();
 }
 
-/* 选中后其它圆被推开的偏移 */
-/* 第 i 个圆在屏幕上的圆心（不含推开） */
+/* Offset by which other discs are pushed away after selection */
+/* On-screen center of disc i (before push-away) */
 static void PlScreenCenter(int i, float& cx, float& cy) {
     App& a = g_app;
     float x = 0, y = 0;
@@ -3868,7 +3868,7 @@ static void PlScreenCenter(int i, float& cx, float& cy) {
     cy = UI::TITLE_H + (a.height - UI::TITLE_H) * 0.5f + y + a.plY;
 }
 
-/* 展开后胶囊卡片的屏幕矩形（没选中时是空矩形） */
+/* Screen rect of the expanded pill card (empty rect when nothing is selected) */
 static D2D1_RECT_F PlCapsuleRect() {
     App& a = g_app;
     if (a.plActive < 0) return Rc(0, 0, 0, 0);
@@ -3882,7 +3882,7 @@ static D2D1_RECT_F PlCapsuleRect() {
               PL_PILL_W * e + R * 2.0f + 20.0f, pillH);
 }
 
-/* 展开后卡片的目标矩形（窗口正中） */
+/* Target rect of the expanded card (window center) */
 static D2D1_RECT_F PlCardTargetRect() {
     const float W = g_app.width, H = g_app.height;
     const float cardW = (std::min)(620.0f, W - 80.0f);
@@ -3892,11 +3892,11 @@ static D2D1_RECT_F PlCardTargetRect() {
     return Rc(cx - cardW * 0.5f, cy - cardH * 0.5f, cardW, cardH);
 }
 
-/* 当前帧所有圆的最终屏幕圆心（含让位与去重叠），绘制和点击共用 */
+/* Final on-screen centers of all discs this frame (with yield + de-overlap), shared by drawing and hit-testing */
 static std::vector<D2D1_POINT_2F> g_plPos;
 static int g_plPosFor = -1;
 
-/* Container Transform：其它圆不参与布局，选中时整体淡出即可 */
+/* Container Transform: other discs don't take part in the layout; just fade them all out on selection */
 static void PlBuildPositions() {
     App& a = g_app;
     const int n = (int)a.playlists.size();
@@ -3908,7 +3908,7 @@ static void PlBuildPositions() {
         g_plPos[(size_t)i] = D2D1::Point2F(cx, cy);
     }
 }
-/* 第 i 个圆的最终屏幕圆心 */
+/* Final on-screen center of disc i */
 static void PlScreenPos(int i, float& cx, float& cy) {
     App& a = g_app;
     if (g_plPosFor != (int)a.playlists.size()) PlBuildPositions();
@@ -3931,7 +3931,7 @@ static void DrawPlaylistPicker() {
         return;
     }
 
-    // 正在拉歌单：底部给个提示，别让人以为点坏了
+    // Playlist is loading: show a hint at the bottom so it doesn't look broken
     if (g_plBusy.load()) {
         FillRect(Rc(0, UI::TITLE_H, W, H - UI::TITLE_H), UI::BG, 0.55f);
         DrawSpinner(W * 0.5f, H * 0.5f - 10.0f, 20.0f, (float)(GetTickCount64() % 4000) * 0.26f, 0.95f);
@@ -3944,9 +3944,9 @@ static void DrawPlaylistPicker() {
 
     const float R = PL_D * 0.5f;
 
-    PlBuildPositions();          // 本帧所有圆的最终位置（让位 + 去重叠）
+    PlBuildPositions();          // Final positions of all discs this frame (yield + de-overlap)
 
-    // ── Container Transform：选中的圆长成卡片，其它圆淡出 ──
+    // ── Container Transform: the selected disc grows into a card, others fade out ──
     float selE = 0.0f;
     D2D1_RECT_F cardR{};
     float cardRadius = 0.0f;
@@ -3959,13 +3959,13 @@ static void DrawPlaylistPicker() {
         PlScreenPos(a.plActive, ccx, ccy);
         const Playlist& spl = a.playlists[(size_t)a.plActive];
 
-        // 目标卡片：窗口正中，宽 620 高 150
+        // Target card: window center, 620 wide, 150 high
         D2D1_RECT_F from = Rc(ccx - R, ccy - R, R * 2, R * 2);
         D2D1_RECT_F to   = PlCardTargetRect();
         const float cardCY = (to.top + to.bottom) * 0.5f;
 
         auto L = [&](float p, float q) { return p + (q - p) * selE; };
-        // 先插值四条边，再换算成 Rc 需要的宽高
+        // Interpolate the four edges first, then convert to the width/height Rc needs
         float cardL = L(from.left, to.left);
         float cardT = L(from.top, to.top);
         float cardRt = L(from.right, to.right);
@@ -3973,20 +3973,20 @@ static void DrawPlaylistPicker() {
         cardR = Rc(cardL, cardT, cardRt - cardL, cardB - cardT);
         cardRadius = L(R, 26.0f);
 
-        // 背景压暗，衬托卡片
+        // Darken the background to set off the card
         if (selE > 0.02f) FillRect(Rc(0, UI::TITLE_H, W, H - UI::TITLE_H), 0x000000, 0.28f * selE);
 
         FillRound(cardR, cardRadius, UI::CARD, 0.99f);
         StrokeRound(cardR, cardRadius, UI::BORDER, 0.80f, 1.0f);
 
-        // 封面：从圆心滑到卡片左侧的头像位
+        // Cover: slides from the disc center to the avatar slot on the card's left
         const float avR = R * 0.92f;
         float avToX = to.left + 30.0f + avR;
         float avToY = cardCY;
         avatarCx = L(ccx, avToX);
         avatarCy = L(ccy, avToY);
 
-        // 文字：标题 0.15 / 曲目数 0.42 / 提示 0.60 开始出现
+        // Text: title starts at 0.15 / track count at 0.42 / hint at 0.60
         auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
         float tx = avToX + avR + 22.0f;
         float tw = to.right - tx - 30.0f;
@@ -4013,7 +4013,7 @@ static void DrawPlaylistPicker() {
         }
     }
 
-    // 封面画成圆形（选中项的头像也用它）
+    // Draw the cover as a circle (also used as the selected item's avatar)
     auto drawCoverCircle = [&](int idx, float cx, float cy, float rad, float alpha) {
         const Playlist& pl = a.playlists[(size_t)idx];
         RequestPlaylistCover(idx);
@@ -4056,10 +4056,10 @@ static void DrawPlaylistPicker() {
         }
     };
 
-    // 未选中的圆：随卡片展开淡出（Container Transform 的"其余内容淡出"）
+    // Unselected discs: fade out as the card expands ("fade everything else" of Container Transform)
     float othersA = 1.0f - selE * 0.92f;
     for (int i = 0; i < n; i++) {
-        if (i == a.plActive) continue;                 // 选中的改由卡片头像表示
+        if (i == a.plActive) continue;                 // The selected one is represented by the card avatar instead
         float cx = 0, cy = 0;
         PlScreenPos(i, cx, cy);
         if (cx < -R * 1.4f || cx > W + R * 1.4f) continue;
@@ -4074,22 +4074,22 @@ static void DrawPlaylistPicker() {
         g_alphaMul = keep;
 
         Hit h; h.r = Rc(cx - R, cy - R, R * 2, R * 2); h.kind = HK_PL; h.index = i;
-        if (g_alpha > 0.5f && a.plActive < 0) a.hits.push_back(h);   // 选中后圆已淡出，不再响应
+        if (g_alpha > 0.5f && a.plActive < 0) a.hits.push_back(h);   // Once selected the disc has faded out; no longer responds
     }
 
-    // 选中项的头像：跟着卡片一起从圆心滑到卡片左侧
+    // Selected item's avatar: slides with the card from the disc center to the card's left
     if (a.plActive >= 0 && a.plActive < n && selE > 0.01f) {
         drawCoverCircle(a.plActive, avatarCx, avatarCy, R * 0.92f, 1.0f);
         StrokeCircle(avatarCx, avatarCy, R * 0.92f - 0.75f, UI::ACCENT, 0.9f * selE, 1.6f);
     }
 }
 /* ══════════════════════════════════════════
-   总绘制
+   Main draw
    ══════════════════════════════════════════ */
 /* ══════════════════════════════════════════
-   开屏动画：空白 → 曲目从右侧飞入依次排好 → 标题栏浮现
+   Splash: blank → tracks fly in from the right and line up → title bar appears
    ══════════════════════════════════════════ */
-/** 第一阶段：logo 与文字浮现、停留、渐隐 */
+/** Phase 1: logo and text fade in, hold, then fade out */
 static void DrawSplash(float t, float W, float H) {
     float a;
     if (t < SPLASH_IN)                 a = t / SPLASH_IN;
@@ -4098,7 +4098,7 @@ static void DrawSplash(float t, float W, float H) {
     if (a <= 0.0f) return;
     if (a > 1.0f) a = 1.0f;
 
-    // 浮现时从下方微微升起
+    // Rises slightly from below while fading in
     float in = (t < SPLASH_IN) ? (t / SPLASH_IN) : 1.0f;
     float e = 1.0f - powf(1.0f - in, 3.0f);
     float dy = (1.0f - e) * 18.0f;
@@ -4107,7 +4107,7 @@ static void DrawSplash(float t, float W, float H) {
 
     g_alphaMul = a;
 
-    // 图标 + 标题作为一组，整体居中
+    // Icon + title as one group, centered as a whole
     const float logoD = 92.0f, gap = 18.0f, titleH = 30.0f;
     const float totalH = logoD + gap + titleH;
     const float top = (H - totalH) * 0.5f + dy;
@@ -4129,22 +4129,22 @@ static void DrawIntro() {
     int n = (int)a.songs.size();
     if (n == 0) return;
 
-    // 加载阶段：只有一个居中的加载环，不出现 logo 和文字
+    // Loading phase: only a centered spinner, no logo or text
     if (!g_loadDone) {
         const float cx = W * 0.5f;
         const float cy = H * 0.5f;
-        // 开头 200ms 淡入，避免从纯色背景里"啪"地蹦出来
+        // Fade in over the first 200ms so it doesn't pop out of the flat background
         float fade = g_loadT / 0.20f;
         if (fade > 1.0f) fade = 1.0f;
         DrawSpinner(cx, cy, 20.0f, g_loadT * 260.0f, 0.95f * fade);
-        DrawTitleBar(W);          // 顶栏从第一帧就完整可用
+        DrawTitleBar(W);          // The title bar is fully usable from the first frame
         return;
     }
 
-    // 第一阶段：logo + 文字浮现 → 渐隐
+    // Phase 1: logo + text fade in → fade out
     if (g_introT < INTRO_TILE_START) {
         DrawSplash(g_introT, W, H);
-        // 加载环在开头 200ms 内淡出，和 logo 的淡入交接
+        // The spinner fades out within the first 200ms, handing over to the logo fade-in
         if (g_introT < 0.20f) {
             float f = 1.0f - g_introT / 0.20f;
             DrawSpinner(W * 0.5f, H * 0.5f, 20.0f, g_loadT * 260.0f, 0.95f * f);
@@ -4153,13 +4153,13 @@ static void DrawIntro() {
         return;
     }
 
-    // 开屏之后直接交给歌单选择页（它自己淡入），不再飞入歌曲卡片
+    // After the splash, hand over directly to the playlist picker (it fades itself in); no more flying song cards
     DrawTitleBar(W);
 }
 
 static void DrawUI(ID2D1RenderTarget* rt) {
     Bind(rt);
-    {   // 主题变了：占位渐变要跟着重建
+    {   // Theme changed: rebuild the placeholder gradient too
         static int lastGen = -1;
         if (lastGen != ThemeGeneration()) {
             lastGen = ThemeGeneration();
@@ -4167,8 +4167,8 @@ static void DrawUI(ID2D1RenderTarget* rt) {
             Logf("APP", "主题换代 %d：占位渐变已重建", lastGen);
         }
     }
-    DrainDecoded();               // 后台解好的封面搬进来
-    DrainCovers();                // 按需下载的封面落地，排进解码
+    DrainDecoded();               // Bring in covers decoded in the background
+    DrainCovers();                // On-demand downloaded covers arrive and queue up for decoding
     App& a = g_app;
     const float W = a.width, H = a.height;
 
@@ -4176,32 +4176,32 @@ static void DrawUI(ID2D1RenderTarget* rt) {
     g_alpha = 1.0f;
     FillRect(Rc(0, 0, W, H), UI::BG);
 
-    // 设置面板打开时，先屏蔽背景的 hover：把鼠标挪到画面外，画完面板再还原
+    // While the settings panel is open, suppress background hover: move the mouse off-screen, restore after drawing the panel
     const POINT realMouse = a.mouse;
     if (g_settingsOpen) a.mouse = POINT{ -100000, -100000 };
 
-    if (!g_introDone) {         // 开屏阶段：只画飞入
+    if (!g_introDone) {         // Splash phase: draw only the fly-in
         DrawIntro();
         return;
     }
 
-    if (g_exitOn) {             // 退出播放页：淡出 + 网格飞入
+    if (g_exitOn) {             // Exiting the player page: fade out + grid flies in
         DrawExiting();
         return;
     }
 
     const D2D1_POINT_2F center = D2D1::Point2F(W * 0.5f, H * 0.5f);
 
-    // 歌单选择页：整页独立绘制
+    // Playlist picker: drawn as a separate full page
     if (a.page == Page::Playlists) {
-        g_alpha = g_plEnter;          // 开屏结束后的淡入
+        g_alpha = g_plEnter;          // Fade-in after the splash ends
         DrawPlaylistPicker();
         g_alpha = 1.0f;
         DrawTitleBar(W);
         if (g_setT > 0.01f) {
             a.mouse = realMouse;
-            // 面板是模态的：遮罩和卡片的点击区要在 PanelFx 之外注册，
-            // 否则动画没结束时会被裁掉，点击就会穿透到后面的圆
+            // The panel is modal: the scrim's and card's hit areas must be registered outside PanelFx,
+            // otherwise they're clipped while the animation runs and clicks pass through to the discs behind
             { Hit bg; bg.r = Rc(0, 0, W, H); bg.kind = HK_SET_BG; a.hits.push_back(bg); }
             { Hit hc; hc.r = SettingsCardRect(W, H); hc.kind = HK_SET_CARD; a.hits.push_back(hc); }
             FillRect(Rc(0, 0, W, H), 0x000000, 0.20f * g_setT);
@@ -4211,7 +4211,7 @@ static void DrawUI(ID2D1RenderTarget* rt) {
         return;
     }
 
-    // 网格层
+    // Grid layer
     if (a.pageAnim < 0.999f) {
         g_alpha = 1.0f - a.pageAnim;
         float sc = 1.0f - 0.05f * a.pageAnim;
@@ -4220,11 +4220,11 @@ static void DrawUI(ID2D1RenderTarget* rt) {
         rt->SetTransform(D2D1::Matrix3x2F::Identity());
     }
 
-    // 播放层
+    // Player layer
     if (a.pageAnim > 0.001f) {
         g_alpha = a.pageAnim;
         if (g_enterOn && g_enterT < 0.80f) {
-            DrawEntering();            // 转场前半段：格子飞散 + 主盘就位
+            DrawEntering();            // First half of the transition: tiles scatter + main disc takes its place
         } else {
             rt->SetTransform(D2D1::Matrix3x2F::Scale(1.0f, 1.0f, center));
             DrawPlayerPage();
@@ -4234,50 +4234,50 @@ static void DrawUI(ID2D1RenderTarget* rt) {
 
     g_alpha = 1.0f;
 
-    // 没有账号 / 登录过期：自动弹出平台选择（每次启动只弹一次）
+    // No account / login expired: auto-open platform selection (once per launch)
     if (g_loginState == 2 && !g_loginAsked && !g_loginRunning && !g_exitOn && !g_enterOn) {
         g_loginAsked = true;
         g_settingsOpen = true;
         g_loginChoose = true;
     }
 
-    // 顶栏：全程不透明、每帧都画。不做进场淡入淡出——
-    // 之前那段"隐藏 1.4 秒"既让按钮点不动，又让整条栏看着半透明。
+    // Title bar: always opaque, drawn every frame. No enter fade —
+    // the old "hide for 1.4s" made buttons unclickable and the whole bar look translucent.
     DrawTitleBar(W);
     if (g_setT > 0.01f) {
-        a.mouse = realMouse;         // 面板自己要用真实鼠标做 hover
-        // 遮罩和卡片始终可点（模态），按钮才受动画裁剪
+        a.mouse = realMouse;         // The panel needs the real mouse for hover
+        // Scrim and card are always clickable (modal); only buttons are clipped by the animation
         { Hit bg; bg.r = Rc(0, 0, W, H); bg.kind = HK_SET_BG; a.hits.push_back(bg); }
         { Hit hc; hc.r = SettingsCardRect(W, H); hc.kind = HK_SET_CARD; a.hits.push_back(hc); }
-        FillRect(Rc(0, 0, W, H), 0x000000, 0.20f * g_setT);   // 遮罩只淡入，不缩放
+        FillRect(Rc(0, 0, W, H), 0x000000, 0.20f * g_setT);   // Scrim only fades in, no scaling
         PanelFx fx(g_setT, W * 0.5f, H * 0.5f);
         DrawSettings(W, H);
     }
 }
 
 /* ══════════════════════════════════════════
-   动画
+   Animation
    ══════════════════════════════════════════ */
-/** 真实经过的秒数（动画时间不能按固定 16ms 累加，否则帧率低时会被拉长） */
+/** Real elapsed seconds (animation time must not accumulate a fixed 16ms, or it stretches at low frame rates) */
 static float DeltaSeconds() {
     static ULONGLONG last = 0;
     ULONGLONG now = GetTickCount64();
     if (last == 0) { last = now; return 0.016f; }
     float dt = (float)(now - last) / 1000.0f;
     last = now;
-    if (dt > 0.10f) dt = 0.10f;      // 卡顿时别让动画跳太远
+    if (dt > 0.10f) dt = 0.10f;      // On hitches, don't let the animation jump too far
     return dt;
 }
 
-/** 把"每帧收敛 perFrame"换算成与帧率无关的系数，保证墙钟时长一致 */
+/** Convert "perFrame convergence" into a frame-rate-independent factor so wall-clock duration stays consistent */
 static float Ease(float perFrame, float dt) {
     return 1.0f - powf(1.0f - perFrame, dt * 62.5f);
 }
 
-static void GoPlayer(int idx);  // 定义在后面
+static void GoPlayer(int idx);  // Defined later
 static void SwitchTrack(int delta);
 
-/* ── 一起听：跨平台匹配（异步，别卡 UI） ── */
+/* ── Listen Together: cross-platform matching (async, don't block the UI) ── */
 struct PendPlay {
     bool has = false;
     bool failed = false;
@@ -4295,7 +4295,7 @@ static void TryMatchAsync(const TogetherEvent& ev) {
     std::string key = ev.song + "|" + ev.title;
     {
         std::lock_guard<std::mutex> lk(g_ppMx);
-        if (key == g_matchKey) return;          // 同一首不重复匹配
+        if (key == g_matchKey) return;          // Don't re-match the same song
         g_matchKey = key;
         g_pp = PendPlay{};
     }
@@ -4321,7 +4321,7 @@ static void TryMatchAsync(const TogetherEvent& ev) {
         Logf(ok ? "TOG" : "ERR", "匹配%s %s", ok ? "成功" : "失败", ok ? h.c_str() : Narrow(err).c_str());
     }).detach();
 }
-/* ── 一起听：接收与应用对方状态 ── */
+/* ── Listen Together: receive and apply the peer's state ── */
 static void ApplyRemoteState(const TogetherEvent& ev) {
     App& a = g_app;
     if (ev.song.empty()) { Logf("TOG", "收到状态但没有曲目 id，忽略"); return; }
@@ -4329,7 +4329,7 @@ static void ApplyRemoteState(const TogetherEvent& ev) {
 
     int idx = -1;
     for (int i = 0; i < (int)a.songs.size(); i++) {
-        if (a.songs[i].hash == ev.song) { idx = i; break; }   // hash 是 std::string
+        if (a.songs[i].hash == ev.song) { idx = i; break; }   // hash is a std::string
     }
     if (idx < 0) {
         Logf("TOG", "本地没有该曲目，开始跨平台匹配");
@@ -4338,10 +4338,10 @@ static void ApplyRemoteState(const TogetherEvent& ev) {
     }
     Logf("TOG", "本地命中 idx=%d 当前=%d", idx, a.current);
 
-    // 期望位置：对端发来位置 + 已经过去的时间（UTC 毫秒，跨机器可比）
+    // Expected position: peer's position + elapsed time (UTC ms, comparable across machines)
     long long now = (long long)TogetherNowMs();
     long long elapsed = (now > ev.stampMs) ? (now - ev.stampMs) : 0;
-    if (elapsed > 60000) elapsed = 0;                 // 时钟差太大就只按发来的位置
+    if (elapsed > 60000) elapsed = 0;                 // If clock skew is too large, just use the received position
     long long expectedLL = (long long)ev.posMs + (ev.playing ? elapsed : 0);
     int dur = (idx >= 0 && idx < (int)a.songs.size()) ? a.songs[(size_t)idx].durationSec : 0;
     if (dur > 0 && expectedLL > (long long)dur * 1000 - 1000) expectedLL = (long long)dur * 1000 - 1000;
@@ -4351,27 +4351,27 @@ static void ApplyRemoteState(const TogetherEvent& ev) {
     if (idx != a.current) {
         Logf("TOG", "跟随切歌 %d -> %d", a.current, idx);
         GoPlayer(idx);
-        g_pendingSeekMs = expected;                 // 打开后直接跳到对端位置
+        g_pendingSeekMs = expected;                 // Jump straight to the peer's position once opened
         if (!ev.playing) a.playing = false;
         return;
     }
-    if (ev.playing != a.playing) {                  // 播/停跟对端
+    if (ev.playing != a.playing) {                  // Play/pause follows the peer
         a.playing = ev.playing;
         if (ev.playing) AudioPlay(); else AudioPause();
     }
     if (ev.playing) {
         int mine = (int)(a.pos * 1000.0);
-        if (abs(mine - expected) > 800) {           // 事件点偏差超过 0.8 秒才纠
+        if (abs(mine - expected) > 800) {           // Correct only when the event point is off by more than 0.8s
             AudioSeekMS(expected);
             a.pos = expected / 1000.0;
         }
     }
 }
 
-/* ── 一起听：把自己的状态推出去 ── */
+/* ── Listen Together: push out our own state ── */
 static void PushLocalState(bool force) {
     if (!TogetherActive()) return;
-    // 双方都推：房主推权威状态；跟随方推的只用来让房主知道"有人在听"
+    // Both push: the host pushes authoritative state; a follower's push only lets the host know someone is listening
     App& a = g_app;
     if (a.current < 0 || a.current >= (int)a.songs.size()) return;
 
@@ -4384,7 +4384,7 @@ static void PushLocalState(bool force) {
     ULONGLONG now = GetTickCount64();
     int posMs = (int)(a.pos * 1000.0);
 
-    // 只在关键动作上同步：切歌、播停、拖进度、加载状态变化
+    // Sync only on key actions: song change, play/pause, seek, loading-state change
     bool changed = force || g_togForcePush ||
                    s.hash != lastHash || a.playing != lastPlaying;
     if (!changed) return;
@@ -4402,15 +4402,15 @@ static void PushLocalState(bool force) {
 }
 static bool Animate() {
 #ifndef FLORAL_NO_TOGETHER
-    // ── 一起听：收事件、推状态 ──
+    // ── Listen Together: consume events, push state ──
     {
         TogetherEvent ev;
         while (TogetherPoll(ev)) {
             if (ev.kind == 1) {
                 Logf("TOG", "检测到对端：%s", ev.nick.c_str());
                 g_togHosting = false;
-                g_togForcePush = true;          // 新加入：立刻把当前状态推过去
-                TogetherSayHello();            // 回一个报到，让对方也看到我
+                g_togForcePush = true;          // Just joined: push the current state right away
+                TogetherSayHello();            // Send a hello back so the peer sees me too
                 g_togPeer = Widen(ev.nick);
                 g_togMyCode = Widen(TogetherMyCode());
                 std::wstring hello = std::wstring(T(L"已和 ", L"Connected with ")) + g_togPeer + T(L" 连接成功，一起听", L"");
@@ -4429,13 +4429,13 @@ static bool Animate() {
                 }
             } else if (ev.kind == 2) {
                 if (g_togIsHost) {
-                    // 房主是权威，不跟随来访者的状态
+                    // The host is authoritative; don't follow a visitor's state
                 } else {
                     ApplyRemoteState(ev);
                 }
             }
         }
-        {   // 在场心跳：15 秒报一次昵称，保证双方都能看到对面
+        {   // Presence heartbeat: report the nickname every 15s so each side sees the other
             static ULONGLONG lastHello = 0;
             ULONGLONG nowH = GetTickCount64();
             if (nowH - lastHello > 15000) {
@@ -4443,7 +4443,7 @@ static bool Animate() {
                 TogetherSayHello();
             }
         }
-        {   // 加载状态变了（卡缓冲 / 恢复）：同步一次
+        {   // Loading state changed (buffering / recovered): sync once
             static bool lastLoading = false;
             if (g_audioLoading != lastLoading) {
                 lastLoading = g_audioLoading;
@@ -4452,14 +4452,14 @@ static bool Animate() {
         }
         PushLocalState(false);
 
-        // 跨平台匹配结果
+        // Cross-platform match result
         {
             PendPlay pp;
             {
                 std::lock_guard<std::mutex> lk(g_ppMx);
-                if (!g_pp.has) { /* 没结果 */ }
+                if (!g_pp.has) { /* no result */ }
                 pp = g_pp;
-                if (g_pp.has) g_pp.has = false;     // 只消费一次
+                if (g_pp.has) g_pp.has = false;     // Consume only once
             }
             if (pp.has) {
                 if (pp.failed) {
@@ -4468,7 +4468,7 @@ static bool Animate() {
                     if (!g_togIsHost) TogetherRequestSkip();
                 } else {
                     Logf("TOG", "注入匹配结果 hash=%.20s 并播放", pp.hash.c_str());
-                    // 注入到本地列表并播放
+                    // Inject into the local list and play
                     Song s;
                     s.title = pp.title;
                     s.artist = pp.artist;
@@ -4490,7 +4490,7 @@ static bool Animate() {
     bool need = false;
     const float dt = DeltaSeconds();
 
-    // 登录 / 导出状态机（后台线程只写状态 UI 相关的都在这边做）
+    // Login / export state machine (worker threads only write state; UI-related work happens here)
     {
         int  lgState = 0, expState = 0, expCount = 0;
         std::string tgTok, tgUid;
@@ -4510,15 +4510,15 @@ static bool Animate() {
             g_token = tgTok;
             g_nickname.clear();
             g_vipType = 0;
-            g_loginState = 1;                     // 登录成功，有效
+            g_loginState = 1;                     // Login succeeded, valid
             g_loginAsked = false;
-            ClearCache();                         // 跨平台时缓存不通用
+            ClearCache();                         // Cache isn't shared across platforms
             g_covFlag.assign(g_app.songs.size(), 0);
             g_layoutCount = -1;
             g_layoutWidth = -1;
             SettingsToast(changed ? T(L"已切换账号，正在拉取歌单…", L"Account switched, fetching playlist…") : T(L"登录成功，正在拉取歌单…", L"Signed in, fetching playlist…"));
             StartExport(tgUid, tgTok);
-            CheckLoginAsync();                    // 拉取昵称
+            CheckLoginAsync();                    // Fetch nickname
             need = true;
         } else if (g_loginRunning && lgState == 4) {
             g_loginRunning = false;
@@ -4551,7 +4551,7 @@ static bool Animate() {
         }
     }
 
-    // 空闲时预热"上一首/下一首"的封面位图，切歌那一帧就不用现场建位图（会掉一帧）
+    // When idle, prewarm prev/next cover bitmaps so the switch frame doesn't build them on the spot (drops a frame)
     if (a.page == Page::Player && a.current >= 0 && g_textPhase == 0 &&
         !g_enterOn && g_switchT >= 1.0f) {
         static ULONGLONG lastNeighbor = 0;
@@ -4565,17 +4565,17 @@ static bool Animate() {
                 int ni = (a.current + delta + cnt) % cnt;
                 const Song& ns = a.songs[(size_t)ni];
                 if (!ns.cover.empty() && !CoverEntry(ns.cover)) {
-                    // 还没解好，下一轮再试
+                    // Not decoded yet; retry next round
                 }
             }
         }
     }
 
-    // 播放/暂停图标：几何形变参数朝目标逼近（可被打断，不会跳）
+    // Play/pause icon: morph parameter approaches the target (interruptible, no jumping)
     {
         float target = a.playing ? 1.0f : 0.0f;
         if (fabsf(g_playIconMix - target) > 0.0005f) {
-            float step = dt / 0.16f;                 // 160ms 走完
+            float step = dt / 0.16f;                 // Done in 160ms
             if (g_playIconMix < target) g_playIconMix = (std::min)(target, g_playIconMix + step);
             else                        g_playIconMix = (std::max)(target, g_playIconMix - step);
             need = true;
@@ -4584,7 +4584,7 @@ static bool Animate() {
         }
     }
 
-    // 播放页文字：切歌先滑出（旧文字），再滑入（新文字）
+    // Player text: on song change, slide the old text out, then the new text in
     {
         static int  lastCur   = -1;
         static Page lastPage2 = Page::Grid;
@@ -4596,20 +4596,20 @@ static bool Animate() {
             lastPage2 = a.page;
 
             if (a.page != Page::Player || g_exitOn) {
-                // 离开播放页：文字保持静态，绝不能在退场时又播一遍进场
+                // Leaving the player page: keep text static; never replay the enter animation on exit
                 g_textPhase = 0;
                 g_textT = 0.0f;
             } else {
-                // 抓一份旧文字的副本，退场时还要画
+                // Grab a copy of the old text; it's still drawn during exit
                 g_outTitle  = g_curTitle;
                 g_outArtist = g_curArtist;
                 g_outAlbum  = g_curAlbum;
-                g_textPhase = (songChanged && !g_outTitle.empty()) ? 1 : 2;   // 有旧文字才退场
+                g_textPhase = (songChanged && !g_outTitle.empty()) ? 1 : 2;   // Exit only if there is old text
                 g_textT = 0.0f;
             }
         } else if (g_textPhase == 1) {
             g_textT += dt;
-            if (g_textT >= 0.20f) {                 // 退场结束，接滑入
+            if (g_textT >= 0.20f) {                 // Exit done, start slide-in
                 g_textPhase = 2;
                 g_textT = 0.0f;
             }
@@ -4620,7 +4620,7 @@ static bool Animate() {
         if (g_textPhase != 0) need = true;
 
 
-        // 记下当前三行，供下次切歌当快照
+        // Save the current three rows as a snapshot for the next song change
         if (a.current >= 0 && a.current < (int)a.songs.size()) {
             const Song& cs = a.songs[(size_t)a.current];
             g_curTitle = cs.title; g_curArtist = cs.artist; g_curAlbum = cs.album;
@@ -4629,7 +4629,7 @@ static bool Animate() {
         }
     }
 
-    // toast 存活期间要一直重绘，否则淡入淡出不会动
+    // Keep redrawing while a toast is alive, or its fade won't animate
     {
         ULONGLONG nowT2 = GetTickCount64();
         if (g_settingsMsgAt && nowT2 - g_settingsMsgAt < 5500) need = true;
@@ -4649,7 +4649,7 @@ static bool Animate() {
 
     DrainPlaylistSwap();
 
-    // ── 歌单选择页：合并后台数据、惯性、悬停 ──
+    // ── Playlist picker: merge background data, inertia, hover ──
     if (g_plReady.load()) {
         std::vector<Playlist> got;
         { std::lock_guard<std::mutex> lk(g_plMx); got.swap(g_plPending); }
@@ -4663,7 +4663,7 @@ static bool Animate() {
         }
     }
     if (a.page == Page::Playlists) {
-        // 选中进度
+        // Selection progress
         if (a.plActive >= 0) {
             if (a.plSelT < 1.0f) {
                 a.plSelT += dt / 0.34f;
@@ -4677,7 +4677,7 @@ static bool Animate() {
         }
 
         if (!a.plDragging) {
-            // 惯性
+            // Inertia
             if (a.plActive < 0) {
                 a.plX += a.plVelX;
                 a.plY += a.plVelY;
@@ -4687,7 +4687,7 @@ static bool Animate() {
                 if (fabsf(a.plVelY) < 0.25f) a.plVelY = 0.0f;
                 if (a.plVelX != 0.0f || a.plVelY != 0.0f) need = true;
             }
-            // 缓动追目标
+            // Ease toward target
             float k = Ease(0.25f, dt);
             a.plX += (a.plTargetX - a.plX) * k;
             a.plY += (a.plTargetY - a.plY) * k;
@@ -4695,7 +4695,7 @@ static bool Animate() {
             if (fabsf(a.plY - a.plTargetY) < 0.35f) a.plY = a.plTargetY;
             if (a.plX != a.plTargetX || a.plY != a.plTargetY) need = true;
         }
-        if (a.plActive < 0) PlClampPan();          // 选中时不受边界限制，要能正中
+        if (a.plActive < 0) PlClampPan();          // No pan limits while selected; must be able to center
 
         int hov = -1;
         if (!a.plDragging && !g_settingsOpen) {
@@ -4711,7 +4711,7 @@ static bool Animate() {
         }
     }
 
-    // 面板进出场进度
+    // Panel enter/exit progress
     {
         float k = Ease(0.24f, dt);
         auto step = [k](float& v, bool open) {
@@ -4726,11 +4726,11 @@ static bool Animate() {
         if (g_setT > 0.0f || g_qualT > 0.0f || g_volT > 0.0f || g_togT > 0.0f) need = true;
     }
 
-    // 开屏动画计时（按真实时间）
+    // Splash timing (by real time)
     if (!g_loadDone) {
         g_loadT += dt;
         need = true;
-        // 歌单已经有了（或拉取结束），首屏封面解好，就可以进场
+        // Playlist exists (or fetch finished) and the first cover is decoded; ready to enter
         bool dataReady = !g_app.songs.empty() || g_expState == 3;
         bool coversReady = CoversReadyForFirstScreen();
         bool refreshDone = (g_expState != 1) && !g_bootRefreshPending.load();
@@ -4743,17 +4743,17 @@ static bool Animate() {
     } else if (!g_introDone) {
         g_introT += dt;
         need = true;
-        // 开屏期间不再预解歌曲封面：歌单页只看歌单封面，歌曲封面等进歌单再说
-        // logo 渐隐完就结束开屏，直接进歌单选择页（不再等封面、不再飞卡片）
+        // Don't pre-decode song covers during the splash: the picker only shows playlist covers; song covers wait until inside
+        // End the splash when the logo finishes fading and go straight to the picker (no waiting for covers, no flying cards)
         if (g_introT > SPLASH_OUT + 0.05f) {
             g_introDone = true;
             if (g_app.page == Page::Grid) { g_app.page = Page::Playlists; PlCenterContent(); }
-            g_plEnter = 0.0f;                      // 歌单页淡入
+            g_plEnter = 0.0f;                      // Playlist page fade-in
             Logf("APP", "开屏结束 t=%.2fs", g_introT);
         }
     }
 
-    // 平滑滚动：实际位置缓动追目标位置（帧率无关）
+    // Smooth scrolling: actual position eases toward target (frame-rate independent)
     {
         float d = a.scrollTarget - a.scroll;
         if (std::fabs(d) > 0.4f) {
@@ -4765,7 +4765,7 @@ static bool Animate() {
         }
     }
 
-    // 滚动瞬时速度 -> 运动模糊强度
+    // Scroll velocity -> motion blur strength
     {
         float moved = a.scroll - g_prevScroll;
         g_prevScroll = a.scroll;
@@ -4786,36 +4786,36 @@ static bool Animate() {
         else a.tileAnim[i] = t;
     }
 
-    // 切歌动画 + 唱片转动
+    // Song-change animation + record spin
     if (g_switchT < 1.0f) {
         g_switchT += dt / 0.55f;
         if (g_switchT > 1.0f) g_switchT = 1.0f;
         need = true;
     }
     if (a.page == Page::Player && a.playing && !g_enterOn) {
-        g_discAngle += dt * 55.0f;      // 约 9 秒一圈
+        g_discAngle += dt * 55.0f;      // About 9s per revolution
         if (g_discAngle > 360.0f) g_discAngle -= 360.0f;
         need = true;
     }
 
-    // 退播放页的转场计时
+    // Exit-player-page transition timer
     if (g_exitOn) {
         g_exitT += dt / 2.0f;
         if (g_exitT >= 1.0f) { g_exitT = 1.0f; g_exitOn = false; }
         need = true;
     }
 
-    // 进播放页的转场计时
+    // Enter-player-page transition timer
     if (g_enterOn) {
         g_enterT += dt / 2.2f;
         if (g_enterT >= 1.0f) { g_enterT = 1.0f; g_enterOn = false; }
-        // 分隔线等格子全飞走之后再长出来
+        // The divider grows only after all tiles have flown away
         float lk = (g_enterT - 0.70f) / 0.20f;
         g_lineT = (lk < 0.0f) ? 0.0f : (lk > 1.0f ? 1.0f : lk);
         need = true;
     }
 
-    // 分隔线：进播放页时从右往左伸出（转场结束后自己收尾）
+    // Divider: extends right-to-left when entering the player page (finishes by itself after the transition)
     if (a.page == Page::Player) {
         if (!g_enterOn && g_lineT < 1.0f) {
             g_lineT += dt / 0.45f;
@@ -4826,7 +4826,7 @@ static bool Animate() {
         g_lineT = 0.0f;
     }
 
-    // 后台解析好的地址：回主线程开 MCI（MCI 必须在创建它的线程用）
+    // URL resolved in the background: open MCI back on the main thread (MCI must be used on the thread that created it)
     {
         int st = 0, ui = -1;
         std::wstring u;
@@ -4836,15 +4836,15 @@ static bool Animate() {
         }
         if (st == 2 && ui == a.current && !g_audioOk && !g_audioError) {
             {
-                // 先把状态清掉：保证一个地址只尝试打开一次，绝不会每帧重试
+                // Clear state first so each URL is opened at most once; never retry every frame
                 std::lock_guard<std::mutex> lk(g_urlMx);
                 g_urlState = 0;
                 g_urlReady.clear();
             }
             Trace("open  idx=%d url_ok=1", ui);
-            BeginOpenAsync(u);                   // 后台开，UI 继续跑动画
+            BeginOpenAsync(u);                   // Open in the background; the UI keeps animating
         }
-        // 后台 open 的结果：回到 UI 线程做收尾（播放状态只在这里改）
+        // Result of the background open: finish on the UI thread (playback state is only changed here)
         {
             int r = g_openResult.exchange(0);
             if (r > 0) {
@@ -4852,7 +4852,7 @@ static bool Animate() {
                 g_audioOk = true;
                 StartFadeIn();
                 g_audioLoading = false;
-                if (g_pendingSeekMs >= 0) {          // 切音质 / 一起听：跳回目标位置
+                if (g_pendingSeekMs >= 0) {          // Quality switch / Listen Together: seek back to the target position
                     AudioSeekMS(g_pendingSeekMs);
                     a.pos = g_pendingSeekMs / 1000.0;
                     g_pendingSeekMs = -1;
@@ -4889,7 +4889,7 @@ static bool Animate() {
                 Trace("openFAIL");
             }
         }
-        if (st == 3 && ui == a.current && !g_audioOk) {   // 只认自己那首的失败
+        if (st == 3 && ui == a.current && !g_audioOk) {   // Only honor failures for our own song
             g_audioError = true;
             g_audioErrKind = 1;
             g_audioLoading = false;
@@ -4899,7 +4899,7 @@ static bool Animate() {
         }
     }
 
-    // 看门狗：MCI 说 open 成功、但一直不出位置 = 流是死的
+    // Watchdog: MCI reported a successful open but no position ever shows up = dead stream
     if (g_audioLoading && g_audioOk && AudioPosMS() <= 120 &&
         GetTickCount64() - g_loadingSince > 4000) {
         Trace("wd1 fire idx=%d", a.current);
@@ -4911,7 +4911,7 @@ static bool Animate() {
         need = true;
     }
 
-    // 看门狗：解析一直不回来（sidecar 挂了）也不能无限等
+    // Watchdog: resolution never returns (the sidecar died) — can't wait forever either
     if (g_audioLoading && !g_audioOk &&
         GetTickCount64() - g_loadingSince > 12000) {
         {
@@ -4924,26 +4924,26 @@ static bool Animate() {
         need = true;
     }
 
-    // 后台跳转中也显示加载圈（流媒体要等下载追上目标位置）
+    // Also show the spinner during background seeks (streaming must download up to the target)
     const bool seeking = AudioIsSeeking();
     if (seeking) {
         g_audioLoading = true;
         g_loadingMin = 0;
     }
 
-    // 加载圈：转到能读到位置为止（并且至少显示 g_loadingMin 那么久）
+    // Spinner: keep spinning until a position can be read (and show for at least g_loadingMin)
     if (g_audioLoading) {
         bool ready = g_audioOk && AudioPosMS() > 120 && !seeking;
         if (ready && GetTickCount64() > g_loadingMin) {
             g_audioLoading = false;
         } else {
-            g_spinAngle += dt * 7.0f;       // 大约 1 秒一圈
+            g_spinAngle += dt * 7.0f;       // roughly one revolution per second
             if (g_spinAngle > 6.2831853f) g_spinAngle -= 6.2831853f;
             need = true;
         }
     }
 
-    // 淡入淡出
+    // Fade in / fade out
     if (g_fadeDir != 0) {
         g_vol += g_fadeDir * (dt / (g_fadeDir > 0 ? 0.45f : 0.25f));
         if (g_vol > 1.0f) g_vol = 1.0f;
@@ -4954,14 +4954,14 @@ static bool Animate() {
             g_fadeDir = 0;
         } else if (g_fadeDir < 0 && g_vol <= 0.0f) {
             g_fadeDir = 0;
-            if (g_pendingPick >= 0) {        // 换的是指定的一首
+            if (g_pendingPick >= 0) {        // switching to one specific track
                 int i = g_pendingPick;
                 g_pendingPick = -1;
-                LoadAudioFor(i);             // 里面会 StartFadeIn
+                LoadAudioFor(i);             // StartFadeIn is called inside
             } else {
                 int d = g_pendingDir;
                 g_pendingDir = 0;
-                if (d != 0) SwitchTrackNow(d);   // 淡出干净了才真换歌
+                if (d != 0) SwitchTrackNow(d);   // only really switch once the fade-out is clean
             }
         }
         need = true;
@@ -4970,18 +4970,18 @@ static bool Animate() {
     if (a.page == Page::Player && a.playing && a.current >= 0 &&
         a.current < (int)a.songs.size()) {
         if (g_audioOk) {
-            if (!g_seekDrag) {                 // 拖动时别被引擎位置顶回去
+            if (!g_seekDrag) {                 // don't let the engine position fight back while dragging
                 int ms = AudioPosMS();
                 if (ms >= 0) a.pos = ms / 1000.0;
-                else         ms = (int)(a.pos * 1000.0);   // 解码器读不到位置（EOF）时沿用上次值，
-                                                           // 这样下面的"位置不再前进"兜底才判断得到
+                else         ms = (int)(a.pos * 1000.0);   // decoder can't report a position (EOF): reuse the last value,
+                                                           // so the "position stopped advancing" fallback below can still decide
                 int len = AudioLenMS();
                 int metaMs = a.songs[a.current].durationSec * 1000;
 
-                // 解码器不报告长度（流式 MP3 常见）时退到元数据时长，
-                // 否则 len=-1 会让下面判断永远不成立 —— 这就是"有时不自动连播"
+                // When the decoder reports no length (common with streaming MP3) fall back to the metadata duration,
+                // otherwise len=-1 keeps the check below from ever firing — that's the "auto-advance sometimes fails" issue
                 int endMs = (len > 0) ? len : metaMs;
-                {   // 每首歌记一次解码器长度，方便排查"不自动连播"
+                {   // log the decoder length once per track, to debug "auto-advance sometimes fails"
                     static int loggedIdx = -1;
                     if (a.current != loggedIdx && ms > 2000) {
                         loggedIdx = a.current;
@@ -4992,11 +4992,11 @@ static bool Animate() {
 
                 bool atEnd = false;
                 if (endMs > 0 && ms >= 0) {
-                    int margin = (len > 0) ? 150 : 1200;   // 元数据精度低，多留一点
+                    int margin = (len > 0) ? 150 : 1200;   // metadata is coarse, keep a wider margin
                     atEnd = (ms >= endMs - margin);
                 }
 
-                // 兜底：位置 1.5 秒没再前进，且已经到 97% 以上，也认为放完了
+                // Fallback: the position hasn't advanced for 1.5 s and we're already past 97% — treat it as finished
                 {
                     static int       lastMs  = -1;
                     static ULONGLONG lastAt  = 0;
@@ -5009,7 +5009,7 @@ static bool Animate() {
                 }
 
                 if (atEnd) {
-                    // 同一首只触发一次：切歌有淡出延迟，期间条件仍然成立
+                    // Fire only once per track: switching has a fade-out delay during which the condition still holds
                     static int autoDone = -1;
                     if (autoDone == a.current) { need = true; }
                     else {
@@ -5020,7 +5020,7 @@ static bool Animate() {
                     follower = TogetherActive() && !g_togIsHost;
 #endif
                     if (follower) {
-                        a.playing = false;         // 等房主推下一首，别自己切
+                        a.playing = false;         // wait for the host to push the next track, don't switch on our own
                         AudioPause();
                     } else {
                         SwitchTrack(1);
@@ -5028,27 +5028,27 @@ static bool Animate() {
                     }
                 }
             }
-        } else if (g_urlState != 1 && !g_audioError) {   // 解析中/失败都别假装在放
+        } else if (g_urlState != 1 && !g_audioError) {   // while resolving/failed, don't pretend it's playing
             a.pos += dt;
             if (a.pos >= a.songs[a.current].durationSec) {
-                // 一起听里只有房主能切歌；访客停下来等房主推下一首
+                // In Together only the host may switch tracks; guests stop and wait for the host's next track
                 bool follower = false;
 #ifndef FLORAL_NO_TOGETHER
                 follower = TogetherActive() && !g_togIsHost;
 #endif
                 if (follower) {
-                    a.pos = (float)a.songs[a.current].durationSec;   // 停在末尾，别越界
+                    a.pos = (float)a.songs[a.current].durationSec;   // park at the end, don't run past it
                     a.playing = false;
                     AudioPause();
                 } else {
-                    SwitchTrack(1);            // 放完自动下一首（走飞盘动画）
+                    SwitchTrack(1);            // auto-advance to the next track when finished (with the disc animation)
                 }
             }
         }
         need = true;
     }
 
-    // 网格挤开动画：只缓动视口附近的块，视口外的直接到位
+    // Grid push-apart animation: ease only the tiles near the viewport, the rest snap straight into place
     if (g_draw.size() == g_target.size()) {
         if (g_layoutDirty) {
             g_layoutDirty = false;
@@ -5083,7 +5083,7 @@ static bool Animate() {
 }
 
 /* ══════════════════════════════════════════
-   初始化
+   Initialization
    ══════════════════════════════════════════ */
 static bool GfxInit() {
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d))) return false;
@@ -5111,7 +5111,7 @@ static void GfxRelease() {
 }
 
 /* ══════════════════════════════════════════
-   托盘图标
+   Tray icon
    ══════════════════════════════════════════ */
 #define WM_TRAYICON (WM_APP + 1)
 
@@ -5119,7 +5119,7 @@ static NOTIFYICONDATAW g_nid{};
 static bool   g_trayAdded = false;
 static HICON  g_trayIcon  = nullptr;
 
-/* 自己画一个 32×32 图标：圆角方块 + 白色 F（和启动页一致） */
+/* Draw our own 32×32 icon: rounded square + white F (same as the splash page) */
 static HICON MakeTrayIcon(UINT32 bg, UINT32 fg) {
     const int S = 32;
     BITMAPV5HEADER bi{};
@@ -5144,9 +5144,9 @@ static HICON MakeTrayIcon(UINT32 bg, UINT32 fg) {
     const float fr = (fg >> 16) & 0xFF, fgc = (fg >> 8) & 0xFF, fb = fg & 0xFF;
     BYTE* px = (BYTE*)bits;
 
-    // 圆角方块的范围
+    // Extent of the rounded square
     const float x0 = 2.0f, y0 = 2.0f, x1 = (float)S - 2.0f, y1 = (float)S - 2.0f, rad = 8.0f;
-    const float fx0 = 10.0f, fy0 = 8.0f, fx1 = 22.0f, fy1 = 24.0f;   // F 的外框
+    const float fx0 = 10.0f, fy0 = 8.0f, fx1 = 22.0f, fy1 = 24.0f;   // bounding box of the F
     const float stemW = 4.0f, barH = 3.6f;
 
     auto inRoundRect = [&](float x, float y) {
@@ -5158,9 +5158,9 @@ static HICON MakeTrayIcon(UINT32 bg, UINT32 fg) {
                (cy > y0 + rad - 0.01f && cy < y1 - rad + 0.01f);
     };
     auto inF = [&](float x, float y) {
-        if (x >= fx0 && x < fx0 + stemW && y >= fy0 && y < fy1) return true;                  // 竖
-        if (x >= fx0 && x < fx1 && y >= fy0 && y < fy0 + barH) return true;                   // 上横
-        if (x >= fx0 && x < fx1 - 3.0f && y >= fy0 + 6.4f && y < fy0 + 6.4f + barH) return true; // 中横
+        if (x >= fx0 && x < fx0 + stemW && y >= fy0 && y < fy1) return true;                  // vertical stem
+        if (x >= fx0 && x < fx1 && y >= fy0 && y < fy0 + barH) return true;                   // top bar
+        if (x >= fx0 && x < fx1 - 3.0f && y >= fy0 + 6.4f && y < fy0 + 6.4f + barH) return true; // middle bar
         return false;
     };
 
@@ -5180,7 +5180,7 @@ static HICON MakeTrayIcon(UINT32 bg, UINT32 fg) {
             if (cb <= 0.0f) continue;
 
             float r = br, g = bgc, b = bb;
-            if (cf > 0.0f) {                       // 文字盖在底色上
+            if (cf > 0.0f) {                       // glyph covers the background colour
                 float k = cf / cb;
                 if (k > 1.0f) k = 1.0f;
                 r = br + (fr - br) * k;
@@ -5245,7 +5245,7 @@ static void ShowMainWindow(HWND hwnd) {
     SetForegroundWindow(hwnd);
 }
 /* ══════════════════════════════════════════
-   交互
+   Interaction
    ══════════════════════════════════════════ */
 static Hit* Pick(POINT p) {
     for (int i = (int)g_app.hits.size() - 1; i >= 0; i--) {
@@ -5254,7 +5254,7 @@ static Hit* Pick(POINT p) {
     return nullptr;
 }
 
-/** 顶部按钮：和点歌一样走转场动画，区别只是不重新开始播放 */
+/** Top button: uses the same transition as picking a song, the only difference is playback isn't restarted */
 static void GoPlayerPage() {
     App& a = g_app;
     if (a.page == Page::Player) return;
@@ -5263,7 +5263,7 @@ static void GoPlayerPage() {
     const bool hasSong = (a.current >= 0 && a.current < n);
 
     if (hasSong) {
-        // 从"当前这首"的格子起飞，位置和鼠标点它时一致
+        // Take off from the tile of "the current song", at the same spot as clicking it with the mouse
         EnsureBase(a.width, n);
         const std::vector<TileBox>& src = (g_draw.size() == g_base.size()) ? g_draw : g_base;
         if (a.current < (int)src.size()) {
@@ -5274,15 +5274,15 @@ static void GoPlayerPage() {
         }
         g_enterIdx = a.current;
     } else {
-        g_enterIdx = -1;                // 还没选歌：只让其他格子散开，中间是空唱片
+        g_enterIdx = -1;                // no song selected yet: just spread the other tiles, an empty disc in the middle
     }
 
     a.page = Page::Player;
     a.pageAnim = 1.0f;
     a.hoverTile = -1;
-    g_switchT = 1.0f;                   // 不播切歌的甩盘动画
+    g_switchT = 1.0f;                   // don't play the track-switch disc animation
     g_switchFrom = -1;
-    g_discAngle = 0.0f;                 // 进场从 0 度开始转，交接不会跳
+    g_discAngle = 0.0f;                 // spin starts from 0 degrees on entry so the hand-off doesn't jump
     g_enterT = 0.0f;
     g_enterOn = true;
     g_exitOn = false;
@@ -5295,7 +5295,7 @@ static void GoPlayer(int idx) {
     App& a = g_app;
     if (idx < 0 || idx >= (int)a.songs.size()) return;
 
-    // 记下这一格"现在画在屏幕上"的位置（含悬停放大），转场从它开始，不会先缩一下
+    // Record where this tile is "currently drawn on screen" (including hover zoom); the transition starts there so nothing shrinks first
     EnsureBase(a.width, (int)a.songs.size());
     const std::vector<TileBox>& src = (g_draw.size() == g_base.size()) ? g_draw : g_base;
     if (idx < (int)src.size()) {
@@ -5305,32 +5305,32 @@ static void GoPlayer(int idx) {
         g_enterFrom = Rc(a.width * 0.5f - 80, a.height * 0.5f - 80, 160, 160);
     }
 
-    // 点的是正在放的那首：只是回到播放页，别重头开始
+    // Clicking the track that's already playing: just go back to the player page, don't restart from the top
     const bool sameTrack = (idx == a.current) && (g_audioOk || g_audioLoading) && !g_audioError;
 
-    g_textDir = (idx >= a.current) ? 1 : -1;   // 文字滑动的方向跟着点的那一格走
+    g_textDir = (idx >= a.current) ? 1 : -1;   // the text slide direction follows the tile that was clicked
     a.current = idx;
     a.playing = true;
     a.page = Page::Player;
-    a.pageAnim = 1.0f;         // 不走淡入淡出，交给转场
+    a.pageAnim = 1.0f;         // no fade in/out, that's left to the transition
     a.hoverTile = -1;
-    g_switchT = 1.0f;          // 进入播放页不播放切歌动画
+    g_switchT = 1.0f;          // entering the player page doesn't play the track-switch animation
     g_switchFrom = -1;
 
     g_enterIdx = idx;
     g_enterT = 0.0f;
     g_enterOn = true;
     g_audioRetry = 0;
-    g_pendingSeekMs = -1;               // 换的是别的歌：从头开始
+    g_pendingSeekMs = -1;               // switching to another track: start from the beginning
 
     if (sameTrack) {
-        // 保持进度和角度；之前是暂停的就继续播
+        // Keep progress and angle; if it was paused before, keep playing
         if (g_audioOk) AudioPlay();
     } else {
         a.pos = 0.0;
         g_discAngle = 0.0f;
         if (g_audioOk && !g_audioLoading && g_fadeDir == 0) {
-            // 上一首还在放：先淡出，音量归零后再接新的
+            // The previous track is still playing: fade out first, then start the new one once volume reaches zero
             g_pendingPick = idx;
             g_fadeDir = -1;
         } else {
@@ -5339,7 +5339,7 @@ static void GoPlayer(int idx) {
     }
 }
 
-/* 回到歌单选择页 */
+/* Back to the playlist selection page */
 static void GoPicker() {
     if (g_app.page == Page::Playlists) return;
     g_app.page = Page::Playlists;
@@ -5359,16 +5359,16 @@ static void GoPicker() {
 static void GoGrid() {
     g_app.page = Page::Grid;
     g_app.pageAnim = 0.0f;
-    g_gridEnter = 0.0f;          // 回选歌页：曲目从右侧飞入（和开屏原来那套一样）
+    g_gridEnter = 0.0f;          // back to the song grid: tracks fly in from the right (same as the original splash)
     g_enterOn = false;
     g_enterT = 1.0f;
     g_exitT = 0.0f;
-    g_exitOn = false;            // 不再用"网格从右飞入"那套
-    g_settingsOpen = false;      // 退出播放页顺手把设置面板收掉
+    g_exitOn = false;            // no longer use the "grid flies in from the right" approach
+    g_settingsOpen = false;      // leaving the player page also closes the settings panel
     g_seekDrag = false;
 }
 
-/** 播放页进度条的位置（绘制和命中都用它，避免两套坐标对不上） */
+/** Position of the player page progress bar (drawing and hit-testing both use it so the two coordinate sets can't diverge) */
 static void ProgressGeom(float& px, float& barY, float& barW) {
     App& a = g_app;
     const float lineY = UI::TITLE_H + 4.0f;
@@ -5381,7 +5381,7 @@ static void ProgressGeom(float& px, float& barY, float& barW) {
     barY = cy + 10.0f;
 }
 
-/** 按横坐标定位到某首歌的某个时间点 */
+/** Map an x coordinate to a point in time in the current song */
 static void SeekToX(float x) {
     App& a = g_app;
     if (a.current < 0 || a.current >= (int)a.songs.size()) return;
@@ -5396,7 +5396,7 @@ static void SeekToX(float x) {
 static void OnClick(POINT p) {
     App& a = g_app;
 
-    // 窗口按钮优先
+    // Window buttons take priority
     if (p.y < UI::TITLE_H) {
         for (int i = 0; i < UI::BTN_COUNT; i++) {
             if (Inside(BtnRect(i, a.width), p)) {
@@ -5406,11 +5406,11 @@ static void OnClick(POINT p) {
                     WINDOWPLACEMENT wpl = { sizeof(wpl) };
                     GetWindowPlacement(hwnd, &wpl);
                     ShowWindow(hwnd, wpl.showCmd == SW_MAXIMIZE ? SW_RESTORE : SW_MAXIMIZE);
-                } else ShowWindow(hwnd, SW_HIDE);   // 关闭 = 收到托盘，不退出
+                } else ShowWindow(hwnd, SW_HIDE);   // close = hide to the tray, don't exit
                 return;
             }
         }
-        // 标题栏里还有一堆按钮，别整块吞掉
+        // There are still a bunch of buttons in the title bar, don't swallow the whole strip
         if (Hit* hs = Pick(p)) {
             if (hs->kind == HK_SETTINGS)  g_settingsOpen = !g_settingsOpen;
             if (hs->kind == HK_PLAYER)    GoPlayerPage();
@@ -5441,13 +5441,13 @@ static void OnClick(POINT p) {
         break;
     case HK_SETTINGS:  g_settingsOpen = !g_settingsOpen; break;
     case HK_VOL:
-        if (g_volMuted) {                       // 先解除静音
+        if (g_volMuted) {                       // unmute first
             g_volMuted = false;
             g_userVol = g_volBeforeMute;
             ApplyVolume();
         }
         g_volOpen = !g_volOpen;
-        if (g_volOpen) g_qualOpen = false;   // 两个面板别同时开
+        if (g_volOpen) g_qualOpen = false;   // don't open both panels at the same time
         break;
     case HK_SRC:
         if (h->index != g_source) {
@@ -5551,7 +5551,7 @@ static void OnClick(POINT p) {
         break;
 #endif  // FLORAL_NO_TOGETHER
     case HK_SCROLL: {
-        g_scrollDrag = true;                       // 按下就跟着拖
+        g_scrollDrag = true;                       // follows the mouse as soon as it's pressed
         float trackH = g_app.height - UI::PAD - GRID_TOP;
         if (trackH > 40.0f) {
             float thumbH = (std::max)(36.0f, trackH * trackH / (trackH + g_app.maxScroll));
@@ -5574,10 +5574,10 @@ static void OnClick(POINT p) {
         if (h->index >= 0 && h->index < kQualCount && h->index != g_quality) {
             g_quality = h->index;
             SaveQuality();
-            { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }   // 旧地址作废
+            { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }   // old URLs are now invalid
             if (g_audioOk && !g_audioLoading && g_fadeDir == 0 && a.current >= 0) {
-                g_pendingSeekMs = (int)(a.pos * 1000.0);   // 记住进度，重装后接着放
-                g_pendingPick = a.current;      // 淡出后按新音质重装
+                g_pendingSeekMs = (int)(a.pos * 1000.0);   // remember the progress, resume after the reload
+                g_pendingPick = a.current;      // reload with the new quality after the fade-out
                 g_fadeDir = -1;
             }
         }
@@ -5599,28 +5599,28 @@ static void OnClick(POINT p) {
         break;
     }
     case HK_LOGIN_TIP: g_settingsOpen = true; break;
-    case HK_SET_BG:                          // 点遮罩：关面板
+    case HK_SET_BG:                          // click on the scrim: close the panel
     case HK_SET_CLOSE:
         g_settingsOpen = false;
         g_loginChoose = false;
-        if (g_loginRunning) {                  // 关面板就取消这次扫码
+        if (g_loginRunning) {                  // closing the panel cancels this QR sign-in
             g_loginRunning = false;
             std::lock_guard<std::mutex> lk(g_lgMx);
             g_lgState = 0;
         }
         break;
-    case HK_SET_CARD: break;                 // 卡片内部：吞掉，别穿透
+    case HK_SET_CARD: break;                 // inside the card: swallow it, don't pass through
     case HK_SET_CLEAR: ClearCache(); break;
     case HK_SET_THEME: {
         ThemeNext();
-        if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);   // 颜色变了要立刻重画
+        if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);   // colours changed, repaint immediately
         UpdateTrayIcon();
         std::wstring msg = std::wstring(T(L"主题已切换：", L"Theme: ")) + ThemeName(ThemeCurrent());
         SettingsToast(msg.c_str());
         break;
     }
     case HK_SET_LOGIN: {
-        // 重新登录：先清干净（缓存 + 两个平台的登录信息），再选平台
+        // Sign in again: clear everything first (cache + both platforms' sign-in data), then pick a platform
         ClearCache();
         DeleteFileW((AssetDir() + L"\\kugou-session.json").c_str());
         DeleteFileW((AssetDir() + L"\\netease-session.json").c_str());
@@ -5630,7 +5630,7 @@ static void OnClick(POINT p) {
         g_vipType = 0;
         g_loginState = 0;
         g_loginAsked = false;
-        g_loginRunning = false;                 // 取消上一次可能还在跑的轮询
+        g_loginRunning = false;                 // cancel the previous poll, which may still be running
         { std::lock_guard<std::mutex> lk(g_lgMx); g_lgState = 0; g_lgMsg.clear(); }
         AudioClose();
         g_audioOk = false;
@@ -5641,7 +5641,7 @@ static void OnClick(POINT p) {
     }
     case HK_LOGIN_PICK: {
         g_loginChoose = false;
-        if (h->index != g_source) {              // 换平台：连带切数据源
+        if (h->index != g_source) {              // switching platform: switch the data source along with it
             g_source = h->index;
             SaveSource();
             g_likesName = std::wstring(SourceTag()) + L"-likes.tsv";
@@ -5663,7 +5663,7 @@ static void OnClick(POINT p) {
         break;
     }
     case HK_PLAY:
-        if (g_audioError) {               // 失败了再点一下就当重试
+        if (g_audioError) {               // after a failure, clicking again counts as a retry
             LoadAudioFor(a.current);
             break;
         }
@@ -5674,7 +5674,7 @@ static void OnClick(POINT p) {
     case HK_NEXT:  SwitchTrack(1); break;
     case HK_PROGRESS: {
         if (a.current < 0) break;
-        g_seekDrag = true;          // 按住就开始拖
+        g_seekDrag = true;          // start dragging as soon as it's pressed
         g_lastSeek = GetTickCount64();
         SeekToX(p.x);
         break;
@@ -5684,7 +5684,7 @@ static void OnClick(POINT p) {
 }
 
 /* ══════════════════════════════════════════
-   窗口
+   Window
    ══════════════════════════════════════════ */
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -5721,7 +5721,7 @@ static void Paint(HWND hwnd) {
             g_hwndRt = nullptr;
             g_rt = nullptr;
         } else {
-            // 不在这里等垂直同步：DwmFlush 会把 UI 线程卡住，反而更顿
+            // Don't wait for vsync here: DwmFlush blocks the UI thread and makes things stutter more
         }
     }
     EndPaint(hwnd, &ps);
@@ -5778,14 +5778,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (p.y < UI::TITLE_H) {
             float btnLeft = rc.right - UI::BTN_W * UI::BTN_COUNT;
-            if (p.x >= btnLeft) return HTCLIENT;          // 三个窗口按钮
-            // 设置按钮也得是 HTCLIENT，否则会被当成标题栏拖拽，点不动
+            if (p.x >= btnLeft) return HTCLIENT;          // the three window buttons
+            // The settings button must be HTCLIENT too, otherwise it's treated as a title-bar drag and can't be clicked
             float gearX = BtnRect(0, (float)rc.right).left - 40.0f;
             if (p.x >= gearX - 4.0f && p.x <= gearX + 36.0f) return HTCLIENT;
             float pbX = gearX - 44.0f;
             if (p.x >= pbX - 4.0f && p.x <= pbX + 36.0f) return HTCLIENT;
-            // 回歌单页按钮（唱片按钮左边再 44px）：同样要是 HTCLIENT，
-            // 否则会落进上面的 HTCAPTION 分支，被当成拖窗口
+            // Back-to-playlists button (another 44px left of the disc button): it must be HTCLIENT too,
+            // otherwise it falls into the HTCAPTION branch above and is treated as a window drag
             float pickX = pbX - 44.0f;
             if (p.x >= pickX - 4.0f && p.x <= pickX + 36.0f) return HTCLIENT;
             if (g_loginState == 2 || g_loginState == 3) {
@@ -5838,7 +5838,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-        if (g_volDrag) {                        // 拖动音量：直接跟着走
+        if (g_volDrag) {                        // dragging the volume: follow it directly
             float tx = g_volTrack.left, tw = g_volTrack.right - g_volTrack.left;
             if (tw > 1.0f) {
                 float k = ((float)mx - tx) / tw;
@@ -5850,9 +5850,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveVolume();
             }
         }
-        if (g_seekDrag) {                       // 拖动进度条：跟着鼠标走
+        if (g_seekDrag) {                       // dragging the progress bar: follow the mouse
             ULONGLONG now = GetTickCount64();
-            if (now - g_lastSeek > 60) {        // 别把 MCI 打爆
+            if (now - g_lastSeek > 60) {        // don't flood MCI
                 g_lastSeek = now;
                 SeekToX((float)mx);
             }
@@ -5860,8 +5860,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_app.mouse.x != mx || g_app.mouse.y != my) {
             g_app.mouse.x = mx;
             g_app.mouse.y = my;
-            g_hoverArmed = true;      // 鼠标动了，恢复悬停放大
-            g_mouseDirty = true;      // 不直接重绘，交给定时器节流
+            g_hoverArmed = true;      // mouse moved, re-enable hover zoom
+            g_mouseDirty = true;      // don't repaint directly, let the timer throttle it
         }
         return 0;
     }
@@ -5875,8 +5875,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (g_app.page == Page::Playlists && p.y > (LONG)UI::TITLE_H && !g_settingsOpen) {
-            // 只有顶栏以下、且设置面板没开时才拖动；
-            // 面板打开时鼠标事件必须走 OnClick，否则整个面板都点不动
+            // Only drag below the top bar, and only while the settings panel is closed;
+            // when the panel is open mouse events must reach OnClick, otherwise nothing in the panel can be clicked
             g_app.plDragging = true;
             g_app.plDragMoved = false;
             g_app.plDragStartMouse = p;
@@ -5896,11 +5896,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.plDragging = false;
             ReleaseCapture();
             if (g_app.plDragMoved) {
-                g_app.plActive = -1;                // 拖动即取消选中
+                g_app.plActive = -1;                // dragging cancels the selection
                 g_app.plTargetX = g_app.plX;
                 g_app.plTargetY = g_app.plY;
             } else {
-                // 当成点击：找鼠标下的那个圆
+                // Treat it as a click: find the circle under the mouse
                 float best = PL_D * 0.5f;
                 int hit = -1;
                 for (int i = 0; i < (int)g_app.playlists.size(); i++) {
@@ -5910,7 +5910,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     float d2 = dx * dx + dy * dy;
                     if (d2 <= best * best) { best = sqrtf(d2); hit = i; }
                 }
-                // 展开状态：整张卡片都能点，点哪都进歌单；卡片外则收起
+                // Expanded state: the whole card is clickable and any click enters the playlist; clicking outside collapses it
                 if (g_app.plActive >= 0) {
                     POINT mp = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                     D2D1_RECT_F card = PlCardTargetRect();
@@ -5929,14 +5929,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
                 if (hit >= 0) {
                     if (g_app.plActive == hit && g_app.plSelT > 0.9f) {
-                        SelectPlaylistAsync(hit);   // 再点一次：进入歌单
+                        SelectPlaylistAsync(hit);   // clicked again: enter the playlist
                     } else {
-                        // 第一次：选中 + 把这张挪到窗口正中
+                        // First click: select it + move this card to the centre of the window
                         g_app.plActive = hit;
                         g_app.plSelT = 0.0f;
                         if (g_plCellsFor != (int)g_app.playlists.size())
                             BuildPlCells((int)g_app.playlists.size());
-                        // 卡片以窗口中心为目标展开，视角保持不动
+                        // The card expands toward the window centre, the camera stays put
                         g_app.plTargetX = 0.0f;
                         g_app.plTargetY = 0.0f;
                         g_app.plVelX = g_app.plVelY = 0.0f;
@@ -5946,7 +5946,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        if (g_seekDrag) g_togForcePush = true;      // 拖完进度条：同步一次位置
+        if (g_seekDrag) g_togForcePush = true;      // finished dragging the progress bar: sync the position once
         g_seekDrag = false;
         g_volDrag = false;
         g_scrollDrag = false;
@@ -5962,9 +5962,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_app.scrollTarget -= delta;
         if (g_app.scrollTarget < 0) g_app.scrollTarget = 0;
         if (g_app.scrollTarget > g_app.maxScroll) g_app.scrollTarget = g_app.maxScroll;
-        g_hoverArmed = false;         // 滚动期间和结束后都不弹开
+        g_hoverArmed = false;         // no hover pop-open during or after scrolling
         g_app.hoverTile = -1;
-        g_mouseDirty = true;          // 交给定时器推动动画
+        g_mouseDirty = true;          // let the timer drive the animation
         return 0;
     }
 
@@ -5981,13 +5981,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             InvalidateRect(hwnd, nullptr, FALSE);
         }
-        // 选歌界面：方向键 / PgUp PgDn 滚动
+        // Song grid: arrow keys / PgUp PgDn to scroll
         if (g_app.page == Page::Grid && !g_settingsOpen && !g_togOpen) {
             const float viewH = (std::max)(0.0f, (float)g_app.height - GRID_TOP - UI::PAD);
             float step = 0.0f;
-            if (wp == VK_UP)        step = -110.0f;                    // 约一行
+            if (wp == VK_UP)        step = -110.0f;                    // about one row
             else if (wp == VK_DOWN) step = 110.0f;
-            else if (wp == VK_PRIOR) step = -viewH + 40.0f;            // PgUp：一屏
+            else if (wp == VK_PRIOR) step = -viewH + 40.0f;            // PgUp: one screen
             else if (wp == VK_NEXT)  step = viewH - 40.0f;             // PgDn
             if (step != 0.0f) {
                 g_app.scrollTarget += step;
@@ -5999,7 +5999,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
-        // 一起听输入框：Ctrl+V 粘贴（自绘输入框没有系统编辑器，得自己读剪贴板）
+        // Together input box: Ctrl+V to paste (a custom-drawn box has no system editor, so read the clipboard ourselves)
         if (g_togOpen && g_togInput && wp == 'V' &&
             (GetKeyState(VK_CONTROL) & 0x8000)) {
             if (OpenClipboard(hwnd)) {
@@ -6019,7 +6019,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
-        // Ctrl+A 全选清空，方便重输
+        // Ctrl+A clears everything so it's easy to retype
         if (g_togOpen && g_togInput && wp == 'A' &&
             (GetKeyState(VK_CONTROL) & 0x8000)) {
             g_togInputText.clear();
@@ -6031,9 +6031,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CHAR: {
         if (g_togOpen && g_togInput) {
             wchar_t c = (wchar_t)wp;
-            if (c == 8) {                                  // 退格
+            if (c == 8) {                                  // backspace
                 if (!g_togInputText.empty()) g_togInputText.pop_back();
-            } else if (c == 13) {                          // 回车加入
+            } else if (c == 13) {                          // Enter to join
                 if (!g_togMyCode.empty() && g_togInputText == g_togMyCode) {
                     TogToast(T(L"这是你自己的房间码，发给朋友让他加入", L"That is your own room code"));
                     return 0;
@@ -6058,12 +6058,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         bool need = Animate();
         if (g_mouseDirty) { g_mouseDirty = false; need = true; }
-        if (g_coverDirty.exchange(false)) need = true;   // 后台解出封面，重画一次
-        if (!need && CoverWorkPending()) need = true;    // 还有封面在排队/下载/解码
+        if (g_coverDirty.exchange(false)) need = true;   // a cover was decoded in the background, repaint once
+        if (!need && CoverWorkPending()) need = true;    // covers still queued/downloading/decoding
         size_t bmpsBefore = g_coverBmps.size();
-        if (g_app.page == Page::Grid) PrewarmCovers(2);   // 只在选歌页预热
+        if (g_app.page == Page::Grid) PrewarmCovers(2);   // only prewarm on the song grid
         if (g_coverBmps.size() != bmpsBefore) need = true;
-        if (!IsWindowVisible(hwnd)) need = false;      // 收到托盘里就不用重绘了
+        if (!IsWindowVisible(hwnd)) need = false;      // hidden in the tray, no need to repaint
         if (need) InvalidateRect(hwnd, nullptr, FALSE);
         if (g_showFps) {
             static ULONGLONG last = 0;
@@ -6098,7 +6098,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                           pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(menu);
-            PostMessage(hwnd, WM_NULL, 0, 0);      // 让菜单正常收起
+            PostMessage(hwnd, WM_NULL, 0, 0);      // let the menu dismiss properly
             if (cmd == 1) ShowMainWindow(hwnd);
             else if (cmd == 2) PostMessage(hwnd, WM_CLOSE, 0, 0);
         }
@@ -6110,8 +6110,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 #ifndef FLORAL_NO_TOGETHER
         TogetherStop();
 #endif
-        AudioClose();                       // 停设备、join 下载线程
-        if (g_apiProc) {                    // 自己拉起来的接口服务跟着退出
+        AudioClose();                       // stop the device, join the download thread
+        if (g_apiProc) {                    // the API service we spawned exits along with us
             TerminateProcess(g_apiProc, 0);
             CloseHandle(g_apiProc);
             g_apiProc = nullptr;
@@ -6123,7 +6123,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 /* ══════════════════════════════════════════
-   离屏渲染（开发用）
+   Offscreen rendering (dev only)
    ══════════════════════════════════════════ */
 static bool SavePng(IWICBitmapSource* src, const std::wstring& path) {
     IWICStream* stream = nullptr;
@@ -6178,7 +6178,7 @@ static bool RenderToPng(const std::wstring& out) {
     return ok;
 }
 
-/* ── 记住窗口位置 ── */
+/* ── Remember the window position ── */
 static std::wstring WindowFile() { return LocalDir() + L"\\window.txt"; }
 
 static void SaveWindowRect(HWND hwnd) {
@@ -6191,7 +6191,7 @@ static void SaveWindowRect(HWND hwnd) {
     fclose(f);
 }
 
-/* 读上次的位置；落在屏幕外就忽略（拔掉副屏也要能开） */
+/* Read the last position; ignore it if it lands off-screen (must still open with a secondary monitor unplugged) */
 static bool LoadWindowRect(int& x, int& y, int& w, int& h) {
     FILE* f = nullptr;
     _wfopen_s(&f, WindowFile().c_str(), L"rb");
@@ -6203,14 +6203,14 @@ static bool LoadWindowRect(int& x, int& y, int& w, int& h) {
 
     RECT probe{ (LONG)a, (LONG)b, (LONG)(a + c), (LONG)(b + d) };
     HMONITOR mon = MonitorFromRect(&probe, MONITOR_DEFAULTTONULL);
-    if (!mon) return false;                 // 那块屏幕已经不在了
+    if (!mon) return false;                 // that monitor is gone now
     x = (int)a; y = (int)b; w = (int)c; h = (int)d;
     return true;
 }
 /* ══════════════════════════════════════════
-   入口
+   Entry point
    ══════════════════════════════════════════ */
-/** 崩溃时把异常码和地址写下来，便于定位 */
+/** On a crash, write down the exception code and address so it can be located later */
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     wchar_t buf[MAX_PATH] = { 0 };
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
@@ -6220,7 +6220,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     _wfopen_s(&f, (dir + L"\\crash.txt").c_str(), L"wb");
     if (f) {
         const EXCEPTION_RECORD* r = ep->ExceptionRecord;
-        // 反查异常地址属于哪个模块，以及模块内偏移
+        // Look up which module the exception address belongs to, and the offset inside that module
         wchar_t mod[MAX_PATH] = L"?";
         HMODULE hm = nullptr;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -6238,7 +6238,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-/* 未捕获异常：写清楚是什么，别默默 abort */
+/* Unhandled exception: record exactly what it was, don't just abort silently */
 static void OnTerminate() {
     std::string msg = "unknown";
     if (auto e = std::current_exception()) {
@@ -6254,7 +6254,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetUnhandledExceptionFilter(CrashFilter);
     std::set_terminate(OnTerminate);
-    timeBeginPeriod(1);              // 提高定时器精度，减少帧间隔抖动
+    timeBeginPeriod(1);              // raise timer resolution, reduce frame interval jitter
     LogInit();
     ThemeLoad();
     Logf("APP", "==== Floral 启动 ====");
@@ -6267,7 +6267,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     Logf("APP", "日志文件 = %s", Narrow(LogPath()).c_str());
     LoadVolume();
     LoadQuality();
-    LoadSource();                    // 必须先定音源，LoadSession 才知道读哪个文件
+    LoadSource();                    // the source must be set first so LoadSession knows which file to read
     g_likesName = std::wstring(SourceTag()) + L"-likes.tsv";
     Logf("APP", "音源=%d 歌单文件=%s", g_source, Narrow(g_likesName).c_str());
     LoadSession();
@@ -6275,8 +6275,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     InitData();
     Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
     LoadPlaylists();
-    AdoptLocalCovers();          // 只补路径，不解码：启动不再拉起歌曲封面
-    // 首屏只等歌单列表；歌曲列表和封面都等用户点进歌单时再拉
+    AdoptLocalCovers();          // only fills in paths, no decoding: startup no longer loads song covers
+    // First screen only waits for the playlist list; the song list and covers are fetched when the user opens a playlist
     if (!g_token.empty()) g_bootRefreshPending = true;
     std::thread([]() {
         EnsureSidecar();
@@ -6291,14 +6291,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         return 1;
     }
 
-    // 启动后台解码线程，并把所有封面排进队列
+    // Start the background decode thread and queue up all the covers
     StartDecoder();
 
-    // 缺封面的歌按需下载
+    // Download covers for songs that lack one, on demand
     g_covFlag.assign(g_app.songs.size(), 0);
     std::thread(CoverWorkerMain).detach();
 
-    // 命令行
+    // Command line
     std::wstring outPath, mode, page, audioTest;
     float enterT = -1.0f;
     float panelT = -1.0f;
@@ -6324,9 +6324,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         } else if (a == L"--fps") {
             g_showFps = true;
         } else if (a == L"--settings") {
-            g_settingsOpen = true; g_setT = 1.0f;   // 截图用：直接打开设置面板
+            g_settingsOpen = true; g_setT = 1.0f;   // for screenshots: open the settings panel directly
         } else if (a == L"--loading") {
-            g_audioLoading = true;        // 截图用：固定显示加载圈
+            g_audioLoading = true;        // for screenshots: keep the spinner visible
             g_loadingSince = GetTickCount64() - 1000;
             g_spinAngle = 0.8f;
         } else if (a == L"--trace") {
@@ -6334,32 +6334,32 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         } else if (a == L"--choose") {
             g_loginChoose = true; g_settingsOpen = true; g_setT = 1.0f;
         } else if (a == L"--icont" && i + 1 < argc) {
-            iconT = (float)_wtof(argv[++i]);        // 截图用：播放图标交叉淡化进度
+            iconT = (float)_wtof(argv[++i]);        // for screenshots: play-icon crossfade progress
         } else if (a == L"--toastt" && i + 1 < argc) {
-            toastT = (float)_wtof(argv[++i]);      // 截图用：toast 透明度
+            toastT = (float)_wtof(argv[++i]);      // for screenshots: toast opacity
         } else if (a == L"--textphase" && i + 1 < argc) {
-            textPhase = _wtoi(argv[++i]);          // 截图用：1 退场 / 2 进场
+            textPhase = _wtoi(argv[++i]);          // for screenshots: 1 exit / 2 enter
         } else if (a == L"--textt" && i + 1 < argc) {
-            textT = (float)_wtof(argv[++i]);       // 截图用：文字进场进度
+            textT = (float)_wtof(argv[++i]);       // for screenshots: text enter progress
         } else if (a == L"--covert" && i + 1 < argc) {
-            coverT = (float)_wtof(argv[++i]);      // 截图用：封面淡入进度
+            coverT = (float)_wtof(argv[++i]);      // for screenshots: cover fade-in progress
         } else if (a == L"--panelt" && i + 1 < argc) {
-            panelT = (float)_wtof(argv[++i]);     // 截图用：面板定格在某个进度
+            panelT = (float)_wtof(argv[++i]);     // for screenshots: freeze the panel at a given progress
         } else if (a == L"--volopen") {
-            g_volOpen = true; g_volT = 1.0f;   // 截图用
+            g_volOpen = true; g_volT = 1.0f;   // for screenshots
         } else if (a == L"--qualopen") {
             g_qualOpen = true; g_qualT = 1.0f;
         } else if (a == L"--enter" && i + 1 < argc) {
-            enterT = (float)_wtof(argv[++i]);   // 截图用：定格进场某一时刻
+            enterT = (float)_wtof(argv[++i]);   // for screenshots: freeze the enter animation at one moment
         } else if (a == L"--loginstate" && i + 1 < argc) {
-            g_loginState = _wtoi(argv[++i]);   // 截图用：伪造登录态 1/2/3
+            g_loginState = _wtoi(argv[++i]);   // for screenshots: fake the sign-in state 1/2/3
         } else if (a == L"--audiotest" && i + 1 < argc) {
             audioTest = argv[++i];
         }
     }
     if (argv) LocalFree(argv);
 
-    // 音频引擎自检：打开、播 1.2 秒、把状态写到 audiotest.txt
+    // Audio engine self-test: open, play for 1.2 s, write the state to audiotest.txt
     if (!audioTest.empty()) {
         std::wstring log;
         bool ok = AudioOpen(audioTest);
@@ -6372,7 +6372,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                      AudioPosMS(), AudioLenMS(), (int)AudioIsPlaying());
             log += b;
 
-            // 再验一下 seek 在流上能不能用
+            // Also verify that seek works on a stream
             AudioSeekMS(60000);
             Sleep(900);
             swprintf(b, 128, L"after seek(60s) pos=%d\n", AudioPosMS());
@@ -6396,11 +6396,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         if (outPath.empty()) outPath = L"shot.png";
         g_app.width = 960.0f;
         g_app.height = 640.0f;
-        g_snapUI = true;              // 截图直接到终态
-        g_introDone = true;           // 截图跳过开屏动画
-        g_lineT = 1.0f;               // 分隔线直接伸到底
+        g_snapUI = true;              // screenshots go straight to the final state
+        g_introDone = true;           // screenshots skip the splash animation
+        g_lineT = 1.0f;               // the divider extends all the way
 
-        // 截图要完整：等后台把封面都解出来
+        // Screenshots must be complete: wait for the background to decode all covers
         {
             size_t want = g_decRequested.size();
             for (int i = 0; i < 2000 && g_coverSrcs.size() < want; i++) {
@@ -6410,10 +6410,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             DrainDecoded();
         }
 
-        if (page == L"playlists") {            // 画面用：歌单选择页
+        if (page == L"playlists") {            // for screenshots: the playlist selection page
             g_app.page = Page::Playlists;
             PlCenterContent();
-        } else if (page == L"empty") {         // 画面用：播放页但没选歌
+        } else if (page == L"empty") {         // for screenshots: player page with no song selected
             g_app.current = -1;
             g_app.page = Page::Player;
             g_app.pageAnim = 1.0f;
@@ -6423,7 +6423,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             g_app.pos = 62.0;
             g_app.page = Page::Player;
             g_app.pageAnim = 1.0f;
-            if (enterT >= 0.0f) {              // 定格进场动画的某一帧
+            if (enterT >= 0.0f) {              // freeze one frame of the enter animation
                 EnsureBase(g_app.width, (int)g_app.songs.size());
                 if (!g_base.empty()) {
                     const TileBox& b = g_base[0];
@@ -6437,9 +6437,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         } else if (hoverIdx >= 0 && hoverIdx < (int)g_app.tileAnim.size()) {
             g_app.hoverTile = hoverIdx;
             g_app.tileAnim[hoverIdx] = 1.0f;
-            // 直接算到终态，截图才能看到"挤开"后的样子
+            // Compute the end state directly so the screenshot shows the "pushed apart" layout
             EnsureBase(g_app.width, (int)g_app.songs.size());
-            // 鼠标要落在「基础布局」的这块上，否则命中会跑到邻居
+            // The mouse must land on this tile in the base layout, otherwise hit-testing picks a neighbour
             const TileBox& bb = g_base[(size_t)hoverIdx];
             g_app.mouse.x = (LONG)(bb.x + bb.w * 0.5f);
             g_app.mouse.y = (LONG)(GRID_TOP + bb.y + bb.h * 0.5f);
@@ -6447,15 +6447,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             g_draw = g_target;
         }
 
-        g_noCoverFade = true;   // 截图：封面直接满，别拍成占位色
+        g_noCoverFade = true;   // screenshots: covers at full opacity, don't capture the placeholder colour
     if (coverT >= 0.0f) { g_noCoverFade = false; g_coverFadeOverride = coverT; }
-    if (iconT >= 0.0f) {          // 截图：把形变参数定在某个值（0=播放，1=暂停）
+    if (iconT >= 0.0f) {          // screenshots: pin the morph parameter at a value (0 = play, 1 = pause)
         g_app.playing = (iconT > 0.5f);
         g_playIconMix = iconT;
     }
     if (toastT >= 0.0f) {
         g_toastOverride = toastT;
-        g_settingsMsg = L"歌单已更新";     // 截图时造一条提示
+        g_settingsMsg = L"歌单已更新";     // fabricate a toast for the screenshot
         g_settingsMsgAt = GetTickCount64();
         g_togMsg = std::wstring(T(L"已和 ", L"Connected with ")) + L"朋友的电脑";
         g_togMsgAt = GetTickCount64();
@@ -6464,13 +6464,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         g_textT = textT;
         if (textPhase >= 0) g_textPhase = textPhase;
         if (g_textPhase == 1 && g_outTitle.empty() && !g_app.songs.empty()) {
-            // 截图时没有真实切歌，人工造一份旧文字
+            // No real track switch during screenshots, so fabricate the old text by hand
             g_outTitle = L"上一首歌的名字";
             g_outArtist = L"上一位歌手";
             g_outAlbum = L"上一张专辑";
         }
     }
-    if (panelT >= 0.0f) {   // 只给当前打开的那个面板定格进度
+    if (panelT >= 0.0f) {   // only pin the progress of the panel that's currently open
         if (g_settingsOpen) g_setT = panelT;
         if (g_qualOpen)     g_qualT = panelT;
         if (g_volOpen)      g_volT = panelT;
@@ -6484,7 +6484,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         return ok ? 0 : 2;
     }
 
-    // 无边框窗口
+    // Frameless window
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
@@ -6512,7 +6512,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     }
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
-    SetTimer(hwnd, 1, 8, nullptr);   // 8ms 保持垂直同步
+    SetTimer(hwnd, 1, 8, nullptr);   // 8ms keeps vsync
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {

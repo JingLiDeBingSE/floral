@@ -2,14 +2,14 @@
 #include <string>
 
 /*
- * 一起听（中继版）
+ * Listen Together (relay edition)
  *
- * 房间码 → 本地 together-server.js（Node，内嵌）→ EMQX Cloud（TLS）
- * C++ 只跟本地 HTTP 打交道，不直接讲 MQTT。
+ * Room code → local together-server.js (Node, embedded) → EMQX Cloud (TLS)
+ * C++ speaks only to the local HTTP server, never MQTT directly.
  */
 
 struct TogetherEvent {
-    int  kind = 0;          // 1 = 已连接  2 = 对方状态  3 = 对方断开  4 = 出错
+    int  kind = 0;          // 1 = connected  2 = peer state  3 = peer left  4 = error
     std::string nick;
     std::string song;
     std::string src;
@@ -35,8 +35,8 @@ void TogetherPushState(const std::string& song, const std::string& src,
 
 unsigned long long TogetherNowMs();
 
-void TogetherSayHello();                       // 在场心跳（只报昵称）
-std::string TogetherDefaultNick(bool host);    // 默认昵称：计算机名   // UTC 毫秒，跨机器可比
+void TogetherSayHello();                       // presence heartbeat (nick only)
+std::string TogetherDefaultNick(bool host);    // default nickname: computer name   // UTC ms, comparable across machines
 
-void TogetherRequestSkip();       // 告诉房主：这首我放不了，跳过吧
+void TogetherRequestSkip();       // tell host: can't play this track, skip it
 bool TogetherPoll(TogetherEvent& ev);

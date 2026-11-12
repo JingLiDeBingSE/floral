@@ -51,7 +51,7 @@ std::wstring LogPath() {
 void LogInit() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_file) { fclose(g_file); g_file = nullptr; }
-    g_file = _wfsopen(LogPath().c_str(), L"wb", _SH_DENYWR);   // 允许其他程序读
+    g_file = _wfsopen(LogPath().c_str(), L"wb", _SH_DENYWR);   // allow other programs to read
     if (!g_file) return;
 
     SYSTEMTIME st;

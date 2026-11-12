@@ -4,20 +4,20 @@
 #include <string>
 
 /*
- * 数据加载。
+ * Data loading.
  *
- * 读 kugou-likes.tsv —— 由 kugou-export.js 从酷狗「我喜欢」导出：
- *   title <TAB> artist <TAB> album <TAB> seconds <TAB> cover（相对路径，可为空）
+ * Reads kugou-likes.tsv — exported from Kugou "I Like" by kugou-export.js:
+ *   title <TAB> artist <TAB> album <TAB> seconds <TAB> cover (relative path, may be empty)
  *
- * 文件不存在就显示空列表。要换成别的数据源，改这里即可。
+ * If the file does not exist, an empty list is shown. To use another data source, change this file.
  */
 
-/** 相对工作目录还是 exe 所在目录找文件，返回找到的路径（找不到返回空） */
+/** Look for a file in the working directory or next to the exe; returns the path found (empty if not found) */
 static std::wstring FindAsset(const std::wstring& name) {
-    // 1) 当前工作目录
+    // 1) current working directory
     if (GetFileAttributesW(name.c_str()) != INVALID_FILE_ATTRIBUTES) return name;
 
-    // 2) exe 所在目录及其上一级（build\songlist.exe -> 项目根目录）
+    // 2) exe directory and its parent (build\songlist.exe -> project root)
     wchar_t exe[MAX_PATH] = { 0 };
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
         std::wstring dir(exe);
@@ -62,7 +62,7 @@ void InitData() {
         if (f) bytes.assign((std::istreambuf_iterator<char>(f)),
                             std::istreambuf_iterator<char>());
     }
-    if (bytes.empty()) return;        // 没有歌单就是空的，等登录后拉
+    if (bytes.empty()) return;        // no playlist: stay empty, fetch after login
     if (bytes.empty()) return;
 
     if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF &&
@@ -76,7 +76,7 @@ void InitData() {
     bool first = true;
     while (std::getline(ss, line)) {
         if (line.empty()) continue;
-        if (first) { first = false; continue; }    // 跳过表头
+        if (first) { first = false; continue; }    // skip header
 
         std::vector<std::wstring> col;
         size_t start = 0;
@@ -97,7 +97,7 @@ void InitData() {
         if (!s.cover.empty()) s.cover = FindAsset(s.cover);
         if (col.size() > 5) {
             std::wstring h = Trim(col[5]);
-            s.hash.assign(h.begin(), h.end());     // hash 是十六进制，直接窄化
+            s.hash.assign(h.begin(), h.end());     // hash is hex, narrow directly
         }
         if (col.size() > 6) s.mixId = _wtoi64(col[6].c_str());
         if (col.size() > 7) s.albumId = _wtoi64(col[7].c_str());
