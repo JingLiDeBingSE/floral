@@ -27,6 +27,7 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <exception>
 
 App g_app;
 static HWND g_hwnd = nullptr;      // main window (drives explicit redraws)
