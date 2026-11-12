@@ -91,6 +91,9 @@ struct App {
     int   plHover = -1;                       // Hovered playlist
     int   plActive = -1;                      // Selected (about to expand)
     float plSelT = 0.0f;                      // Selection anim 0→1 (center + expand)
+    std::vector<float> plHoverT;              // per-circle hover progress 0->1
+    int   plPress = -1;                       // circle held down (press feedback)
+    int   plSelLast = -1;                     // last selected index, kept while the card collapses
     bool  plDragging = false;
     POINT plDragStartMouse = { 0, 0 };
     float plDragStartX = 0.0f, plDragStartY = 0.0f;
@@ -118,6 +121,9 @@ struct App {
 };
 
 extern App g_app;
+
+/* Writable data directory: %USERPROFILE%\Documents\Floral */
+extern std::wstring g_dataDir;
 
 #include "theme.h"
 

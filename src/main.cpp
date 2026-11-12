@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <dwmapi.h>
 #include <mmsystem.h>
 #include <cstdio>
@@ -47,6 +48,26 @@ static float g_alpha = 1.0f;
 static float g_alphaMul = 1.0f;
 static float g_plEnter  = 1.0f;   // playlist page fade-in 0→1
 static float g_gridEnter = 1.0f;  // song grid entrance 0→1
+
+/* Playlist page -> song page transition:
+   0 idle, 1 wipe out bottom->top, 2 loading ring, 3 ring fade-out (then the fly-in starts) */
+static int   g_plPhase  = 0;
+static float g_plT      = 0.0f;
+static float g_plSpin   = 0.0f;    // spinner angle accumulator
+static bool  g_swapDone = false;   // playlist data arrived
+static float g_plEnterX = 0.0f, g_plEnterY = 0.0f;   // where the card was clicked (origin of the dissolve)
+
+/* Page curtain: covers the window with the background colour, swaps the page, then reveals.
+   0 idle, 1 covering (old page out), 2 revealing (new page in) */
+static int   g_curtainPhase  = 0;
+static float g_curtainT      = 0.0f;
+static int   g_curtainAction = 0;                    // 1 picker, 2 player
+static bool  g_playerFromPicker = false;             // so leaving the player returns where we came from
+
+/* Immediate page switches, defined further down; the curtain calls them */
+static void GoGrid();
+static void GoPickerNow();
+static void GoPlayerPageNow(bool fromPicker);
 static bool      g_scrollDrag = false;   // dragging the scrollbar
 
 /** Mouse moved, redraw needed (driven by the timer so high-frequency mouse events cannot flood the redraw) */
@@ -681,11 +702,77 @@ static std::vector<CovJob> g_covQueue;
 static std::vector<int>  g_covDone;
 static std::vector<char> g_covFlag;      // 0 pending / 1 queued / 2 processed
 
+std::wstring g_dataDir;            // %USERPROFILE%\Documents\Floral
+
+/* Writable data lives in Documents, not next to the exe: a portable exe dropped in
+   Downloads or on a read-only folder still has somewhere to keep its state. */
+static std::wstring MakeDataDir() {
+    wchar_t docs[MAX_PATH] = { 0 };
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL | CSIDL_FLAG_CREATE, nullptr, 0, docs)))
+        return L".";
+    std::wstring d = std::wstring(docs) + L"\\Floral";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+static bool FileExistsW(const std::wstring& p) {
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static std::wstring ExeDir() {
+    wchar_t exe[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L".";
+    std::wstring s(exe);
+    size_t p = s.find_last_of(L"\\/");
+    return (p == std::wstring::npos) ? L"." : s.substr(0, p);
+}
+
+/* One-time migration: an older build kept everything next to the exe */
+static void MigrateLegacyData(const std::wstring& dst) {
+    if (FileExistsW(dst + L"\\kugou-likes.tsv")) return;      // already migrated
+    std::wstring cands[2] = { ExeDir(), ExeDir() + L"\\.." };
+    for (int c = 0; c < 2; c++) {
+        std::wstring src = cands[c];
+        if (!FileExistsW(src + L"\\kugou-likes.tsv")) continue;
+        static const wchar_t* files[] = {
+            L"kugou-likes.tsv", L"netease-likes.tsv", L"qq-likes.tsv",
+            L"kugou-session.json", L"netease-session.json", L"qq-session.json",
+            L"playlists.tsv", L"lang.txt", L"source.txt", L"theme.txt",
+            L"quality.txt", L"volume.txt", L"window.txt",
+        };
+        for (const wchar_t* f : files) {
+            std::wstring s = src + L"\\" + f;
+            if (!FileExistsW(s)) continue;
+            CopyFileW(s.c_str(), (dst + L"\\" + f).c_str(), FALSE);
+        }
+        // covers
+        std::wstring sc = src + L"\\covers";
+        if (FileExistsW(sc)) {
+            std::wstring dc = dst + L"\\covers";
+            CreateDirectoryW(dc.c_str(), nullptr);
+            WIN32_FIND_DATAW fd{};
+            HANDLE hf = FindFirstFileW((sc + L"\\*.jpg").c_str(), &fd);
+            if (hf != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    CopyFileW((sc + L"\\" + fd.cFileName).c_str(),
+                              (dc + L"\\" + fd.cFileName).c_str(), FALSE);
+                } while (FindNextFileW(hf, &fd));
+                FindClose(hf);
+            }
+        }
+        Logf("APP", "已把旧数据迁移到 %s", Narrow(dst).c_str());
+        return;
+    }
+}
+
 static std::wstring AssetDir() {
-    std::wstring p = FindProjectFile(L"kugou-likes.tsv");
-    if (p.empty()) return L".";
-    size_t s = p.find_last_of(L"\\/");
-    return (s == std::wstring::npos) ? L"." : p.substr(0, s);
+    if (g_dataDir.empty()) {
+        g_dataDir = MakeDataDir();
+        MigrateLegacyData(g_dataDir);
+        Logf("APP", "数据目录 = %s", Narrow(g_dataDir).c_str());
+    }
+    return g_dataDir;
 }
 
 static void CoverWorkerMain() {
@@ -2857,32 +2944,38 @@ static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float di
         return;
     }
 
-    // Fully continuous: the vinyl grows from small to full while the cover shrinks toward the center. No "appears at some threshold" switch
+    // Fully continuous morph. Two things used to snap at t=0:
+    //   1. only the tile's WIDTH was used, so a wide tile instantly became a square;
+    //   2. the vinyl was drawn at full radius from the first frame, poking out of a rectangular cover.
+    // Now the cover rect interpolates from the tile's real rect to a square, and the vinyl grows from 0.
     const float e = discK * discK * (3.0f - 2.0f * discK);      // smoothstep
-    const float w = r.right - r.left;
+    const float w0 = r.right - r.left;
+    const float h0 = r.bottom - r.top;
+    const float st = (w0 + h0) * 0.5f;                          // square side the disc settles on
     const float cx = (r.left + r.right) * 0.5f;
     const float cy = (r.top + r.bottom) * 0.5f;
-    const float R  = w * 0.5f;
+    const float R  = st * 0.5f;
 
-    // Compute the cover first, then grow the vinyl outward from the cover edge — the ring thickness grows continuously from 0,
-    // so there is no "a black ring suddenly appears on one frame" jump
-    const float artR  = R + (R * 0.66f - R) * e;                // R → 0.66R (matches DrawDisc)
-    const float discR = artR + (R - artR) * e;                  // grows from artR to R
-    FillCircle(cx, cy, discR, 0x2A2026, 1.0f);
-    const float radius = UI::R_TILE + (artR - UI::R_TILE) * e;  // rounded square → perfect circle
-    DrawCoverArt(Rc(cx - artR, cy - artR, artR * 2.0f, artR * 2.0f), s, idx, radius);
+    const float vr = R * e;                                     // vinyl radius: 0 → R
+    if (vr > 0.5f) FillCircle(cx, cy, vr, 0x2A2026, 1.0f);
 
-    // While still in square form, the song info fades out with it
+    // Cover: starts as the tile's own rectangle, ends as the 1.32R inner square of the disc
+    const float artSide = R * 1.32f;
+    const float cw = w0 + (artSide - w0) * e;
+    const float ch = h0 + (artSide - h0) * e;
+    const float radius = UI::R_TILE + (artSide * 0.5f - UI::R_TILE) * e;
+    DrawCoverArt(Rc(cx - cw * 0.5f, cy - ch * 0.5f, cw, ch), s, idx, radius);
+
+    // While still close to a tile, the song info fades out with it
     if (infoK > 0.0f && e < 0.55f) {
         float ia = infoK * (1.0f - e / 0.55f);
         if (ia > 0.0f) DrawTileInfo(r, s, ia);
     }
-
     // Grooves and center hole: fade in together with the disc
     if (e > 0.15f) {
         float k = (e - 0.15f) / 0.85f;
-        StrokeCircle(cx, cy, discR * 0.93f, 0xFFFFFF, 0.05f * k, 1.0f);
-        StrokeCircle(cx, cy, discR * 0.78f, 0xFFFFFF, 0.05f * k, 1.0f);
+        StrokeCircle(cx, cy, vr * 0.93f, 0xFFFFFF, 0.05f * k, 1.0f);
+        StrokeCircle(cx, cy, vr * 0.78f, 0xFFFFFF, 0.05f * k, 1.0f);
         FillCircle(cx, cy, R * 0.05f, UI::BG, 0.9f * k);
         StrokeCircle(cx, cy, R * 0.05f, 0xFFFFFF, 0.18f * k, 1.0f);
     }
@@ -2950,8 +3043,13 @@ static void DrawEntering() {
 
             float nx = c0x + (tx - c0x) * e;
             float ny = c0y + (ty - c0y) * e;
+            // Do NOT snap to a square on frame 0: a rectangular tile kept its width and
+            // jumped to a square the instant the transition started. Interpolate the real
+            // tile rect toward the square instead, so the shape change is part of the motion.
             float sz = (std::min)(bx.w, bx.h) * (1.0f - 0.32f * e);
-            DrawMorphDisc(Rc(nx - sz * 0.5f, ny - sz * 0.5f, sz, sz),
+            float wNow = bx.w + (sz - bx.w) * e;
+            float hNow = bx.h + (sz - bx.h) * e;
+            DrawMorphDisc(Rc(nx - wNow * 0.5f, ny - hNow * 0.5f, wNow, hNow),
                           a.songs[i], i, clamp01(eo * 1.35f), 0.0f);
         }
     }
@@ -3717,14 +3815,24 @@ static void DrainPlaylistSwap() {
         a.pos = 0.0;
         a.scroll = 0.0f;
         a.scrollTarget = 0.0f;
+        // Precompute the grid layout now, while the loading ring still covers the screen:
+        // doing it on the first fly-in frame would freeze that frame for a visible moment
+        EnsureBase(a.width, (int)a.songs.size());
+        EnsureTarget(a.width, (int)a.songs.size(), -1);
+
         a.pageAnim = 0.0f;
         a.page = Page::Grid;
         a.plActive = idx;
-        g_gridEnter = 0.0f;          // Song page: tracks fly in from the right
+        // Hold the fly-in until the loading ring has faded out (phase 3 finishes it)
+        g_gridEnter = (g_plPhase == 2) ? -1.0f : 0.0f;
+        g_swapDone = true;
         g_coverDirty = true;
         Logf("APP", "歌单已切换：%d 首", (int)a.songs.size());
     } else if (!err.empty()) {
         Logf("ERR", "切换歌单失败: %s", Narrow(err).c_str());
+        g_plPhase = 0;                 // abort the transition, stay on the picker
+        g_plT = 0.0f;
+        g_gridEnter = 1.0f;
     }
 }
 /* ══════════════════════════════════════════
@@ -3920,14 +4028,27 @@ static void PlScreenPos(int i, float& cx, float& cy) {
     }
 }
 
+/* Centred loading ring, shared by the splash and the picker -> song transition */
+static void DrawPlLoader(float W, float H, float alpha, float scale = 1.0f) {
+    if (alpha <= 0.01f) return;
+    FillRect(Rc(0, (float)UI::TITLE_H, W, H - (float)UI::TITLE_H), UI::BG, alpha);
+    DrawSpinner(W * 0.5f, H * 0.5f, 20.0f * scale, g_plSpin, 0.95f * alpha);
+}
 static void DrawPlaylistPicker() {
     App& a = g_app;
     const float W = a.width, H = a.height;
     const int n = (int)a.playlists.size();
 
     if (n == 0) {
-        Text(T(L"还没有歌单数据", L"No playlists yet"), Fmt(14.0f, DWRITE_FONT_WEIGHT_NORMAL),
-             Rc(0, H * 0.45f, W, 24), UI::TEXT3, DWRITE_TEXT_ALIGNMENT_CENTER);
+        // Empty state: a faint disc outline plus two lines, so the page still has a subject
+        const float cyE = H * 0.44f;
+        StrokeCircle(W * 0.5f, cyE, 34.0f, UI::BORDER, 0.55f, 1.6f);
+        StrokeCircle(W * 0.5f, cyE, 9.0f, UI::BORDER, 0.55f, 1.6f);
+        Text(T(L"还没有歌单数据", L"No playlists yet"), Fmt(15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+             Rc(0, cyE + 20, W, 24), UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
+        Text(T(L"登录后会自动同步你的自建歌单", L"Your playlists sync after sign-in"),
+             Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
+             Rc(0, cyE + 46, W, 20), UI::TEXT3, DWRITE_TEXT_ALIGNMENT_CENTER);
         return;
     }
 
@@ -3951,13 +4072,20 @@ static void DrawPlaylistPicker() {
     D2D1_RECT_F cardR{};
     float cardRadius = 0.0f;
     float avatarCx = 0.0f, avatarCy = 0.0f;
-    if (a.plActive >= 0 && a.plActive < n) {
+    // Keep drawing during collapse: plActive clears first, but the card still has to fade away
+    const int selIdx = (a.plActive >= 0) ? a.plActive : a.plSelLast;
+    if (selIdx >= 0 && selIdx < n && a.plSelT > 0.004f) {
         selE = a.plSelT;
         selE = selE * selE * (3.0f - 2.0f * selE);
 
+        // Collapsing: fade the whole card out with the same curve, so it dissolves instead of snapping off
+        const float cardA = (a.plActive >= 0) ? 1.0f : selE;
+        const float keepMul = g_alphaMul;
+        g_alphaMul = keepMul * cardA;
+
         float ccx = 0, ccy = 0;
-        PlScreenPos(a.plActive, ccx, ccy);
-        const Playlist& spl = a.playlists[(size_t)a.plActive];
+        PlScreenPos(selIdx, ccx, ccy);
+        const Playlist& spl = a.playlists[(size_t)selIdx];
 
         // Target card: window center, 620 wide, 150 high
         D2D1_RECT_F from = Rc(ccx - R, ccy - R, R * 2, R * 2);
@@ -3973,8 +4101,19 @@ static void DrawPlaylistPicker() {
         cardR = Rc(cardL, cardT, cardRt - cardL, cardB - cardT);
         cardRadius = L(R, 26.0f);
 
-        // Darken the background to set off the card
-        if (selE > 0.02f) FillRect(Rc(0, UI::TITLE_H, W, H - UI::TITLE_H), 0x000000, 0.28f * selE);
+        // Darken the background so the card reads as a raised surface
+        if (selE > 0.02f) FillRect(Rc(0, UI::TITLE_H, W, H - UI::TITLE_H), 0x000000, 0.34f * selE);
+
+        // Two stacked shadows: a tight one for contact, a wider one for elevation.
+        // They fade in with the card so the surface appears to rise, not merely appear.
+        {
+            float cw2 = cardR.right - cardR.left;
+            float ch2 = cardR.bottom - cardR.top;
+            FillRound(Rc(cardR.left + 2.0f, cardR.top + 10.0f, cw2, ch2),
+                      cardRadius + 1.0f, UI::SHADOW, 0.16f * selE);
+            FillRound(Rc(cardR.left - 6.0f, cardR.top + 26.0f, cw2 + 12.0f, ch2),
+                      cardRadius + 2.0f, UI::SHADOW, 0.09f * selE);
+        }
 
         FillRound(cardR, cardRadius, UI::CARD, 0.99f);
         StrokeRound(cardR, cardRadius, UI::BORDER, 0.80f, 1.0f);
@@ -4011,6 +4150,8 @@ static void DrawPlaylistPicker() {
                      DWRITE_TEXT_ALIGNMENT_LEADING, tc * 0.9f);
             }
         }
+
+        g_alphaMul = keepMul;
     }
 
     // Draw the cover as a circle (also used as the selected item's avatar)
@@ -4066,21 +4207,34 @@ static void DrawPlaylistPicker() {
         if (cy < UI::TITLE_H - R * 1.4f || cy > H + R * 1.4f) continue;
         if (othersA <= 0.02f) continue;
 
+        // Hover lifts the disc slightly (1.035x); press pushes it back (0.97x).
+        // That pair is the whole feedback budget for a grid this dense.
+        float hv = (i < (int)a.plHoverT.size()) ? a.plHoverT[(size_t)i] : 0.0f;
+        float press = (a.plPress == i) ? 1.0f : 0.0f;
+        float rd = R * (1.0f + 0.035f * hv - 0.03f * press);
+
         float keep = g_alphaMul;
         g_alphaMul = keep * othersA;
-        drawCoverCircle(i, cx, cy, R, 1.0f);
-        bool hot = (a.plHover == i);
-        StrokeCircle(cx, cy, R - 0.75f, hot ? UI::ACCENT : UI::BORDER, hot ? 0.95f : 0.55f, 1.6f);
+
+        // Soft drop shadow: one offset disc reads as depth; a real blur is not worth the cost here
+        FillCircle(cx, cy + 3.0f, rd * 1.02f, UI::SHADOW, 0.10f + 0.06f * hv);
+
+        drawCoverCircle(i, cx, cy, rd, 1.0f);
+
+        bool hot = (hv > 0.35f);
+        StrokeCircle(cx, cy, rd - 0.75f, hot ? UI::ACCENT : UI::BORDER,
+                     hot ? 0.95f : 0.55f, 1.6f + 0.4f * hv);
         g_alphaMul = keep;
 
-        Hit h; h.r = Rc(cx - R, cy - R, R * 2, R * 2); h.kind = HK_PL; h.index = i;
-        if (g_alpha > 0.5f && a.plActive < 0) a.hits.push_back(h);   // Once selected the disc has faded out; no longer responds
+        Hit h; h.r = Rc(cx - rd, cy - rd, rd * 2, rd * 2); h.kind = HK_PL; h.index = i;
+        if (g_alpha > 0.5f && a.plActive < 0) a.hits.push_back(h);   // faded out once selected
     }
 
     // Selected item's avatar: slides with the card from the disc center to the card's left
-    if (a.plActive >= 0 && a.plActive < n && selE > 0.01f) {
-        drawCoverCircle(a.plActive, avatarCx, avatarCy, R * 0.92f, 1.0f);
-        StrokeCircle(avatarCx, avatarCy, R * 0.92f - 0.75f, UI::ACCENT, 0.9f * selE, 1.6f);
+    if (selIdx >= 0 && selIdx < n && selE > 0.01f) {
+        const float cardA = (a.plActive >= 0) ? 1.0f : selE;
+        drawCoverCircle(selIdx, avatarCx, avatarCy, R * 0.92f, cardA);
+        StrokeCircle(avatarCx, avatarCy, R * 0.92f - 0.75f, UI::ACCENT, 0.9f * selE * cardA, 1.6f);
     }
 }
 /* ══════════════════════════════════════════
@@ -4194,9 +4348,45 @@ static void DrawUI(ID2D1RenderTarget* rt) {
 
     // Playlist picker: drawn as a separate full page
     if (a.page == Page::Playlists) {
+        // While leaving, the page grows 1.0 -> 1.02: a tiny bit of motion keeps the fade alive
+        float scPage = 1.0f;
+        if (g_plPhase == 1) {
+            float e1 = g_plT * g_plT * (3.0f - 2.0f * g_plT);
+            scPage = 1.0f + 0.02f * e1;
+        }
+        if (scPage > 1.0005f)
+            g_rt->SetTransform(D2D1::Matrix3x2F::Scale(scPage, scPage, center));
+
         g_alpha = g_plEnter;          // Fade-in after the splash ends
         DrawPlaylistPicker();
         g_alpha = 1.0f;
+
+        if (scPage > 1.0005f) g_rt->SetTransform(D2D1::Matrix3x2F::Identity());
+
+        // Page exit: the whole page scales up a touch while fading into the background colour.
+        // No direction, no particles - just a quiet cross-dissolve, which suits this app far
+        // better than a showy effect. The scale is what keeps it from reading as a plain fade.
+        if (g_plPhase == 1 && g_plT > 0.001f) {
+            float e = g_plT * g_plT * (3.0f - 2.0f * g_plT);   // smoothstep
+            FillRect(Rc(0, (float)UI::TITLE_H, W, H - (float)UI::TITLE_H), UI::BG, e);
+            // Last 30%: the ring fades in underneath, so there is no blank beat between them
+            if (g_plT > 0.70f) DrawPlLoader(W, H, (g_plT - 0.70f) / 0.30f);
+        }
+        // Page curtain: covers the picker while switching in or out
+        if (g_curtainPhase != 0) {
+            float e = g_curtainT * g_curtainT * (3.0f - 2.0f * g_curtainT);
+            FillRect(Rc(0, 0, W, H), UI::BG, e);
+        }
+
+        // Loading ring (phases 2 and 3); the page is still the picker until the data lands
+        if (g_plPhase == 2) {
+            float sIn = (std::min)(1.0f, g_plT / 0.18f);
+            DrawPlLoader(W, H, 1.0f, 0.90f + 0.10f * (1.0f - powf(1.0f - sIn, 3.0f)));
+        } else if (g_plPhase == 3) {
+            float p = g_plT;
+            DrawPlLoader(W, H, powf(1.0f - p, 1.6f));      // eased tail: no hard edge at the end
+        }
+        
         DrawTitleBar(W);
         if (g_setT > 0.01f) {
             a.mouse = realMouse;
@@ -4224,7 +4414,26 @@ static void DrawUI(ID2D1RenderTarget* rt) {
     if (a.pageAnim > 0.001f) {
         g_alpha = a.pageAnim;
         if (g_enterOn && g_enterT < 0.80f) {
-            DrawEntering();            // First half of the transition: tiles scatter + main disc takes its place
+            // Songs page animates first (tiles scatter upward), exactly as before
+            DrawEntering();
+
+            // With no selected song there is no tile to morph into the disc, so the player
+            // page would pop in when the transition ends. Fade it in late, after the tiles
+            // have mostly cleared, instead of replacing the grid animation.
+            if (g_enterIdx < 0) {
+                float p = (g_enterT - 0.30f) / 0.30f;
+                if (p <= 0.0f) { /* still flying out */ }
+                else {
+                    if (p > 1.0f) p = 1.0f;
+                    float pe = p * p * (3.0f - 2.0f * p);
+                    float sc = 0.94f + 0.06f * pe;
+                    rt->SetTransform(D2D1::Matrix3x2F::Scale(sc, sc, center));
+                    g_alpha = a.pageAnim * pe;
+                    DrawPlayerPage();
+                    g_alpha = a.pageAnim;
+                    rt->SetTransform(D2D1::Matrix3x2F::Identity());
+                }
+            }
         } else {
             rt->SetTransform(D2D1::Matrix3x2F::Scale(1.0f, 1.0f, center));
             DrawPlayerPage();
@@ -4241,6 +4450,16 @@ static void DrawUI(ID2D1RenderTarget* rt) {
         g_loginChoose = true;
     }
 
+    // Loading ring while the playlist data is still arriving (grid side, after the swap)
+    if (g_plPhase == 2) DrawPlLoader(W, H, 1.0f);
+    else if (g_plPhase == 3) DrawPlLoader(W, H, 1.0f - g_plT);
+
+    // Page curtain (title-bar navigation between the three pages)
+    if (g_curtainPhase != 0) {
+        float e = g_curtainT * g_curtainT * (3.0f - 2.0f * g_curtainT);
+        FillRect(Rc(0, 0, W, H), UI::BG, e);
+    }
+    
     // Title bar: always opaque, drawn every frame. No enter fade —
     // the old "hide for 1.4s" made buttons unclickable and the whole bar look translucent.
     DrawTitleBar(W);
@@ -4649,6 +4868,52 @@ static bool Animate() {
 
     DrainPlaylistSwap();
 
+    // Page curtain: cover the old page, swap, then reveal the new one
+    if (g_curtainPhase != 0) {
+        need = true;
+        if (g_curtainPhase == 1) {
+            g_curtainT += dt / 0.16f;                 // out: quick, so the click feels answered
+            if (g_curtainT >= 1.0f) {
+                g_curtainT = 1.0f;
+                if (g_curtainAction == 1) {
+                    GoPickerNow();
+                } else if (g_curtainAction == 2) {
+                    GoPlayerPageNow(g_playerFromPicker);
+                }
+                g_curtainPhase = 2;
+            }
+        } else {
+            g_curtainT -= dt / 0.30f;                 // in: slower, so the new page settles
+            if (g_curtainT <= 0.0f) {
+                g_curtainT = 0.0f;
+                g_curtainPhase = 0;
+                g_curtainAction = 0;
+            }
+        }
+    }
+    // Playlist -> song page transition
+    if (g_plPhase != 0) {
+        g_plSpin += dt * 260.0f;
+        need = true;
+        if (g_plPhase == 1) {                       // wipe out, bottom to top
+            g_plT += dt / 0.26f;
+            if (g_plT >= 1.0f) { g_plT = 0.0f; g_plPhase = 2; }
+        } else if (g_plPhase == 2) {                // loading ring
+            g_plT += dt;
+            if (g_swapDone && g_plT > 0.18f) { g_plT = 0.0f; g_plPhase = 3; }
+        } else if (g_plPhase == 3) {                // ring fades out while the tracks start flying in
+            g_plT += dt / 0.30f;
+            // Overlap: launch the fly-in halfway through the ring fade, so the two motions
+            // hand off to each other instead of leaving a beat of empty background
+            if (g_plT > 0.5f && g_gridEnter < 0.0f) g_gridEnter = 0.0f;
+            if (g_plT >= 1.0f) {
+                g_plT = 0.0f;
+                g_plPhase = 0;
+                if (g_gridEnter < 0.0f) g_gridEnter = 0.0f;
+            }
+        }
+    }
+
     // ── Playlist picker: merge background data, inertia, hover ──
     if (g_plReady.load()) {
         std::vector<Playlist> got;
@@ -4672,7 +4937,7 @@ static bool Animate() {
             }
         } else if (a.plSelT > 0.0f) {
             a.plSelT -= dt / 0.24f;
-            if (a.plSelT < 0.0f) a.plSelT = 0.0f;
+            if (a.plSelT < 0.0f) { a.plSelT = 0.0f; a.plSelLast = -1; }   // collapse finished
             need = true;
         }
 
@@ -4698,7 +4963,8 @@ static bool Animate() {
         if (a.plActive < 0) PlClampPan();          // No pan limits while selected; must be able to center
 
         int hov = -1;
-        if (!a.plDragging && !g_settingsOpen) {
+        // 卡片展开后其余圆已经淡出，不再参与悬停（否则边框还会跟着鼠标亮）
+        if (!a.plDragging && !g_settingsOpen && a.plActive < 0) {
             float best = PL_D * 0.5f;
             for (int i = 0; i < (int)a.playlists.size(); i++) {
                 float cx = 0, cy = 0;
@@ -4708,6 +4974,20 @@ static bool Animate() {
                 if (d2 <= best * best) { best = sqrtf(d2); hov = i; }
             }
             if (hov != a.plHover) { a.plHover = hov; need = true; }
+        }
+
+        // Per-circle hover progress: fast ease-out, so the disc reacts the moment the pointer lands
+        if ((int)a.plHoverT.size() != (int)a.playlists.size())
+            a.plHoverT.assign(a.playlists.size(), 0.0f);
+        {
+            float kHov = Ease(0.16f, dt);
+            for (int i = 0; i < (int)a.plHoverT.size(); i++) {
+                float target = (a.plHover == i && a.plActive < 0 && !a.plDragging) ? 1.0f : 0.0f;
+                float v = a.plHoverT[(size_t)i];
+                if (fabsf(v - target) < 0.004f) { a.plHoverT[(size_t)i] = target; continue; }
+                a.plHoverT[(size_t)i] = v + (target - v) * kHov;
+                need = true;
+            }
         }
     }
 
@@ -5255,7 +5535,7 @@ static Hit* Pick(POINT p) {
 }
 
 /** Top button: uses the same transition as picking a song, the only difference is playback isn't restarted */
-static void GoPlayerPage() {
+static void GoPlayerPageNow(bool fromPicker) {
     App& a = g_app;
     if (a.page == Page::Player) return;
 
@@ -5283,8 +5563,9 @@ static void GoPlayerPage() {
     g_switchT = 1.0f;                   // don't play the track-switch disc animation
     g_switchFrom = -1;
     g_discAngle = 0.0f;                 // spin starts from 0 degrees on entry so the hand-off doesn't jump
-    g_enterT = 0.0f;
-    g_enterOn = true;
+    g_enterT = fromPicker ? 1.0f : 0.0f;
+    g_enterOn = !fromPicker;            // no entry transition when coming from the picker
+    if (fromPicker) { g_plPhase = 0; g_plT = 0.0f; }   // drop any leftover loading overlay
     g_exitOn = false;
     g_exitT = 0.0f;
     g_settingsOpen = false;
@@ -5340,7 +5621,37 @@ static void GoPlayer(int idx) {
 }
 
 /* Back to the playlist selection page */
-static void GoPicker() {
+static void GoGrid();                       // defined below
+static void GoPickerNow();                  // immediate page switches, defined below
+static void GoPlayerPageNow(bool fromPicker);
+
+/* Ask for a page change: cover -> swap -> reveal. Any click while covering is ignored. */
+static void RequestPage(int action) {
+    if (g_curtainPhase != 0) return;
+    g_curtainAction = action;
+    g_curtainT = 0.0f;
+    g_curtainPhase = 1;
+}
+
+static void GoPicker() { RequestPage(1); }
+static void GoPlayerPage() {
+    if (g_app.page == Page::Player) return;
+    g_playerFromPicker = (g_app.page == Page::Playlists);
+
+    // From the song grid the entry is already a full transition (tiles fly into the disc),
+    // so adding the curtain on top would read as "fade out, then fly out" - two animations
+    // for one move. Go straight into the fly.
+    if (!g_playerFromPicker) { GoPlayerPageNow(false); return; }
+
+    RequestPage(2);
+}
+
+/* Leaving the player page returns to whichever page we entered it from */
+static void ExitPlayer() {
+    if (g_playerFromPicker) { RequestPage(1); return; }
+    GoGrid();
+}
+static void GoPickerNow() {
     if (g_app.page == Page::Playlists) return;
     g_app.page = Page::Playlists;
     g_app.pageAnim = 0.0f;
@@ -5348,11 +5659,18 @@ static void GoPicker() {
     g_app.plActive = -1;
     g_app.plDragging = false;
     g_app.plVelX = g_app.plVelY = 0.0f;
+    g_app.plPress = -1;
+    g_app.plSelLast = -1;
+    g_app.plSelT = 0.0f;
+    g_app.plTargetX = 0.0f;
+    g_app.plTargetY = 0.0f;
+    g_plPhase = 0;                      // cancel any half-finished picker -> song transition
+    g_plT = 0.0f;
     g_exitOn = false;
     g_enterOn = false;
     g_enterT = 1.0f;
     PlCenterContent();
-    g_plEnter = 0.0f;
+    g_plEnter = 1.0f;          // the curtain does the reveal, so no double fade
     g_mouseDirty = true;
 }
 
@@ -5395,6 +5713,7 @@ static void SeekToX(float x) {
 
 static void OnClick(POINT p) {
     App& a = g_app;
+    if (g_curtainPhase != 0) return;      // page is mid-swap: ignore clicks
 
     // Window buttons take priority
     if (p.y < UI::TITLE_H) {
@@ -5428,7 +5747,7 @@ static void OnClick(POINT p) {
 
     switch (h->kind) {
     case HK_TILE:  GoPlayer(h->index); break;
-    case HK_BACK:  GoGrid(); break;
+    case HK_BACK:  ExitPlayer(); break;
     case HK_PICKER:
     case HK_PL_PICK:
         GoPicker();
@@ -5686,6 +6005,40 @@ static void OnClick(POINT p) {
 /* ══════════════════════════════════════════
    Window
    ══════════════════════════════════════════ */
+/* ── DPI ─────────────────────────────────────────────
+   The whole UI is laid out in DIPs (96 = 1x). The render target is told the real
+   DPI, so Direct2D scales the drawing itself - every existing pixel constant keeps
+   working, and text is rasterised at the native resolution instead of being stretched. */
+static float g_dpiScale = 1.0f;     // physical pixels per DIP
+static UINT  g_dpi      = 96;
+
+typedef UINT (WINAPI* PFN_GetDpiForWindow)(HWND);
+
+static UINT WindowDpi(HWND hwnd) {
+    static PFN_GetDpiForWindow fn =
+        (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+    if (fn && hwnd) {
+        UINT d = fn(hwnd);
+        if (d >= 72) return d;
+    }
+    HDC dc = hwnd ? GetDC(hwnd) : nullptr;
+    UINT d = 96;
+    if (dc) { d = (UINT)GetDeviceCaps(dc, LOGPIXELSX); ReleaseDC(hwnd, dc); }
+    return d ? d : 96;
+}
+
+static void RefreshDpi(HWND hwnd) {
+    g_dpi = WindowDpi(hwnd);
+    g_dpiScale = (float)g_dpi / 96.0f;
+}
+
+/* Mouse messages arrive in physical pixels; the UI works in DIPs */
+static POINT DipPoint(LPARAM lp) {
+    POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    p.x = (LONG)lroundf((float)p.x / g_dpiScale);
+    p.y = (LONG)lroundf((float)p.y / g_dpiScale);
+    return p;
+}
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
     BeginPaint(hwnd, &ps);
@@ -5695,8 +6048,10 @@ static void Paint(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     UINT w = (UINT)(std::max)(1L, rc.right - rc.left);
     UINT h = (UINT)(std::max)(1L, rc.bottom - rc.top);
-    g_app.width = (float)w;
-    g_app.height = (float)h;
+
+    RefreshDpi(hwnd);
+    g_app.width  = (float)w / g_dpiScale;      // layout units: DIPs
+    g_app.height = (float)h / g_dpiScale;
 
     if (!g_hwndRt) {
         g_d2d->CreateHwndRenderTarget(
@@ -5707,6 +6062,7 @@ static void Paint(HWND hwnd) {
         D2D1_SIZE_U sz = g_hwndRt->GetPixelSize();
         if (sz.width != w || sz.height != h) g_hwndRt->Resize(D2D1::SizeU(w, h));
     }
+    if (g_hwndRt) g_hwndRt->SetDpi((float)g_dpi, (float)g_dpi);
 
     if (g_hwndRt) {
         g_alpha = 1.0f;
@@ -5751,8 +6107,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
             mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
         }
-        mmi->ptMinTrackSize.x = 720;
-        mmi->ptMinTrackSize.y = 520;
+        mmi->ptMinTrackSize.x = (LONG)lroundf(720.0f * g_dpiScale);
+        mmi->ptMinTrackSize.y = (LONG)lroundf(520.0f * g_dpiScale);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        // Moved to a monitor with a different scale: resize to the suggested rect and
+        // let the next paint pick up the new DPI for the render target
+        RefreshDpi(hwnd);
+        RECT* pr = (RECT*)lp;
+        if (pr) {
+            SetWindowPos(hwnd, nullptr, pr->left, pr->top,
+                         pr->right - pr->left, pr->bottom - pr->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        g_mouseDirty = true;
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
@@ -5761,6 +6132,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(hwnd, &p);
         RECT rc;
         GetClientRect(hwnd, &rc);
+        p.x = (LONG)lroundf((float)p.x / g_dpiScale);   // compare in DIPs below
+        p.y = (LONG)lroundf((float)p.y / g_dpiScale);
+        rc.right  = (LONG)lroundf((float)rc.right  / g_dpiScale);
+        rc.bottom = (LONG)lroundf((float)rc.bottom / g_dpiScale);
 
         if (!IsZoomed(hwnd)) {
             const int b = 6;
@@ -5805,8 +6180,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_MOUSEMOVE: {
-        if (g_app.page == Page::Playlists && g_app.plDragging && !g_settingsOpen) {
-            POINT mp = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (g_app.page == Page::Playlists && g_app.plDragging && !g_settingsOpen) {   // finish the drag even if a transition started
+            POINT mp = DipPoint(lp);
             float dx = (float)(mp.x - g_app.plDragStartMouse.x);
             float dy = (float)(mp.y - g_app.plDragStartMouse.y);
             if (fabsf(dx) > 5.0f || fabsf(dy) > 5.0f) g_app.plDragMoved = true;
@@ -5826,7 +6201,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 float thumbH = (std::max)(36.0f, trackH * trackH / (trackH + g_app.maxScroll));
                 float span = trackH - thumbH;
                 if (span > 1.0f) {
-                    POINT mp = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                    POINT mp = DipPoint(lp);
                     float t = (mp.y - GRID_TOP - thumbH * 0.5f) / span;
                     if (t < 0) t = 0; if (t > 1) t = 1;
                     g_app.scrollTarget = t * g_app.maxScroll;
@@ -5837,7 +6212,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        POINT mpd = DipPoint(lp);
+        int mx = mpd.x, my = mpd.y;
         if (g_volDrag) {                        // dragging the volume: follow it directly
             float tx = g_volTrack.left, tw = g_volTrack.right - g_volTrack.left;
             if (tw > 1.0f) {
@@ -5873,10 +6249,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_LBUTTONDOWN: {
-        POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        if (g_app.page == Page::Playlists && p.y > (LONG)UI::TITLE_H && !g_settingsOpen) {
+        POINT p = DipPoint(lp);
+        if (g_app.page == Page::Playlists && p.y > (LONG)UI::TITLE_H && !g_settingsOpen && g_plPhase == 0) {
             // Only drag below the top bar, and only while the settings panel is closed;
             // when the panel is open mouse events must reach OnClick, otherwise nothing in the panel can be clicked
+            // Press feedback: remember which disc is held so it can scale down until release
+            g_app.plPress = -1;
+            if (g_app.plActive < 0) {
+                float best = PL_D * 0.5f;
+                for (int i = 0; i < (int)g_app.playlists.size(); i++) {
+                    float cx = 0, cy = 0;
+                    PlScreenPos(i, cx, cy);
+                    float ddx = (float)p.x - cx, ddy = (float)p.y - cy;
+                    float d2 = ddx * ddx + ddy * ddy;
+                    if (d2 <= best * best) { best = sqrtf(d2); g_app.plPress = i; }
+                }
+            }
             g_app.plDragging = true;
             g_app.plDragMoved = false;
             g_app.plDragStartMouse = p;
@@ -5892,8 +6280,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_LBUTTONUP:
-        if (g_app.page == Page::Playlists && g_app.plDragging && !g_settingsOpen) {
+        if (g_app.page == Page::Playlists && g_app.plDragging && !g_settingsOpen) {   // finish the drag even if a transition started
             g_app.plDragging = false;
+            g_app.plPress = -1;
             ReleaseCapture();
             if (g_app.plDragMoved) {
                 g_app.plActive = -1;                // dragging cancels the selection
@@ -5912,16 +6301,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 // Expanded state: the whole card is clickable and any click enters the playlist; clicking outside collapses it
                 if (g_app.plActive >= 0) {
-                    POINT mp = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                    POINT mp = DipPoint(lp);
                     D2D1_RECT_F card = PlCardTargetRect();
                     bool inCard = (mp.x >= card.left - 6 && mp.x <= card.right + 6 &&
                                    mp.y >= card.top - 6 && mp.y <= card.bottom + 6);
                     if (inCard && g_app.plSelT > 0.9f) {
+                        // Start the transition: the page breaks apart, then the loading ring
+                        g_plPhase = 1;
+                        g_plEnterX = (float)g_app.mouse.x;
+                        g_plEnterY = (float)g_app.mouse.y;
+                        g_plT = 0.0f;
+                        g_swapDone = false;
                         SelectPlaylistAsync(g_app.plActive);
                     } else {
                         g_app.plActive = -1;
                         g_app.plTargetX = 0.0f;
                         g_app.plTargetY = 0.0f;
+                        g_app.plHover = -1;
                     }
                     g_mouseDirty = true;
                     return 0;
@@ -5929,11 +6325,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
                 if (hit >= 0) {
                     if (g_app.plActive == hit && g_app.plSelT > 0.9f) {
-                        SelectPlaylistAsync(hit);   // clicked again: enter the playlist
+                        g_plPhase = 1;              // clicked again: enter the playlist
+                        g_plEnterX = (float)g_app.mouse.x;
+                        g_plEnterY = (float)g_app.mouse.y;
+                        g_plT = 0.0f;
+                        g_swapDone = false;
+                        SelectPlaylistAsync(hit);
                     } else {
                         // First click: select it + move this card to the centre of the window
                         g_app.plActive = hit;
+                        g_app.plSelLast = hit;      // kept for the collapse animation
                         g_app.plSelT = 0.0f;
+                        g_app.plHover = -1;
                         if (g_plCellsFor != (int)g_app.playlists.size())
                             BuildPlCells((int)g_app.playlists.size());
                         // The card expands toward the window centre, the camera stays put
@@ -5975,7 +6378,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_togOpen) {
                 g_togOpen = false;
             } else if (g_app.page == Page::Player) {
-                GoGrid();
+                ExitPlayer();
             } else if (g_app.page == Page::Grid) {
                 GoPicker();
             }
@@ -6251,11 +6654,21 @@ static void OnTerminate() {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
+    // Belt and braces: the manifest already declares PerMonitorV2, but if it is ever
+    // stripped (some packers do), this keeps the window from being bitmap-stretched.
+    {
+        typedef BOOL (WINAPI* PFN_SetCtx)(HANDLE);
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        auto setCtx = u32 ? (PFN_SetCtx)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : nullptr;
+        if (setCtx) setCtx((HANDLE)-4);      // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    }
+
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetUnhandledExceptionFilter(CrashFilter);
     std::set_terminate(OnTerminate);
     timeBeginPeriod(1);              // raise timer resolution, reduce frame interval jitter
     LogInit();
+    AssetDir();                      // resolve/create the data directory before anything reads it
     ThemeLoad();
     Logf("APP", "==== Floral 启动 ====");
     {
@@ -6494,8 +6907,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     RegisterClassExW(&wc);
 
     const DWORD style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    // Size the window in physical pixels for the DPI we start on
+    HDC screenDc = GetDC(nullptr);
+    UINT startDpi = screenDc ? (UINT)GetDeviceCaps(screenDc, LOGPIXELSX) : 96;
+    if (screenDc) ReleaseDC(nullptr, screenDc);
+    if (startDpi < 72) startDpi = 96;
+    g_dpi = startDpi;
+    g_dpiScale = (float)g_dpi / 96.0f;
+    const int startW = (int)lroundf(960.0f * g_dpiScale);
+    const int startH = (int)lroundf(640.0f * g_dpiScale);
+
     HWND hwnd = CreateWindowExW(0, L"SongListWnd", L"Floral", style,
-        CW_USEDEFAULT, CW_USEDEFAULT, 960, 640, nullptr, nullptr, hInst, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, startW, startH, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
 
     int cornerPref = 2;
