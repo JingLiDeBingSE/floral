@@ -111,6 +111,11 @@ CMake 选项：`-DFLORAL_PORTABLE=ON`（静态运行库）、`-DFLORAL_NO_TOGETH
 
 ---
 
+## 协作开发
+
+想和别人一起改，看 [CONTRIBUTING.md](CONTRIBUTING.md)：分支模型、哪些文件不能提交、
+两边分工怎么切、分支保护怎么设。CI 会在每个 PR 上用 MSVC 编一遍。
+
 ## 说明
 
 非官方客户端，仅用于学习和个人使用；音乐版权归各平台与版权方所有。
