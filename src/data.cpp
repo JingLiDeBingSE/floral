@@ -14,7 +14,12 @@
 
 /** Look for a file in the working directory or next to the exe; returns the path found (empty if not found) */
 static std::wstring FindAsset(const std::wstring& name) {
-    // 1) current working directory
+    // 1) data directory (Documents\Floral), where everything is written now
+    if (!g_dataDir.empty()) {
+        std::wstring p = g_dataDir + L"\\" + name;
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    }
+    // 2) current working directory
     if (GetFileAttributesW(name.c_str()) != INVALID_FILE_ATTRIBUTES) return name;
 
     // 2) exe directory and its parent (build\songlist.exe -> project root)
