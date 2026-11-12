@@ -14,10 +14,10 @@
 #pragma comment(lib, "wininet.lib")
 
 /*
- * 一起听（中继版）
+ * Listen Together (relay build)
  *
- * 真正的 MQTT 由本地的 together-server.js 负责（Node，exe 里内嵌）。
- * 这里只跟 127.0.0.1:4100 说 HTTP，避免在 Win32 里手写 TLS/MQTT。
+ * Real MQTT is handled by the local together-server.js (Node, embedded in the exe).
+ * Here we only speak HTTP to 127.0.0.1:4100, avoiding hand-rolled TLS/MQTT on Win32.
  */
 
 namespace {
@@ -33,7 +33,7 @@ std::thread         g_pollThread;
 std::atomic<bool>   g_run{ false };
 std::deque<TogetherEvent> g_evq;
 
-/* 上一次看到的对端状态，用来判断有没有变化 */
+/* Peer state last seen, used to detect changes */
 std::string g_lastPeerSig;
 
 std::string HttpGet(const std::wstring& url, int timeoutMs = 8000) {
@@ -56,7 +56,7 @@ std::string HttpGet(const std::wstring& url, int timeoutMs = 8000) {
     return out;
 }
 
-/* 极简 JSON 取值（只认字符串/数字，够用） */
+/* Minimal JSON lookup (strings/numbers only, good enough here) */
 std::string Val(const std::string& j, const char* key) {
     std::string k = std::string("\"") + key + "\":";
     size_t p = j.find(k);
@@ -104,7 +104,7 @@ std::string JsonEsc(const std::string& s) {
     return o;
 }
 
-/* 轮询对端状态 */
+/* Poll peer state */
 void PollLoop() {
     while (g_run) {
         std::string r = HttpGet(L"http://127.0.0.1:4100/state", 4000);
@@ -117,7 +117,7 @@ void PollLoop() {
             }
             std::string peer = Val(r, "peer");
             if (!peer.empty()) {
-                // data 子对象：取我们关心的字段
+                // data sub-object: grab the fields we care about
                 std::string sig = r;
                 {
                     std::lock_guard<std::mutex> lk(g_mx);
@@ -152,7 +152,7 @@ void PollLoop() {
 
 }  // namespace
 
-/* 在场心跳：只带昵称，不带播放进度。让对面能认出"谁在房间里" */
+/* Presence heartbeat: nick only, no playback progress, so the peer can tell who is in the room */
 void TogetherSayHello() {
     if (!TogetherActive()) return;
     char buf[256];
@@ -161,7 +161,7 @@ void TogetherSayHello() {
     HttpGet(L"http://127.0.0.1:4100/push?data=" + Widen(enc), 3000);
 }
 
-/* 默认昵称：计算机名，短一点；取不到就用角色名 */
+/* Default nick: computer name, shortened; fall back to role name if unavailable */
 std::string TogetherDefaultNick(bool host) {
     char name[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
     DWORD n = sizeof(name);
@@ -221,7 +221,7 @@ void TogetherStop() {
     g_run = false;
     if (g_pollThread.joinable()) {
         if (g_pollThread.get_id() == std::this_thread::get_id()) {
-            g_pollThread.detach();          // 自己线程里不能 join 自己
+            g_pollThread.detach();          // cannot join yourself from your own thread
         } else {
             g_pollThread.join();
         }
@@ -250,7 +250,7 @@ std::string TogetherMyCode() {
     return g_myCode;
 }
 
-/* UTC 纪元毫秒（跨机器可比；GetTickCount64 只有本机意义） */
+/* UTC epoch milliseconds (comparable across machines; GetTickCount64 is machine-local) */
 unsigned long long TogetherNowMs() {
     FILETIME ft{};
     GetSystemTimeAsFileTime(&ft);
@@ -269,7 +269,7 @@ void TogetherPushState(const std::string& song, const std::string& src,
              JsonEsc(g_nick).c_str(), JsonEsc(song).c_str(), JsonEsc(src).c_str(),
              JsonEsc(title).c_str(), JsonEsc(artist).c_str(),
              posMs, playing ? 1 : 0, TogetherNowMs());
-    std::string enc = UrlEnc(buf);                 // 必须先落地：两个临时对象取 begin/end 是 UB
+    std::string enc = UrlEnc(buf);                 // must materialize first: begin/end of two temporaries is UB
     std::wstring url = L"http://127.0.0.1:4100/push?data=" + Widen(enc);
     HttpGet(url, 3000);
 }

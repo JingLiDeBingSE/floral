@@ -15,11 +15,11 @@
 #include <set>
 
 /*
- * 把原来靠 node 脚本做的两件事搬到 C++：
- *   1) 扫码登录（拿 token / userid）
- *   2) 拉「我喜欢」歌单，写成 kugou-likes.tsv
+ * Ported two jobs from the old Node scripts to C++:
+ *   1) QR-code login (obtain token / userid)
+ *   2) Fetch the "Likes" playlist and write kugou-likes.tsv
  *
- * 只依赖本机的 kugou-api 服务（127.0.0.1:3000），接口细节见 kugou-login.js / kugou-fetch.js。
+ * Depends only on the local kugou-api service (127.0.0.1:3000); see kugou-login.js / kugou-fetch.js for API details.
  */
 
 /* ══════════════ HTTP ══════════════ */
@@ -64,7 +64,7 @@ static std::string UriEnc(const std::string& s) {
     return o;
 }
 
-/* ══════════════ 极简 JSON ══════════════ */
+/* ══════════════ Minimal JSON ══════════════ */
 struct JVal {
     enum T { NUL, NUM, STR, BOOL, ARR, OBJ } t = NUL;
     bool        b = false;
@@ -86,7 +86,7 @@ struct JVal {
     std::string str() const { return t == STR ? s : ""; }
     long long ll() const {
         if (t == NUM) return (long long)num;
-        if (t == STR) return atoll(s.c_str());      // 接口有时给字符串
+        if (t == STR) return atoll(s.c_str());      // API may return a string
         return 0;
     }
 };
@@ -130,7 +130,7 @@ static bool ParseStr(const std::string& s, size_t& p, std::string& out) {
         }
     }
     if (p >= s.size()) return false;
-    ++p;                                   // 跳过收尾引号
+    ++p;                                   // skip closing quote
     return true;
 }
 
@@ -203,7 +203,7 @@ static bool SaveBase64Png(const std::string& b64, const std::wstring& path) {
     for (unsigned char c : b64) {
         if (c == '=') break;
         int v = map[c];
-        if (v < 0) continue;                 // 跳过换行等
+        if (v < 0) continue;                 // skip newlines etc.
         buf = (buf << 6) | v;
         bits += 6;
         if (bits >= 8) {
@@ -221,7 +221,7 @@ static bool SaveBase64Png(const std::string& b64, const std::wstring& path) {
     return true;
 }
 
-/* ══════════════ 登录 ══════════════ */
+/* ══════════════ Login ══════════════ */
 static std::string g_qrKey;
 
 bool KgLoginStart(const std::wstring& qrPath, std::wstring& err) {
@@ -250,7 +250,7 @@ bool KgLoginStart(const std::wstring& qrPath, std::wstring& err) {
 
     std::string s = b64->str();
     size_t comma = s.find(',');
-    if (comma != std::string::npos) s = s.substr(comma + 1);   // 去掉 data:image/png;base64,
+    if (comma != std::string::npos) s = s.substr(comma + 1);   // strip data:image/png;base64,
     if (!SaveBase64Png(s, qrPath)) { err = L"二维码图片写入失败"; return false; }
     return true;
 }
@@ -261,9 +261,9 @@ int KgLoginPoll(std::string& token, std::string& userid, std::wstring& err) {
     JVal r;
     std::string raw = Http(Wide("http://127.0.0.1:3000/login/qr/check?key=" + UriEnc(g_qrKey) +
                                 "&timestamp=" + std::to_string(GetTickCount64())));
-    if (raw.empty() || !Json(raw, r)) return 0;    // 临时失败继续等
+    if (raw.empty() || !Json(raw, r)) return 0;    // transient failure: keep waiting
 
-    // 酷狗的 status 在 data 里（顶层没有）；参考 kugou-login.js：r.json.data.status
+    // Kugou nests status under data (not top-level); per kugou-login.js: r.json.data.status
     const JVal* d = r.get("data");
     const JVal* st = d ? d->get("status") : nullptr;
     if (!st) st = r.get("status");
@@ -273,7 +273,7 @@ int KgLoginPoll(std::string& token, std::string& userid, std::wstring& err) {
     if (status == 2) return 1;
     if (status != 4) return 0;
 
-    // status == 4：登录成功，cookie 里带 token / userid
+    // status == 4: login succeeded, cookie carries token / userid
     std::string cookie;
     const JVal* ck = r.get("cookie");
     if (!ck) { const JVal* dd = r.get("data"); if (dd) ck = dd->get("cookie"); }
@@ -304,7 +304,7 @@ int KgLoginPoll(std::string& token, std::string& userid, std::wstring& err) {
 
     token  = field("token");
     userid = field("userid");
-    if (token.empty() || userid.empty()) {       // 有些返回直接把字段放在 data 里
+    if (token.empty() || userid.empty()) {       // some responses put the fields directly in data
         const JVal* dd = r.get("data");
         if (dd) {
             const JVal* t = dd->get("token");
@@ -317,7 +317,7 @@ int KgLoginPoll(std::string& token, std::string& userid, std::wstring& err) {
     return 2;
 }
 
-/* ══════════════ 导出歌单 ══════════════ */
+/* ══════════════ Playlist export ══════════════ */
 static std::string Clean(const std::string& s) {
     std::string o;
     for (char c : s) o += (c == '\t' || c == '\r' || c == '\n') ? ' ' : c;
@@ -326,11 +326,11 @@ static std::string Clean(const std::string& s) {
     return (a == std::string::npos) ? "" : o.substr(a, b - a + 1);
 }
 
-/* 前置声明：按歌单 id 拉曲目（定义在下面） */
+/* Forward declaration: fetch tracks by playlist id (defined below) */
 static int KgExportTracksByGcid(const std::string& token, const std::string& userid,
                                 const std::string& gcid,
                                 const std::wstring& outTsv, std::wstring& err);
-/* 账号下的全部歌单 */
+/* All playlists under the account */
 int KgFetchPlaylists(const std::string& token, const std::string& userid,
                      std::vector<KgPlaylist>& out, std::wstring& err) {
     out.clear();
@@ -342,7 +342,7 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
         return Http(Wide("http://127.0.0.1:3000" + path + auth));
     };
 
-    // 最多 3 页（100/页），够用
+    // At most 3 pages (100 per page) is enough
     for (int page = 1; page <= 3; page++) {
         JVal r;
         if (!Json(api("/user/playlist?pagesize=100&page=" + std::to_string(page)), r)) {
@@ -375,8 +375,8 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
             if (pic) kp.coverUrl = pic->str();
             const JVal* def = p->get("is_def");
             kp.isDefault = (def && def->ll() == 2);
-            // 只要自己建的歌单：list_create_userid == 自己
-            // （type=0 是自建，type=1 是收藏别人的歌单/专辑，source=2 是专辑）
+            // Only playlists created by this user: list_create_userid == self
+            // (type=0: own, type=1: saved from others, source=2: album)
             const JVal* cu = p->get("list_create_userid");
             long long createUid = cu ? cu->ll() : 0;
             if (createUid != 0 && std::to_string(createUid) != userid) continue;
@@ -390,13 +390,13 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
     return (int)out.size();
 }
 
-/* 指定歌单的曲目 */
+/* Tracks of the specified playlist */
 int KgExportPlaylist(const std::string& token, const std::string& userid,
                      const std::string& gcid, const std::wstring& outTsv, std::wstring& err) {
     if (gcid.empty()) { err = L"歌单 id 为空"; return -1; }
     return KgExportTracksByGcid(token, userid, gcid, outTsv, err);
 }
-/* 按歌单 id 拉全部曲目并写 tsv（我喜欢 / 任意歌单 共用） */
+/* Fetch all tracks by playlist id and write the TSV (shared by Likes / any playlist) */
 static int KgExportTracksByGcid(const std::string& token, const std::string& userid,
                                 const std::string& gcid,
                                 const std::wstring& outTsv, std::wstring& err) {
@@ -407,19 +407,19 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
     auto api = [&](const std::string& path) {
         return Http(Wide("http://127.0.0.1:3000" + path + auth));
     };
-    (void)api;    // 2) 拉曲目并直接拼 TSV —— 不保存 JVal 指针，避免 vector 重分配后悬空
+    (void)api;    // 2) fetch tracks and build the TSV directly — no JVal pointers kept, so no dangling after vector realloc
     std::string out = "title\tartist\talbum\tseconds\tcover\thash\tmixsongid\talbum_id\tcoverUrl\n";
     int n = 0;
 
     auto appendTo = [&](const JVal* t, std::string& dst, int& cnt) {
         if (!t || t->t != JVal::OBJ) return;
 
-        // name 形如「歌手A、歌手B - 真正的歌名」，remark 是中文别名，别拿它当标题
+        // name looks like "artistA, artistB - actual title"; remark is a Chinese alias, don't use it as the title
         const JVal* name2 = t->get("name");
         std::string raw = name2 ? name2->str() : "";
         size_t dash = raw.find(" - ");
         std::string title = (dash == std::string::npos) ? raw : raw.substr(dash + 3);
-        if (title.empty()) {                      // 没 name 才退回 remark
+        if (title.empty()) {                      // fall back to remark only when name is missing
             const JVal* remark = t->get("remark");
             if (remark) title = remark->str();
         }
@@ -472,9 +472,9 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
         n++;
     };
 
-    // 串行翻页：接口本身是串行处理的，并发不会更快，反而容易丢页
-    // 每页最多重试 3 次；只要有一页最终失败就整体报错，不写出半截歌单
-    std::set<std::string> seen;          // 按 hash 去重（接口分页偶尔重叠）
+    // Sequential paging: the API is serial anyway; concurrency is not faster and tends to drop pages
+    // Up to 3 retries per page; if any page ultimately fails, fail the whole export and don't write a partial playlist
+    std::set<std::string> seen;          // dedupe by hash (pages occasionally overlap)
     bool failed = false;
     for (int page = 1; page <= 30 && !failed; page++) {
         const JVal* arr = nullptr;
@@ -498,7 +498,7 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
             int c = 0;
             appendTo(arr->at(i), buf, c);
             if (buf.empty()) continue;
-            // 第 6 列是 hash，用它去重
+            // column 6 is hash; use it to dedupe
             int col = 0;
             size_t a = 0, b = 0;
             for (; b < buf.size(); b++) {
@@ -511,7 +511,7 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
             out += buf;
             n++;
         }
-        if (total < 300) break;              // 到底了
+        if (total < 300) break;              // last page
     }
     if (failed) { err = L"拉歌单失败（分页请求出错，已保留旧歌单）"; return -1; }    if (n == 0) { err = L"歌单里没有歌曲"; return -1; }
 
@@ -534,7 +534,7 @@ int KgExportLikes(const std::string& token, const std::string& userid,
         return Http(Wide("http://127.0.0.1:3000" + path + auth));
     };
 
-    // 1) 歌单列表，找「我喜欢」
+    // 1) playlist list, locate "Likes"
     JVal pl;
     if (!Json(api("/user/playlist?pagesize=100&page=1"), pl)) { err = L"拉歌单列表超时"; return -1; }
     const JVal* pd = pl.get("data");
@@ -542,7 +542,7 @@ int KgExportLikes(const std::string& token, const std::string& userid,
     if (!list) { err = L"歌单列表为空（登录可能失效）"; return -1; }
 
     std::string gcid, name;
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 1) 名字精确匹配
+    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 1) exact name match
         const JVal* p = list->at(i);
         const JVal* nm = p ? p->get("listname") : nullptr;
         const JVal* g = p ? p->get("global_collection_id") : nullptr;
@@ -554,7 +554,7 @@ int KgExportLikes(const std::string& token, const std::string& userid,
         const JVal* g = p ? p->get("global_collection_id") : nullptr;
         if (def && def->ll() == 2 && g && !g->str().empty()) { gcid = g->str(); }
     }
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 3) 名字含「我喜欢」
+    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 3) name contains "Likes"
         const JVal* p = list->at(i);
         const JVal* nm = p ? p->get("listname") : nullptr;
         const JVal* g = p ? p->get("global_collection_id") : nullptr;
@@ -562,24 +562,24 @@ int KgExportLikes(const std::string& token, const std::string& userid,
             name = nm->str(); gcid = g->str();
         }
     }
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 4) 兜底：第一个
+    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 4) fallback: first playlist
         const JVal* p = list->at(i);
         const JVal* g = p ? p->get("global_collection_id") : nullptr;
         if (g && !g->str().empty()) gcid = g->str();
     }
     if (gcid.empty()) { err = L"没找到可用的歌单"; return -1; }
 
-    // 交给公共函数按 gcid 拉曲目
+    // hand off to the shared helper to fetch tracks by gcid
     return KgExportTracksByGcid(token, userid, gcid, outTsv, err);
 }
 
 
-/* ══════════════ 网易云（端口 4000） ══════════════ */
+/* ══════════════ NetEase Cloud Music (port 4000) ══════════════ */
 
-/* 网易云有风控：请求太密会连续 502 / -460。参考项目用 withOnlineRequestLimit 节流，这里同样做 */
+/* NetEase has rate limiting: dense requests yield repeated 502 / -460. The reference project throttles via withOnlineRequestLimit; same here */
 static std::mutex   g_ngMx;
 static ULONGLONG    g_ngLast = 0;
-static int          g_ngGap  = 350;      // 毫秒，失败后自动加长
+static int          g_ngGap  = 350;      // milliseconds; grows automatically after failures
 
 static std::string NgHttp(const std::wstring& url) {
     std::lock_guard<std::mutex> lk(g_ngMx);
@@ -590,9 +590,9 @@ static std::string NgHttp(const std::wstring& url) {
     g_ngLast = GetTickCount64();
     std::string r = Http(url);
     if (r.empty() || r.find("\"code\":-460") != std::string::npos) {
-        g_ngGap = (g_ngGap < 2000) ? g_ngGap + 250 : 2000;   // 被风控就慢下来
+        g_ngGap = (g_ngGap < 2000) ? g_ngGap + 250 : 2000;   // back off when rate-limited
     } else {
-        g_ngGap = (g_ngGap > 350) ? g_ngGap - 50 : 350;      // 正常就慢慢恢复
+        g_ngGap = (g_ngGap > 350) ? g_ngGap - 50 : 350;      // recover gradually when healthy
     }
     return r;
 }
@@ -604,7 +604,7 @@ static std::string g_ngKey;
 
 bool NgLoginStart(const std::wstring& qrPath, std::wstring& err) {
     g_ngKey.clear();
-    // 这个接口偶尔 502，重试几次
+    // this endpoint occasionally returns 502; retry a few times
     for (int i = 0; i < 4 && g_ngKey.empty(); i++) {
         JVal k;
         if (!Json(NgHttp(Wide("http://127.0.0.1:4000/login/qr/key?timestamp=" +
@@ -639,18 +639,18 @@ bool NgLoginStart(const std::wstring& qrPath, std::wstring& err) {
 int NgLoginPoll(std::string& cookie, std::wstring& err) {
     if (g_ngKey.empty()) { err = L"没有二维码 key"; return 4; }
     JVal r;
-    // 网易云这个接口会间歇性 502/断连：一次失败不能终止轮询，继续等下一次
+    // This NetEase endpoint intermittently returns 502 or drops the connection: one failure must not end polling; keep waiting for the next round
     std::string raw = NgHttp(Wide("http://127.0.0.1:4000/login/qr/check?key=" + UriEnc(g_ngKey) +
                                   "&timestamp=" + std::to_string(GetTickCount64())));
     if (raw.empty() || !Json(raw, r)) return 0;
     const JVal* c = r.get("code");
     int code = c ? (int)c->ll() : -1;
     if (code == 800) { err = L"二维码过期了，重新点一次「重新登录」"; return 3; }
-    if (code == 801 || code == -1) return 0;     // 等扫码
-    if (code == 802) return 1;                   // 已扫待确认
+    if (code == 801 || code == -1) return 0;     // waiting for scan
+    if (code == 802) return 1;                   // scanned, awaiting confirmation
     if (code != 803) return 0;
 
-    // 803：登录成功，cookie 在顶层
+    // 803: login succeeded, cookie is at the top level
     const JVal* ck = r.get("cookie");
     std::string ck2;
     if (ck && ck->t == JVal::STR) ck2 = ck->str();
@@ -659,8 +659,8 @@ int NgLoginPoll(std::string& cookie, std::wstring& err) {
     return 2;
 }
 
-/* 参考 folia-major：公开接口用一个匿名 cookie（/register/anonimous），
-   登录 cookie 单独存。没有匿名 cookie 时网易云偶尔会 502 */
+/* Following folia-major: public APIs use an anonymous cookie (/register/anonimous);
+   the login cookie is stored separately. Without an anonymous cookie NetEase occasionally returns 502 */
 static std::string g_anonCookie;
 
 static std::string GetAnonCookie() {
@@ -677,7 +677,7 @@ static std::string GetAnonCookie() {
 
 std::wstring NgResolveUrl(const std::string& songId, const char* level, std::wstring& err, int* gotLevel) {
     if (songId.empty()) { err = L"没有歌曲 id"; return L""; }
-    // 不是每首歌都有无损/高品：从请求档位逐级往下退
+    // Not every track has lossless/high quality: step down the requested levels
     const char* chain[3] = { "standard", "exhigh", "lossless" };
     int want = 1;
     if (level && !strcmp(level, "standard")) want = 0;
@@ -702,8 +702,8 @@ std::wstring NgResolveUrl(const std::string& songId, const char* level, std::wst
     return L"";
 }
 
-/* 网易云 cookie 很长（2~3KB），整条塞进 URL 会超过 WinInet 的 2083 字符限制，
-   只留 MUSIC_U 和 __csrf 两个鉴权字段 */
+/* NetEase cookies are long (2~3KB); passing the whole thing in a URL exceeds WinInet's 2083-character limit,
+   so keep only the two auth fields MUSIC_U and __csrf */
 std::string NgTrimCookie(const std::string& full) {
     auto pick = [&](const char* k) -> std::string {
         std::string key = std::string(k) + "=";
@@ -720,10 +720,10 @@ std::string NgTrimCookie(const std::string& full) {
 
 int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::wstring& err) {
     std::string enc = cookie.empty() ? "" : UriEnc(NgTrimCookie(cookie));
-    std::string ck  = enc.empty() ? "" : ("&cookie=" + enc);   // 接在已有 ? 后面
-    std::string ckQ = enc.empty() ? "" : ("?cookie=" + enc);   // 第一个参数
+    std::string ck  = enc.empty() ? "" : ("&cookie=" + enc);   // append after an existing ?
+    std::string ckQ = enc.empty() ? "" : ("?cookie=" + enc);   // first query parameter
 
-    // 1) 当前账号 uid
+    // 1) current account uid
     std::string accRaw = NgHttp(L"http://127.0.0.1:4000/user/account" + Wide(ckQ));
     if (accRaw.empty()) { err = L"接口服务未启动（netease-api）"; return -1; }
     JVal acc;
@@ -735,7 +735,7 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
     const JVal* uid = ad ? ad->get("id") : nullptr;
     if (!uid || uid->ll() == 0) { err = L"还没登录网易云"; return -1; }
 
-    // 2) 找「我喜欢的音乐」
+    // 2) find "Liked Music"
     JVal pl;
     if (!Json(NgHttp(L"http://127.0.0.1:4000/user/playlist?uid=" +
                    Wide(std::to_string(uid->ll())) + Wide(ck)), pl)) {
@@ -750,16 +750,16 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
         const JVal* p = arr->at(i);
         const JVal* sp = p ? p->get("specialType") : nullptr;
         const JVal* id = p ? p->get("id") : nullptr;
-        if (sp && sp->ll() == 5 && id) pid = id->ll();      // 5 = 我喜欢的音乐
+        if (sp && sp->ll() == 5 && id) pid = id->ll();      // 5 = liked music
     }
     if (!pid) { const JVal* id = arr->at(0)->get("id"); if (id) pid = id->ll(); }
     if (!pid) { err = L"没找到喜欢的歌单"; return -1; }
 
-    // 3) 拉曲目，边拉边拼 tsv
+    // 3) fetch tracks, building the TSV as we go
     std::string out = "title\tartist\talbum\tseconds\tcover\thash\tmixsongid\talbum_id\tcoverUrl\n";
     int n = 0;
     for (int off = 0; off < 5000; off += 100) {
-        // 网易云接口会间歇性 502，每页重试几次再放弃
+        // NetEase intermittently returns 502; retry each page a few times before giving up
         JVal r;
         const JVal* songs = nullptr;
         std::string u = "http://127.0.0.1:4000/playlist/track/all?id=" + std::to_string(pid) +
@@ -773,7 +773,7 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
             Sleep(400 + attempt * 350);
         }
         if (!songs || songs->count() == 0) {
-            if (n > 0) continue;               // 跳过这页，别整单放弃
+            if (n > 0) continue;               // skip this page instead of dropping the whole playlist
             err = L"歌单接口一直返回 502，稍后重试";
             return -1;
         }
@@ -821,7 +821,7 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
     fclose(f);
     return n;
 }
-/* ══════════════ QQ 音乐（端口 3200） ══════════════ */
+/* ══════════════ QQ Music (port 3200) ══════════════ */
 
 static std::string g_qqKey;
 static std::mutex  g_qqMx;
@@ -839,7 +839,7 @@ static std::string QqHttp(const std::wstring& url) {
     return r;
 }
 
-/* 会话：登录后 API 用 qqmusic_session=<token> 认人，整条 cookie 太长，只取这个 */
+/* Session: after login the API identifies callers via qqmusic_session=<token>; the full cookie is too long, so extract only this */
 static std::string QqSessionParam(const std::string& cookie) {
     if (cookie.empty()) return "";
     size_t p = cookie.find("qqmusic_session=");
@@ -882,13 +882,13 @@ int QqLoginPoll(std::string& cookie, std::wstring& err) {
     if (g_qqKey.empty()) { err = L"没有二维码 key"; return 4; }
     JVal r;
     std::string raw = QqHttp(L"http://127.0.0.1:3200/login/qr/check?key=" + Wide(UriEnc(g_qqKey)));
-    if (raw.empty() || !Json(raw, r)) return 0;          // 抖动就继续等
+    if (raw.empty() || !Json(raw, r)) return 0;          // keep waiting on transient glitches
 
     const JVal* c = r.get("code");
     int code = c ? (int)c->ll() : -1;
     if (code == 800) { err = L"二维码过期了，重新点一次「重新登录」"; return 3; }
     if (code == 801 || code == -1) return 0;
-    if (code == 802) return 1;                            // 已扫码
+    if (code == 802) return 1;                            // scanned
     if (code != 803) return 0;
 
     const JVal* ck = r.get("cookie");
@@ -903,10 +903,10 @@ std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie,
                           int level, std::wstring& err, int* gotLevel) {
     if (mid.empty()) { err = L"没有歌曲 mid"; return L""; }
 
-    std::string tail = QqSessionParam(cookie);          // "" 或 "&cookie=xxx"
+    std::string tail = QqSessionParam(cookie);          // "" or "&cookie=xxx"
     if (!tail.empty() && tail[0] == '&') tail = tail.substr(1);
 
-    // 未登录只有 M500（约 128k）；登录后才可能拿到更高档位
+    // Not logged in: M500 only (~128k); higher tiers may be available after login
     const char* lv[3] = { "", "level=exhigh", "level=lossless" };
     int want = level < 0 ? 0 : (level > 2 ? 2 : level);
 
@@ -998,7 +998,7 @@ int QqExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
     fclose(f);
     return n;
 }
-/* ══════════════ 跨平台匹配：按歌名+歌手在本地平台搜同类曲目 ══════════════ */
+/* ══════════════ Cross-platform matching: search the local platform for similar tracks by title + artist ══════════════ */
 
 static std::string Lower(const std::string& s) {
     std::string o;
@@ -1006,7 +1006,7 @@ static std::string Lower(const std::string& s) {
     return o;
 }
 
-/* 去掉常见后缀：(Live) (Remaster) (Explicit) 之类 */
+/* Strip common suffixes: (Live) (Remaster) (Explicit) etc. */
 static std::string NormTitle(const std::string& s) {
     std::string o;
     int depth = 0;
@@ -1036,7 +1036,7 @@ static int Score(const std::string& t1, const std::string& a1,
     return sc;
 }
 
-/* 在 source 平台搜；命中返回 true 并填 hash */
+/* Search on the source platform; returns true on a hit and fills hash */
 bool MatchOnPlatform(int source, const std::string& title, const std::string& artist,
                      int wantDur, std::string& hashOut, long long& mixIdOut, long long& albumIdOut,
                      std::wstring& err) {

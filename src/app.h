@@ -9,70 +9,70 @@
 #include <string>
 #include <vector>
 
-/* ───────── 数据 ───────── */
+/* ───────── Data ───────── */
 struct Song {
     std::wstring title;
     std::wstring artist;
     std::wstring album;
     int durationSec = 0;
-    std::wstring cover;     // 封面本地路径，可为空
-    std::string  coverUrl;  // 封面网络地址（本地没有时按需下载）
-    std::string  hash;      // 酷狗 hash
-    long long    mixId = 0; // mixsongid，取播放地址时要当 album_audio_id
+    std::wstring cover;     // Local cover path; may be empty
+    std::string  coverUrl;  // Cover URL; downloaded on demand when not local
+    std::string  hash;      // Kugou hash
+    long long    mixId = 0; // mixsongid; use as album_audio_id when resolving stream URL
     long long    albumId = 0;
 };
 
-/* ───────── 歌单 ───────── */
+/* ───────── Playlists ───────── */
 struct Playlist {
     std::wstring name;
-    std::string  gcid;        // 酷狗 global_collection_id
+    std::string  gcid;        // Kugou global_collection_id
     int          count = 0;
     std::string  coverUrl;
     bool         isDefault = false;
 };
 
-/* ───────── 页面 ───────── */
+/* ───────── Pages ───────── */
 enum class Page { Playlists, Grid, Player };
 
-/* ───────── 命中区 ───────── */
+/* ───────── Hit regions ───────── */
 enum HitKind {
     HK_NONE = 0,
     HK_MIN, HK_MAX, HK_CLOSE,
-    HK_TILE,        // 封面格子
-    HK_BACK,        // 播放页返回
-    HK_PLAY,        // 播放/暂停
-    HK_PREV,        // 上一首
-    HK_NEXT,        // 下一首
-    HK_PROGRESS,    // 进度条
-    HK_SETTINGS,    // 打开设置
-    HK_SET_CLOSE,   // 关设置
-    HK_SET_BG,      // 设置面板外的遮罩（点了也关）
-    HK_SET_CARD,    // 设置卡片本身（吞掉点击，别穿透到后面的歌）
-    HK_SET_CLEAR,   // 清空缓存
-    HK_SET_THEME,   // 切换主题
-    HK_SET_LOGIN,   // 重新登录（先弹平台选择）
-    HK_SET_LANG_ZH, // 设置：界面语言切到中文
-    HK_SET_LANG_EN, // 设置：界面语言切到英文
-    HK_LOGIN_PICK,  // 选了哪个平台
-    HK_LOGIN_TIP,   // 标题栏的登录状态提示
-    HK_PLAYER,      // 进入播放页
-    HK_VOL,         // 音量按钮
-    HK_VOL_TRACK,   // 音量滑杆
-    HK_SRC,         // 音源切换（酷狗/网易云）
-    HK_TOG,         // 一起听按钮
-    HK_TOG_HOST,    // 开房
-    HK_TOG_COPY,    // 复制连接码
-    HK_TOG_INPUT,   // 连接码输入框
-    HK_TOG_JOIN,    // 加入
-    HK_TOG_LEAVE,   // 退出一起听
-    HK_TOG_SWAP,    // 换个本机地址（已弃用，保留占位）
-    HK_TOG_CARD,    // 卡片空白处：吞掉点击，不要关面板
-    HK_SCROLL,      // 选歌界面的滚动条
-    HK_PL,          // 歌单选择页的圆
-    HK_PL_PICK,     // 标题栏「歌曲」：回歌单页
-    HK_PICKER,      // 标题栏按钮：回歌单选择页
-    HK_QUAL,        // 音质按钮
-    HK_QUAL_ITEM    // 音质选项
+    HK_TILE,        // Cover tile
+    HK_BACK,        // Player page back
+    HK_PLAY,        // Play/pause
+    HK_PREV,        // Previous track
+    HK_NEXT,        // Next track
+    HK_PROGRESS,    // Progress bar
+    HK_SETTINGS,    // Open settings
+    HK_SET_CLOSE,   // Close settings
+    HK_SET_BG,      // Backdrop outside settings panel (click closes)
+    HK_SET_CARD,    // Settings card itself (swallow clicks; don't reach songs behind)
+    HK_SET_CLEAR,   // Clear cache
+    HK_SET_THEME,   // Toggle theme
+    HK_SET_LOGIN,   // Sign in again (platform picker first)
+    HK_SET_LANG_ZH, // Settings: switch UI language to Chinese
+    HK_SET_LANG_EN, // Settings: switch UI language to English
+    HK_LOGIN_PICK,  // Which platform was picked
+    HK_LOGIN_TIP,   // Title bar sign-in status
+    HK_PLAYER,      // Open player page
+    HK_VOL,         // Volume button
+    HK_VOL_TRACK,   // Volume slider
+    HK_SRC,         // Source switch (Kugou / NetEase Cloud Music)
+    HK_TOG,         // Listen-together button
+    HK_TOG_HOST,    // Create room
+    HK_TOG_COPY,    // Copy room code
+    HK_TOG_INPUT,   // Room code input
+    HK_TOG_JOIN,    // Join
+    HK_TOG_LEAVE,   // Leave listen-together
+    HK_TOG_SWAP,    // Change local address (deprecated placeholder)
+    HK_TOG_CARD,    // Card blank area: swallow clicks; don't close panel
+    HK_SCROLL,      // Song picker scrollbar
+    HK_PL,          // Playlist picker circle
+    HK_PL_PICK,     // Title bar "Songs": back to playlist page
+    HK_PICKER,      // Title bar button: back to playlist picker
+    HK_QUAL,        // Quality button
+    HK_QUAL_ITEM    // Quality option
 };
 struct Hit {
     D2D1_RECT_F r{};
@@ -84,30 +84,30 @@ struct App {
     std::vector<Song> songs;
     std::vector<Playlist> playlists;
 
-    /* 歌单选择页：整体平移 + 拖动惯性 */
-    float plX = 0.0f, plY = 0.0f;             // 当前平移
-    float plTargetX = 0.0f, plTargetY = 0.0f; // 缓动目标
-    float plVelX = 0.0f, plVelY = 0.0f;       // 松手后的速度
-    int   plHover = -1;                       // 悬停的歌单
-    int   plActive = -1;                      // 已选中（准备伸展）
-    float plSelT = 0.0f;                      // 选中动画 0→1（居中 + 伸展）
+    /* Playlist picker: pan + drag inertia */
+    float plX = 0.0f, plY = 0.0f;             // Current pan
+    float plTargetX = 0.0f, plTargetY = 0.0f; // Eased target
+    float plVelX = 0.0f, plVelY = 0.0f;       // Velocity after release
+    int   plHover = -1;                       // Hovered playlist
+    int   plActive = -1;                      // Selected (about to expand)
+    float plSelT = 0.0f;                      // Selection anim 0→1 (center + expand)
     bool  plDragging = false;
     POINT plDragStartMouse = { 0, 0 };
     float plDragStartX = 0.0f, plDragStartY = 0.0f;
     bool  plDragMoved = false;
 
     Page page = Page::Grid;
-    float pageAnim = 0.0f;              // 0 = 网格，1 = 播放页
+    float pageAnim = 0.0f;              // 0 = grid, 1 = player
 
     int hoverTile = -1;
-    std::vector<float> tileAnim;        // 每个格子的悬停动画 0..1
+    std::vector<float> tileAnim;        // Per-tile hover anim 0..1
 
-    int current = -1;                   // 正在播放的曲目
+    int current = -1;                   // Currently playing track
     bool playing = false;
-    double pos = 0.0;                   // 播放进度（秒）
+    double pos = 0.0;                   // Playback position (seconds)
 
     float scroll = 0.0f;
-    float scrollTarget = 0.0f;      // 平滑滚动：实际值追这个
+    float scrollTarget = 0.0f;      // Smooth scroll: actual value follows this
     float maxScroll = 0.0f;
 
     POINT mouse = { -1, -1 };
@@ -126,5 +126,5 @@ enum { WB_MIN = 0, WB_MAX = 1, WB_CLOSE = 2 };
 void InitData();
 extern std::wstring g_likesName;
 
-/* 内嵌资源：歌单默认数据（data.cpp 用） */
+/* Embedded resource: default playlist data (used by data.cpp) */
 bool LoadEmbeddedLikes(std::string& out);

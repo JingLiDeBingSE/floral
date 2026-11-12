@@ -3,28 +3,28 @@
 #include <vector>
 
 /*
- * 酷狗接口客户端（不依赖 Node）：
- *   扫码登录 + 拉「我喜欢」歌单
+ * Kugou API client (no Node dependency):
+ *   QR-code login + fetch the "Liked" playlist
  *
- * 全部走本机 127.0.0.1:3000 的 kugou-api 服务。
+ * Everything goes through the local kugou-api service at 127.0.0.1:3000.
  */
 
-/** 取二维码：成功会把图写到 qrPath 指向的 png */
+/** Fetch the QR code; on success the image is written to the png at qrPath */
 bool KgLoginStart(const std::wstring& qrPath, std::wstring& err);
 
-/** 轮询扫码状态：0 等待 / 1 已扫码待确认 / 2 成功 / 3 二维码过期 / 4 出错 */
+/** Poll the scan status: 0 waiting / 1 scanned, pending confirm / 2 success / 3 QR expired / 4 error */
 int  KgLoginPoll(std::string& token, std::string& userid, std::wstring& err);
 
-/* ── 网易云（同一套接口风格，端口 4000） ── */
+/* ── NetEase Cloud Music (same API style, port 4000) ── */
 bool NgLoginStart(const std::wstring& qrPath, std::wstring& err);
-int  NgLoginPoll(std::string& cookie, std::wstring& err);   // 2 = 成功，cookie 已填
+int  NgLoginPoll(std::string& cookie, std::wstring& err);   // 2 = success, cookie filled in
 int  NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::wstring& err);
-std::string  NgTrimCookie(const std::string& full);   // 只留 MUSIC_U / __csrf
+std::string  NgTrimCookie(const std::string& full);   // keep only MUSIC_U / __csrf
 std::wstring NgResolveUrl(const std::string& songId, const char* level, std::wstring& err, int* gotLevel = nullptr);
 
-/* ── QQ 音乐（端口 3200） ── */
+/* ── QQ Music (port 3200) ── */
 bool QqLoginStart(const std::wstring& qrPath, std::wstring& err);
-int  QqLoginPoll(std::string& cookie, std::wstring& err);      // 2 = 成功
+int  QqLoginPoll(std::string& cookie, std::wstring& err);      // 2 = success
 int  QqExportLikes(const std::string& cookie, const std::wstring& outTsv, std::wstring& err);
 std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie, int level,
                            std::wstring& err, int* gotLevel = nullptr);
@@ -33,7 +33,7 @@ bool MatchOnPlatform(int source, const std::string& title, const std::string& ar
                      int wantDur, std::string& hashOut, long long& mixIdOut, long long& albumIdOut,
                      std::wstring& err);
 
-/* ── 歌单 ── */
+/* ── Playlists ── */
 struct KgPlaylist {
     std::string  gcid;       // global_collection_id
     std::wstring name;
@@ -42,14 +42,14 @@ struct KgPlaylist {
     bool        isDefault = false;
 };
 
-/** 拉账号下全部歌单 */
+/** Fetch all playlists of the account */
 int KgFetchPlaylists(const std::string& token, const std::string& userid,
                      std::vector<KgPlaylist>& out, std::wstring& err);
 
-/** 拉指定歌单的曲目并写出 tsv，返回歌曲数（失败 -1） */
+/** Fetch tracks of the given playlist and write a tsv; returns the track count (-1 on failure) */
 int KgExportPlaylist(const std::string& token, const std::string& userid,
                      const std::string& gcid, const std::wstring& outTsv, std::wstring& err);
 
-/** 拉「我喜欢」并写出 tsv，返回写出的歌曲数（失败返回 -1） */
+/** Fetch the "Liked" songs and write a tsv; returns the number of songs written (-1 on failure) */
 int  KgExportLikes(const std::string& token, const std::string& userid,
                    const std::wstring& outTsv, std::wstring& err);
