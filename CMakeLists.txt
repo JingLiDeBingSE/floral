@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Default to a Release build. Set before project(), which initializes an unset build type to Debug for MSVC
+if(NOT DEFINED CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+endif()
+
 project(Floral VERSION 1.0 LANGUAGES CXX)
 
 # ─────────────────────────────────────────────
@@ -22,10 +28,6 @@ option(FLORAL_EMBED_SERVICES "把接口服务内嵌进 exe" ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-endif()
 
 set(FLORAL_SOURCES
     src/main.cpp
@@ -82,7 +84,6 @@ if(MSVC)
     target_compile_definitions(floral PRIVATE
         UNICODE _UNICODE
         _CRT_SECURE_NO_WARNINGS
-        WIN32_LEAN_AND_MEAN
     )
     target_compile_options(floral PRIVATE /W3 /utf-8 /permissive-)
     if(FLORAL_PORTABLE)
