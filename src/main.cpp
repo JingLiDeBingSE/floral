@@ -2421,6 +2421,9 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
 }
 
 static void EnsureSidecar() {
+    // Both the startup thread and login threads call this; concurrent calls would extract and launch services twice
+    static std::mutex mx;
+    std::lock_guard<std::mutex> lk(mx);
 #ifndef FLORAL_NO_TOGETHER
     // Listen-together helper: MQTT credentials are passed via environment variables
     SetEnvironmentVariableW(L"FLORAL_MQTT_HOST", L"k9bf6e3a.ala.cn-shenzhen.emqxsl.cn");
@@ -4280,8 +4283,6 @@ static void DrawSplash(float t, float W, float H) {
 static void DrawIntro() {
     App& a = g_app;
     const float W = a.width, H = a.height;
-    int n = (int)a.songs.size();
-    if (n == 0) return;
 
     // Loading phase: only a centered spinner, no logo or text
     if (!g_loadDone) {
@@ -5010,12 +5011,11 @@ static bool Animate() {
     if (!g_loadDone) {
         g_loadT += dt;
         need = true;
-        // Playlist exists (or fetch finished) and the first cover is decoded; ready to enter
-        bool dataReady = !g_app.songs.empty() || g_expState == 3;
+        // The first screen is the playlist picker, which only needs the startup playlist refresh
         bool coversReady = CoversReadyForFirstScreen();
         bool refreshDone = (g_expState != 1) && !g_bootRefreshPending.load();
 
-        if ((dataReady && coversReady && refreshDone) || g_loadT > 12.0f) {
+        if ((coversReady && refreshDone) || g_loadT > 12.0f) {
             g_loadDone = true;
             g_introT = 0.0f;
             Logf("APP", "启动加载完成 t=%.2fs（封面就绪=%d）", g_loadT, coversReady ? 1 : 0);
@@ -6462,6 +6462,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         bool need = Animate();
         if (g_mouseDirty) { g_mouseDirty = false; need = true; }
         if (g_coverDirty.exchange(false)) need = true;   // a cover was decoded in the background, repaint once
+        static int shownLogin = 0;                       // worker threads update the login state; repaint to show the hint
+        if (g_loginState != shownLogin) { shownLogin = g_loginState; need = true; }
         if (!need && CoverWorkPending()) need = true;    // covers still queued/downloading/decoding
         size_t bmpsBefore = g_coverBmps.size();
         if (g_app.page == Page::Grid) PrewarmCovers(2);   // only prewarm on the song grid
