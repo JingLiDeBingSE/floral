@@ -80,7 +80,7 @@ static void GoPickerNow();
 static void GoPlayerPageNow(bool fromPicker);
 static bool      g_scrollDrag = false;   // dragging the scrollbar
 
-/** Mouse moved, redraw needed (driven by the timer so high-frequency mouse events cannot flood the redraw) */
+/** A new frame is needed. Input and background work set it, and Tick serves it at most once per display refresh */
 static bool g_mouseDirty = false;
 
 /* Common wrapper for panel enter/exit: fade + 0.96→1 scale around the anchor; while t is small, clicks are ignored */
@@ -104,7 +104,7 @@ struct PanelFx {
         // Clip only the buttons inside the panel: they are still tiny right after it appears, so ignore them for now\n        if (t < 0.55f && g_app.hits.size() > hitMark) g_app.hits.resize(hitMark);
     }
 };
-static std::atomic<bool> g_coverDirty{ false };   // set by workers once a cover is decoded; drives timer redraws
+static std::atomic<bool> g_coverDirty{ false };   // set by workers once a cover is decoded; Tick draws a frame for it
 
 /** After scrolling, wait for the mouse to actually move before allowing hover zoom (so it does not pop open by itself) */
 static bool g_hoverArmed = true;
@@ -442,6 +442,7 @@ static const wchar_t MOTION_BLUR_XML[] = LR"(<?xml version='1.0'?>
 </Effect>)";
 
 static std::string g_blurShader;      // compiled pixel shader bytecode
+static const float BLUR_MAX_TAPS = 64.0f;
 
 class MotionBlurEffect final : public ID2D1EffectImpl, public ID2D1DrawTransform {
 public:
@@ -491,7 +492,7 @@ public:
     IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE) override {
         // About one tap per pixel of travel, each at the center of an equal step along the vector
         const float length = sqrtf(m_vector.x * m_vector.x + m_vector.y * m_vector.y);
-        const float taps = (std::min)(64.0f, (std::max)(1.0f, ceilf(length)));
+        const float taps = (std::min)(BLUR_MAX_TAPS, (std::max)(1.0f, ceilf(length)));
         const float params[4] = { m_vector.x / taps, m_vector.y / taps, taps, 0.0f };
         return m_info->SetPixelShaderConstantBuffer(reinterpret_cast<const BYTE*>(params), sizeof(params));
     }
@@ -543,7 +544,7 @@ private:
 /* Compiles the pixel shader with the system's d3dcompiler_47.dll and registers the effect.
    If either step fails, moving content is drawn without blur */
 static void RegisterMotionBlur() {
-    HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
+    HMODULE dll = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     pD3DCompile compile = dll ? reinterpret_cast<pD3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
     ID3DBlob* code = nullptr;
     if (compile && SUCCEEDED(compile(MOTION_BLUR_HLSL, sizeof(MOTION_BLUR_HLSL) - 1, nullptr, nullptr, nullptr,
@@ -576,6 +577,12 @@ static void BeginMotionBlur(D2D1_VECTOR_2F blur) {
     g_rt->GetDpi(&dpiX, &dpiY);
     g_motionPx = D2D1::Vector2F(blur.x * dpiX / 96.0f, blur.y * dpiY / 96.0f);
     if (fabsf(g_motionPx.x) + fabsf(g_motionPx.y) < 0.5f) return;
+    // Taps more than 2 px apart leave gaps that show as separate copies, so longer blur is shortened
+    const float length = sqrtf(g_motionPx.x * g_motionPx.x + g_motionPx.y * g_motionPx.y);
+    if (length > 2.0f * BLUR_MAX_TAPS) {
+        g_motionPx.x *= 2.0f * BLUR_MAX_TAPS / length;
+        g_motionPx.y *= 2.0f * BLUR_MAX_TAPS / length;
+    }
 
     if (!g_blurFx) {
         ID2D1DeviceContext* dc = nullptr;
@@ -1254,9 +1261,9 @@ static void DrainDecoded() {
         tmp.swap(g_decDone);
     }
     for (auto& p : tmp) {
-        MarkCoverReady(p.first);
-        // a decode queued before the cache was cleared can arrive twice; keep the first
-        if (!g_coverSrcs.try_emplace(std::move(p.first), p.second).second && p.second) p.second->Release();
+        // a decode queued before the cache was cleared can arrive after the first one, even after its upload
+        const bool have = g_coverBmps.count(p.first) || !g_coverSrcs.try_emplace(p.first, p.second).second;
+        if (have && p.second) p.second->Release();
     }
     g_mouseDirty = true;              // a new cover is available, trigger a redraw
 }
@@ -1319,7 +1326,7 @@ static CoverBmp* CoverEntry(const std::wstring& path) {
         QueueDecode(path);           // not decoded yet: hand it to the background, draw the placeholder meanwhile
         return nullptr;
     }
-    if (g_coverUploads <= 0) { g_mouseDirty = true; return nullptr; }   // uploaded on a following frame
+    if (!g_rt || g_coverUploads <= 0) { g_mouseDirty = true; return nullptr; }   // uploaded on a following frame
     g_coverUploads--;
     CoverBmp e;
     if (FAILED(g_rt->CreateBitmapFromWicBitmap(src, nullptr, &e.bmp))) return nullptr;
@@ -5190,11 +5197,6 @@ static bool Animate() {
         }
         if (a.plActive < 0) PlClampPan();          // No pan limits while selected; must be able to center
 
-        // Dragging moves the pan between steps as well, so blur covers all travel since the last step
-        g_plBlur = D2D1::Vector2F((a.plX - g_plLastX) * SHUTTER, (a.plY - g_plLastY) * SHUTTER);
-        g_plLastX = a.plX;
-        g_plLastY = a.plY;
-
         int hov = -1;
         // 卡片展开后其余圆已经淡出，不再参与悬停（否则边框还会跟着鼠标亮）
         if (!a.plDragging && !g_settingsOpen && a.plActive < 0) {
@@ -5223,6 +5225,10 @@ static bool Animate() {
             }
         }
     }
+    // Dragging moves the pan between steps as well, so blur covers all travel since the last step
+    g_plBlur = D2D1::Vector2F((a.plX - g_plLastX) * SHUTTER, (a.plY - g_plLastY) * SHUTTER);
+    g_plLastX = a.plX;
+    g_plLastY = a.plY;
 
     // Panel enter/exit progress
     {
@@ -5278,6 +5284,13 @@ static bool Animate() {
             need = true;
         }
         g_gridBlur = D2D1::Vector2F(0.0f, (before - a.scroll) * SHUTTER);
+    }
+    // Content that has stayed still for a moment is drawn once more without blur. Pointer input slower
+    // than the display moves it only every other frame, and the wait keeps those frames from flickering
+    {
+        static ULONGLONG lastMoved = 0;
+        if (g_gridBlur.y != 0.0f || g_plBlur.x != 0.0f || g_plBlur.y != 0.0f) lastMoved = NowMs();
+        else if (lastMoved && NowMs() - lastMoved > 30) { lastMoved = 0; need = true; }
     }
 
     float target = (a.page == Page::Player) ? 1.0f : 0.0f;
@@ -6272,9 +6285,9 @@ static POINT DipPoint(LPARAM lp) {
     p.y = (LONG)lroundf((float)p.y / g_dpiScale);
     return p;
 }
-/* Draws one frame. EndDraw (with D2D1_PRESENT_OPTIONS_NONE) waits for the next vertical blank,
-   so frames drawn back to back follow the display's refresh rate */
-static void Render(HWND hwnd) {
+/* Draws one frame and returns whether it reached the screen. EndDraw (with D2D1_PRESENT_OPTIONS_NONE)
+   waits for the next vertical blank, so frames drawn back to back follow the display's refresh rate */
+static bool Render(HWND hwnd) {
     ++g_paintCount;
 
     RECT rc;
@@ -6311,13 +6324,7 @@ static void Render(HWND hwnd) {
             g_rt = nullptr;
         }
     }
-}
-
-static void Paint(HWND hwnd) {
-    PAINTSTRUCT ps;
-    BeginPaint(hwnd, &ps);
-    Render(hwnd);
-    EndPaint(hwnd, &ps);
+    return g_hwndRt != nullptr;   // false also while the target cannot be created, such as during a device reset
 }
 
 /* Advances animation and background work by one step, then draws a frame if anything changed.
@@ -6344,11 +6351,24 @@ static bool Tick(HWND hwnd) {
             last = now;
         }
     }
-    // Hidden, minimized or occluded windows do not wait for the vertical blank, so drawing would spin
-    if (!need || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
-    if (g_hwndRt && (g_hwndRt->CheckWindowState() & D2D1_WINDOW_STATE_OCCLUDED)) return false;
-    Render(hwnd);
-    return true;
+    if (!need) return false;
+    // A hidden, minimized or occluded window does not wait for the vertical blank, and neither does a frame
+    // that fails to draw, so the loop would spin. The frame stays requested until it reaches the screen
+    if (IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+        !(g_hwndRt && (g_hwndRt->CheckWindowState() & D2D1_WINDOW_STATE_OCCLUDED)) && Render(hwnd))
+        return true;
+    g_mouseDirty = true;
+    return false;
+}
+
+/* The system asks for a frame, for example after InvalidateRect or when the window is uncovered.
+   It goes through Tick so that animation steps first and the frame does not repeat the previous one */
+static void Paint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    BeginPaint(hwnd, &ps);
+    g_mouseDirty = true;
+    Tick(hwnd);
+    EndPaint(hwnd, &ps);
 }
 
 static void SaveWindowRect(HWND hwnd);
@@ -6505,7 +6525,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.mouse.x = mx;
             g_app.mouse.y = my;
             g_hoverArmed = true;      // mouse moved, re-enable hover zoom
-            g_mouseDirty = true;      // don't repaint directly, let the timer throttle it
+            g_mouseDirty = true;
         }
         return 0;
     }
@@ -6635,7 +6655,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_app.scrollTarget > g_app.maxScroll) g_app.scrollTarget = g_app.maxScroll;
         g_hoverArmed = false;         // no hover pop-open during or after scrolling
         g_app.hoverTile = -1;
-        g_mouseDirty = true;          // let the timer drive the animation
+        g_mouseDirty = true;
         return 0;
     }
 
