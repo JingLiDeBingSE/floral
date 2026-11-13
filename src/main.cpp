@@ -1643,7 +1643,7 @@ static void DrawSettings(float W, float H) {
     if (g_loginChoose && !g_loginRunning) {
         Text(T(L"选择要登录的平台", L"Choose a platform"), Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
              Rc(card.right - 300, card.top + 74, 270, 20), UI::TEXT2);
-        const wchar_t* pf[3] = { T(L"酷狗音乐", L"Kugou Music"), T(L"网易云音乐", L"NetEase Music"), L"QQ Music" };
+        const wchar_t* pf[3] = { T(L"酷狗音乐", L"Kugou Music"), T(L"网易云音乐", L"NetEase Music"), T(L"QQ 音乐", L"QQ Music") };
         for (int i = 0; i < 3; i++) {
             D2D1_RECT_F b = Rc(card.right - 300, card.top + 96 + i * 46, 270, 38);
             bool hot = Inside(b, g_app.mouse);
