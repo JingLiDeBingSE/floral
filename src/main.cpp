@@ -6327,9 +6327,40 @@ static bool Render(HWND hwnd) {
     return g_hwndRt != nullptr;   // false also while the target cannot be created, such as during a device reset
 }
 
+/* A window in the background draws about 60 frames per second, each shown for the same whole number of
+   display refreshes. The next frame is drawn early in the last refresh before the vertical blank it is for */
+static LONGLONG g_nextFrameQpc = 0;   // a window in the background may draw again from this QPC time
+static LONGLONG QpcFrequency() {
+    static const LONGLONG f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x.QuadPart; }();
+    return f;
+}
+static void ScheduleBackgroundFrame() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    DWM_TIMING_INFO ti = {};
+    ti.cbSize = sizeof(ti);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &ti)) || !ti.qpcRefreshPeriod) {
+        g_nextFrameQpc = now.QuadPart + QpcFrequency() / 60;
+        return;
+    }
+    const LONGLONG period = (LONGLONG)ti.qpcRefreshPeriod;
+    const LONGLONG refreshes = (std::max)(1LL, std::llround((double)QpcFrequency() / period / 60.0));
+    // The frame just presented appears on the next vertical blank
+    const LONGLONG sinceBlank = ((now.QuadPart - (LONGLONG)ti.qpcVBlank) % period + period) % period;
+    const LONGLONG shown = now.QuadPart - sinceBlank + period;
+    g_nextFrameQpc = shown + (refreshes - 1) * period + period / 4;
+}
+
 /* Advances animation and background work by one step, then draws a frame if anything changed.
-   Returns whether a frame was drawn */
-static bool Tick(HWND hwnd) {
+   Returns how long the caller may sleep: 0 after drawing a frame, INFINITE when no frame is waiting */
+static DWORD Tick(HWND hwnd) {
+    const bool background = GetForegroundWindow() != hwnd;
+    if (background) {
+        // Stepping only when the frame is due makes each step, and so the motion blur, span the whole frame
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < g_nextFrameQpc) return (DWORD)((g_nextFrameQpc - now.QuadPart) * 1000 / QpcFrequency() + 1);
+    }
     bool need = Animate();
     if (g_mouseDirty) { g_mouseDirty = false; need = true; }
     if (g_coverDirty.exchange(false)) need = true;   // a cover was decoded in the background, repaint once
@@ -6351,14 +6382,16 @@ static bool Tick(HWND hwnd) {
             last = now;
         }
     }
-    if (!need) return false;
+    if (!need) return INFINITE;
     // A hidden, minimized or occluded window does not wait for the vertical blank, and neither does a frame
     // that fails to draw, so the loop would spin. The frame stays requested until it reaches the screen
     if (IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
-        !(g_hwndRt && (g_hwndRt->CheckWindowState() & D2D1_WINDOW_STATE_OCCLUDED)) && Render(hwnd))
-        return true;
+        !(g_hwndRt && (g_hwndRt->CheckWindowState() & D2D1_WINDOW_STATE_OCCLUDED)) && Render(hwnd)) {
+        if (background) ScheduleBackgroundFrame();
+        return 0;
+    }
     g_mouseDirty = true;
-    return false;
+    return INFINITE;
 }
 
 /* The system asks for a frame, for example after InvalidateRect or when the window is uncovered.
@@ -7204,15 +7237,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     SetTimer(hwnd, 1, 8, nullptr);
 
     // While anything animates, each pass draws a frame and EndDraw paces it to the display;
-    // otherwise the thread sleeps until a message or the timer arrives
+    // otherwise the thread sleeps until a message, the timer or the next background frame arrives
     MSG msg;
     for (;;) {
         if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) break;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
-        } else if (!Tick(hwnd)) {
-            WaitMessage();
+        } else if (DWORD wait = Tick(hwnd)) {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, wait, QS_ALLINPUT);
         }
     }
 
