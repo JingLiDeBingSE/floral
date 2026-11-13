@@ -2378,8 +2378,30 @@ static bool ReadRes(int id, std::string& out) {
 
 
 
-static HANDLE g_apiProc = nullptr;
-static HANDLE g_qqProc   = nullptr;      // service we spawned ourselves; must be reaped on exit
+/* Start a hidden service process inside a job that the system kills when Floral exits, crashes included */
+static bool LaunchSidecar(std::wstring cmd, const std::wstring& dir) {
+    static HANDLE job = [] {
+        HANDLE j = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl = {};
+        jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(j, JobObjectExtendedLimitInformation, &jl, sizeof(jl));
+        return j;
+    }();
+
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    // stays suspended until it is in the job, so processes it spawns join the job as well
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                        nullptr, dir.c_str(), &si, &pi))
+        return false;
+    AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
 
 static std::wstring LocalDir() {
     wchar_t buf[MAX_PATH] = { 0 };
@@ -2417,7 +2439,7 @@ static bool PortListening(unsigned short port) {
 
 /* Start a Node-style sidecar: skip if already running, else unpack and launch it, then wait for the port */
 static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
-                             unsigned short port, HANDLE* procOut, const char* name) {
+                             unsigned short port, const char* name) {
     if (PortListening(port)) return true;                  // already running
 
     if (!ExtractSidecars()) {
@@ -2427,20 +2449,10 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
 
     std::wstring dir     = SidecarRoot() + L"\\" + sub;
     std::wstring nodeExe = SidecarRoot() + L"\\node.exe";
-    std::wstring cmd     = L"\"" + nodeExe + L"\" " + script;
-
-    STARTUPINFOW si = { sizeof(si) };
-    si.dwFlags     = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-                        nullptr, dir.c_str(), &si, &pi)) {
+    if (!LaunchSidecar(L"\"" + nodeExe + L"\" " + script, dir)) {
         Logf("ERR", "%s 启动失败 code=%lu", name, GetLastError());
         return false;
     }
-    if (procOut) *procOut = pi.hProcess; else CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
 
     for (int i = 0; i < 80; i++) {                        // wait up to about 36 s
         if (PortListening(port)) break;
@@ -2458,7 +2470,7 @@ static void StartTogetherHelper() {
     SetEnvironmentVariableW(L"FLORAL_MQTT_USER", L"Floral");
     SetEnvironmentVariableW(L"FLORAL_MQTT_PASS", L"qwertyuiop!@#$%^&*()");
     SetEnvironmentVariableW(L"FLORAL_LISTEN_PORT", L"4100");
-    StartNodeSidecar(L"together", L"together-server.js", 4100, nullptr, "一起听助手");
+    StartNodeSidecar(L"together", L"together-server.js", 4100, "一起听助手");
 }
 #endif
 
@@ -2471,12 +2483,12 @@ static void EnsureSidecar() {
     if (g_source == 2) {                                  // QQ
         StartNodeSidecar(L"qq",
                          L"node_modules/@yakult-green-tea/qq-music-api/dist/src/app.js",
-                         3200, &g_qqProc, "QQ 接口服务");
+                         3200, "QQ 接口服务");
         return;
     }
     if (g_source == 1) {                                  // NetEase
         SetEnvironmentVariableW(L"REAL_IP", L"116.25.146.177");   // without this every request is a 502
-        StartNodeSidecar(L"netease", L"server.js", 4000, &g_apiProc, "网易云接口服务");
+        StartNodeSidecar(L"netease", L"server.js", 4000, "网易云接口服务");
         return;
     }
 
@@ -2500,23 +2512,7 @@ static void EnsureSidecar() {
         fclose(f);
     }
 
-    STARTUPINFOW si = { sizeof(si) };
-    si.dwFlags     = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-    std::wstring cmd = L"\"" + exe + L"\"";
-    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
-        g_apiProc = pi.hProcess;
-        CloseHandle(pi.hThread);
-        HANDLE job = CreateJobObjectW(nullptr, nullptr);
-        if (job) {
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl = {};
-            jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jl, sizeof(jl));
-            AssignProcessToJobObject(job, pi.hProcess);
-        }
-    }
+    LaunchSidecar(L"\"" + exe + L"\"", dir);
     for (int i = 0; i < 30; i++) {
         if (PortListening(3000)) break;
         Sleep(200);
@@ -6547,11 +6543,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TogetherStop();
 #endif
         AudioClose();                       // stop the device, join the download thread
-        if (g_apiProc) {                    // the API service we spawned exits along with us
-            TerminateProcess(g_apiProc, 0);
-            CloseHandle(g_apiProc);
-            g_apiProc = nullptr;
-        }
         PostQuitMessage(0);
         return 0;
     }
