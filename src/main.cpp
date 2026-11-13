@@ -168,7 +168,7 @@ static const CoverPair COVERS[8] = {
     { 0xE9E3E9, 0xC0B0BE },   // blush
 };
 
-/* Cover cache keyed by file path: decoded pixels, and their bitmaps on the current render target */
+/* Cover cache keyed by file path: decoded pixels waiting for upload, and bitmaps on the current render target */
 static std::unordered_map<std::wstring, IWICBitmapSource*> g_coverSrcs;
 
 struct CoverBmp {
@@ -246,6 +246,7 @@ static std::unordered_map<std::wstring, ULONGLONG> g_coverSeen;
 
 static bool  g_noCoverFade = false;     // screenshot mode: no fade-in, straight to full
 static float g_coverFadeOverride = -1.0f;  // screenshot mode: freeze fade progress
+static bool  g_coverFading = false;     // a cover drawn in the last frame is still fading in
 
 static void MarkCoverReady(const std::wstring& path) {
     if (path.empty()) return;
@@ -258,7 +259,9 @@ static float CoverFade(const std::wstring& path) {
     auto it = g_coverSeen.find(path);
     if (it == g_coverSeen.end()) return 1.0f;        // not recorded: treat as ready long ago
     float t = (float)(NowMs() - it->second) / 150.0f;
-    return t >= 1.0f ? 1.0f : t;
+    if (t >= 1.0f) return 1.0f;
+    g_coverFading = true;
+    return t;
 }
 static void Bind(ID2D1RenderTarget* rt) {
     if (g_rt == rt) return;
@@ -1180,18 +1183,6 @@ static void FetchPlaylistsAsync() {
     Logf("APP", "歌单列表拉取完成 %d 个", n);
 }
 /** Main thread: adopt downloaded covers into the cache */
-/** Is there any cover work left (the timer keeps redrawing while there is) */
-static bool CoverWorkPending() {
-    {
-        std::lock_guard<std::mutex> lk(g_covMx);
-        if (!g_covQueue.empty() || !g_covDone.empty()) return true;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_decMutex);
-        if (!g_decDone.empty()) return true;
-    }
-    return false;
-}
 
 static void DrainCovers() {
     std::vector<int> done;
@@ -1326,6 +1317,10 @@ static CoverBmp* CoverEntry(const std::wstring& path) {
     g_coverUploads--;
     CoverBmp e;
     if (FAILED(g_rt->CreateBitmapFromWicBitmap(src, nullptr, &e.bmp))) return nullptr;
+    // Only the GPU copy is drawn from here on; if the render target is replaced, the file is decoded again
+    src->Release();
+    g_coverSrcs.erase(path);
+    g_decRequested.erase(path);
     MarkCoverReady(path);
     return &g_coverBmps.emplace(path, e).first->second;
 }
@@ -6327,7 +6322,7 @@ static bool Tick(HWND hwnd) {
     if (g_coverDirty.exchange(false)) need = true;   // a cover was decoded in the background, repaint once
     static int shownLogin = 0;                       // worker threads update the login state; repaint to show the hint
     if (g_loginState != shownLogin) { shownLogin = g_loginState; need = true; }
-    if (!need && CoverWorkPending()) need = true;    // covers still queued/downloading/decoding
+    if (g_coverFading) { g_coverFading = false; need = true; }
     size_t bmpsBefore = g_coverBmps.size();
     if (g_app.page == Page::Grid) PrewarmCovers(2);   // only prewarm on the song grid
     if (g_coverBmps.size() != bmpsBefore) need = true;
