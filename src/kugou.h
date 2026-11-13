@@ -40,7 +40,6 @@ struct KgPlaylist {
     std::string coverUrl;
     int         count = 0;
     int         ver = 0;          // list_ver, which the service increases whenever the tracks change
-    bool        isDefault = false;
 };
 
 /** Fetch all playlists of the account */

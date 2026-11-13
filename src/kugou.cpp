@@ -376,8 +376,6 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
             if (ver) kp.ver = (int)ver->ll();
             const JVal* pic = p->get("pic");
             if (pic) kp.coverUrl = pic->str();
-            const JVal* def = p->get("is_def");
-            kp.isDefault = (def && def->ll() == 2);
             // Only playlists created by this user: list_create_userid == self
             // (type=0: own, type=1: saved from others, source=2: album)
             const JVal* cu = p->get("list_create_userid");
@@ -462,6 +460,7 @@ static std::string TrackRow(const JVal* t, std::string& hash) {
 }
 
 static const int kTrackPageSize = 300;   // the service returns at most 300 tracks per page
+static const int kMaxTrackPages = 30;
 
 struct TrackPage {
     int listed = 0;                                          // tracks in the response, rows without a title included
@@ -513,7 +512,8 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
     DWORD conns = 8;     // WinInet allows two connections per server by default; this raises it for the whole process
     InternetSetOptionW(nullptr, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &conns, sizeof(conns));
     std::vector<TrackPage> pages;
-    int want = countHint > 0 ? (countHint + kTrackPageSize - 1) / kTrackPageSize : 1;
+    int want = countHint > 0 ? (std::min)((countHint + kTrackPageSize - 1) / kTrackPageSize, kMaxTrackPages) : 1;
+    long long total = -1;
     while ((int)pages.size() < want) {
         const int first = (int)pages.size();
         pages.resize((size_t)want);
@@ -528,11 +528,18 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
         for (std::thread& th : pool) th.join();
         if (failed) { err = L"拉歌单失败（分页请求出错，已保留旧歌单）"; return -1; }
 
-        long long total = -1;
         for (const TrackPage& p : pages) total = (std::max)(total, p.total);
         if (total >= 0) want = (int)((total + kTrackPageSize - 1) / kTrackPageSize);
         else if (pages.back().listed == kTrackPageSize) want++;   // no count: keep going while pages are full
-        want = (std::min)(want, 30);
+        want = (std::min)(want, kMaxTrackPages);
+    }
+    // The pages must add up to the count, duplicates included, unless the page cap cut the list short;
+    // otherwise a page that came back short would be cached as part of a complete playlist
+    long long listed = 0;
+    for (const TrackPage& p : pages) listed += p.listed;
+    if (total >= 0 && listed != total && (int)pages.size() < kMaxTrackPages) {
+        err = L"拉歌单失败（分页数据不完整，已保留旧歌单）";
+        return -1;
     }
 
     std::string out = "title\tartist\talbum\tseconds\tcover\thash\tmixsongid\talbum_id\tcoverUrl\n";
@@ -547,12 +554,15 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
     }
     if (n == 0) { err = L"歌单里没有歌曲"; return -1; }
 
+    // Written under another name and renamed into place, so an interrupted write never leaves a partial list
+    const std::wstring part = outTsv + L".part";
     FILE* f = nullptr;
-    _wfopen_s(&f, outTsv.c_str(), L"wb");
+    _wfopen_s(&f, part.c_str(), L"wb");
     if (!f) { err = L"写 tsv 失败"; return -1; }
     const bool written = fwrite(out.data(), 1, out.size(), f) == out.size();
-    if (fclose(f) != 0 || !written) {    // a truncated file would later be read as the whole playlist
-        DeleteFileW(outTsv.c_str());
+    if (fclose(f) != 0 || !written ||
+        !MoveFileExW(part.c_str(), outTsv.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(part.c_str());
         err = L"写 tsv 失败";
         return -1;
     }

@@ -29,11 +29,9 @@ struct Playlist {
     int          count = 0;
     std::string  coverUrl;
     int          ver = 0;     // Kugou list_ver: changes whenever the tracks change; 0 when unknown
-    bool         isDefault = false;
 
     bool operator==(const Playlist& o) const {
-        return name == o.name && gcid == o.gcid && count == o.count && coverUrl == o.coverUrl &&
-               ver == o.ver && isDefault == o.isDefault;
+        return name == o.name && gcid == o.gcid && count == o.count && coverUrl == o.coverUrl && ver == o.ver;
     }
 };
 
