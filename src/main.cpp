@@ -584,10 +584,16 @@ static void BeginMotionBlur(D2D1_VECTOR_2F blur) {
             dc->Release();
         }
     }
+    // The layer has to match the screen target in pixel size and DPI, which both follow the window
     const D2D1_SIZE_U size = g_rt->GetPixelSize();
     if (g_layerRt) {
         const D2D1_SIZE_U have = g_layerRt->GetPixelSize();
-        if (have.width != size.width || have.height != size.height) { g_layerRt->Release(); g_layerRt = nullptr; }
+        float layerDpiX = 0.0f, layerDpiY = 0.0f;
+        g_layerRt->GetDpi(&layerDpiX, &layerDpiY);
+        if (have.width != size.width || have.height != size.height || layerDpiX != dpiX || layerDpiY != dpiY) {
+            g_layerRt->Release();
+            g_layerRt = nullptr;
+        }
     }
     if (!g_layerRt) g_rt->CreateCompatibleRenderTarget(&g_layerRt);
     if (!g_blurFx || !g_layerRt) return;
@@ -1313,7 +1319,7 @@ static CoverBmp* CoverEntry(const std::wstring& path) {
         QueueDecode(path);           // not decoded yet: hand it to the background, draw the placeholder meanwhile
         return nullptr;
     }
-    if (g_coverUploads <= 0) return nullptr;
+    if (g_coverUploads <= 0) { g_mouseDirty = true; return nullptr; }   // uploaded on a following frame
     g_coverUploads--;
     CoverBmp e;
     if (FAILED(g_rt->CreateBitmapFromWicBitmap(src, nullptr, &e.bmp))) return nullptr;
