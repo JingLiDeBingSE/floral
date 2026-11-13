@@ -1787,21 +1787,17 @@ static void DrawTitleBar(float W) {
     // when the session is invalid or the service is down, show a clickable pill instead of letting people find out when playback fails
     if (g_loginState == 2 || g_loginState == 3) {
         const wchar_t* tip;
-        UINT32 fg;
         if (g_loginState == 3) {
             tip = T(L"接口服务未启动 · 点此查看", L"Service not running · click to check");
-            fg = 0x8A6A2F;
         } else if (g_userid.empty() && g_token.empty()) {
             tip = T(L"未登录 · 点此登录", L"Not signed in · click to sign in");
-            fg = 0xB04A63;
         } else {
             tip = T(L"登录已过期 · 点此重登", L"Session expired · click to sign in");
-            fg = 0xB04A63;
         }
         D2D1_RECT_F pill = LoginPillRect(W);
-        bool ph = Inside(pill, g_app.mouse);
-        FillRound(pill, 11.0f, ph ? 0xF6CBD8 : (g_loginState == 3 ? 0xF7EBD2 : 0xFBE0E8));
-        Text(tip, Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), pill, fg,
+        FillRound(pill, 11.0f, UI::SELECT);
+        if (Inside(pill, g_app.mouse)) StrokeRound(pill, 11.0f, UI::BTN_CLOSE, 1.0f);
+        Text(tip, Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), pill, UI::TEXT,
              DWRITE_TEXT_ALIGNMENT_CENTER);
         Hit h; h.r = pill; h.kind = HK_LOGIN_TIP;
         g_app.hits.push_back(h);
