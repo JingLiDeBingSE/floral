@@ -6,6 +6,9 @@
 #include "lang.h"
 #include "audio.h"
 
+#include <d2d1_1.h>
+#include <d2d1effectauthor.h>
+#include <d3dcompiler.h>
 #include <wininet.h>
 #include <winsock2.h>
 #include <thread>
@@ -21,9 +24,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <climits>
 #include <thread>
 #include <mutex>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #include <chrono>
 #include <atomic>
@@ -42,11 +48,13 @@ static IWICImagingFactory*    g_wic    = nullptr;
 static ID2D1RenderTarget*     g_rt     = nullptr;
 static ID2D1SolidColorBrush*  g_brush  = nullptr;
 static ID2D1HwndRenderTarget* g_hwndRt = nullptr;
+static ID2D1Effect*             g_blurFx  = nullptr;   // motion blur effect on the current render target
+static ID2D1BitmapRenderTarget* g_layerRt = nullptr;   // offscreen layer for content in motion
 
 /** Whole-layer opacity (for page transition fades) */
 static float g_alpha = 1.0f;
 
-/** Extra global opacity multiplier (for motion-blur trails) */
+/** Extra opacity on top of g_alpha, set around a group of draws such as a panel or a fading tile */
 static float g_alphaMul = 1.0f;
 static float g_plEnter  = 1.0f;   // playlist page fade-in 0→1
 static float g_gridEnter = 1.0f;  // song grid entrance 0→1
@@ -72,7 +80,7 @@ static void GoPickerNow();
 static void GoPlayerPageNow(bool fromPicker);
 static bool      g_scrollDrag = false;   // dragging the scrollbar
 
-/** Mouse moved, redraw needed (driven by the timer so high-frequency mouse events cannot flood the redraw) */
+/** A new frame is needed. Input and background work set it, and Tick serves it at most once per display refresh */
 static bool g_mouseDirty = false;
 
 /* Common wrapper for panel enter/exit: fade + 0.96→1 scale around the anchor; while t is small, clicks are ignored */
@@ -96,14 +104,18 @@ struct PanelFx {
         // Clip only the buttons inside the panel: they are still tiny right after it appears, so ignore them for now\n        if (t < 0.55f && g_app.hits.size() > hitMark) g_app.hits.resize(hitMark);
     }
 };
-static std::atomic<bool> g_coverDirty{ false };   // set by workers once a cover is decoded; drives timer redraws
+static std::atomic<bool> g_coverDirty{ false };   // set by workers once a cover is decoded; Tick draws a frame for it
 
 /** After scrolling, wait for the mouse to actually move before allowing hover zoom (so it does not pop open by itself) */
 static bool g_hoverArmed = true;
 
-/** Instant scroll velocity (px/s), drives motion blur */
-static float g_scrollVel = 0.0f;
-static float g_prevScroll = 0.0f;
+/** Share of each frame's travel that the motion blur covers; 0.5 is the 180° shutter of film cameras */
+static const float SHUTTER = 0.5f;
+
+/** Motion blur vectors in DIPs for the current frame: song grid scrolling and playlist picker panning */
+static D2D1_VECTOR_2F g_gridBlur = { 0.0f, 0.0f };
+static D2D1_VECTOR_2F g_plBlur   = { 0.0f, 0.0f };
+static float g_plLastX = 0.0f, g_plLastY = 0.0f;   // picker pan at the previous animation step
 
 /* Debug: --fps shows the measured frame rate in the title bar */
 static bool g_showFps = false;
@@ -137,6 +149,12 @@ static bool Inside(const D2D1_RECT_F& r, const POINT& p) {
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
 
+/* Millisecond clock for animation; GetTickCount64 advances in 15.6 ms steps, too coarse above 60 fps */
+static ULONGLONG NowMs() {
+    using namespace std::chrono;
+    return (ULONGLONG)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 /* Cover palette: 8 Morandi gradient swatches (light → mid) */
 struct CoverPair { UINT32 a, b; };
 static const CoverPair COVERS[8] = {
@@ -150,32 +168,30 @@ static const CoverPair COVERS[8] = {
     { 0xE9E3E9, 0xC0B0BE },   // blush
 };
 
-/* Cover image cache */
-struct CoverSrc { std::wstring path; IWICFormatConverter* conv = nullptr; };
-static std::vector<CoverSrc> g_coverSrcs;
+/* Cover cache keyed by file path: decoded pixels waiting for upload, and bitmaps on the current render target */
+static std::unordered_map<std::wstring, IWICBitmapSource*> g_coverSrcs;
 
 struct CoverBmp {
-    IWICFormatConverter* src = nullptr;
-    ID2D1RenderTarget* rt = nullptr;
     ID2D1Bitmap* bmp = nullptr;
     ID2D1BitmapBrush* brush = nullptr;   // for rounded fills; avoids creating a Layer every frame
 };
-static std::vector<CoverBmp> g_coverBmps;
+static std::unordered_map<std::wstring, CoverBmp> g_coverBmps;
 
-/* Text format cache */
-struct FmtEntry { float size; DWRITE_FONT_WEIGHT weight; IDWriteTextFormat* f; };
-static std::vector<FmtEntry> g_fmts;
+/* Text formats keyed by weight and size; sizes are rounded to half a DIP, so animated sizes share a few formats */
+static std::unordered_map<int, IDWriteTextFormat*> g_fmts;
 
 static IDWriteTextFormat* Fmt(float size, DWRITE_FONT_WEIGHT weight) {
-    for (auto& e : g_fmts)
-        if (e.size == size && e.weight == weight) return e.f;
+    const int halfDips = (int)lroundf(size * 2.0f);
+    const int key = halfDips * 1000 + (int)weight;     // font weights are below 1000
+    auto it = g_fmts.find(key);
+    if (it != g_fmts.end()) return it->second;
     IDWriteTextFormat* f = nullptr;
     if (FAILED(g_dw->CreateTextFormat(L"Microsoft YaHei UI", nullptr, weight,
-            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"zh-cn", &f)))
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, halfDips * 0.5f, L"zh-cn", &f)))
         return nullptr;
     f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-    g_fmts.push_back({ size, weight, f });
+    g_fmts.emplace(key, f);
     return f;
 }
 
@@ -226,15 +242,15 @@ static void BuildCoverBrushes(ID2D1RenderTarget* rt) {
 /* Cover placeholder gradient brushes: 8, cached per render target to avoid rebuilding every frame */
 
 /* Cover fade-in: records when each image first becomes drawable, fading 0→1 over 150ms */
-static std::map<std::wstring, ULONGLONG> g_coverSeen;
+static std::unordered_map<std::wstring, ULONGLONG> g_coverSeen;
 
 static bool  g_noCoverFade = false;     // screenshot mode: no fade-in, straight to full
 static float g_coverFadeOverride = -1.0f;  // screenshot mode: freeze fade progress
+static bool  g_coverFading = false;     // a cover drawn in the last frame is still fading in
 
 static void MarkCoverReady(const std::wstring& path) {
     if (path.empty()) return;
-    if (g_coverSeen.find(path) == g_coverSeen.end())
-        g_coverSeen[path] = GetTickCount64();
+    g_coverSeen.emplace(path, NowMs());
 }
 
 static float CoverFade(const std::wstring& path) {
@@ -242,8 +258,10 @@ static float CoverFade(const std::wstring& path) {
     if (g_noCoverFade || path.empty()) return 1.0f;
     auto it = g_coverSeen.find(path);
     if (it == g_coverSeen.end()) return 1.0f;        // not recorded: treat as ready long ago
-    float t = (float)(GetTickCount64() - it->second) / 150.0f;
-    return t >= 1.0f ? 1.0f : t;
+    float t = (float)(NowMs() - it->second) / 150.0f;
+    if (t >= 1.0f) return 1.0f;
+    g_coverFading = true;
+    return t;
 }
 static void Bind(ID2D1RenderTarget* rt) {
     if (g_rt == rt) return;
@@ -253,11 +271,13 @@ static void Bind(ID2D1RenderTarget* rt) {
         if (g_covBrush[i]) { g_covBrush[i]->Release(); g_covBrush[i] = nullptr; }
     }
     // bitmaps/brushes are bound to the render target, so rebuild them when it changes
-    for (auto& b : g_coverBmps) {
-        if (b.brush) b.brush->Release();
-        if (b.bmp) b.bmp->Release();
+    for (auto& entry : g_coverBmps) {
+        if (entry.second.brush) entry.second.brush->Release();
+        if (entry.second.bmp) entry.second.bmp->Release();
     }
     g_coverBmps.clear();
+    if (g_blurFx)  { g_blurFx->Release();  g_blurFx = nullptr; }
+    if (g_layerRt) { g_layerRt->Release(); g_layerRt = nullptr; }
     g_coverSeen.clear();
     if (!rt) return;
 
@@ -384,6 +404,228 @@ static std::wstring FormatTime(int sec) {
     wchar_t buf[16];
     swprintf(buf, 16, L"%d:%02d", sec / 60, sec % 60);
     return buf;
+}
+
+/* ══════════════════════════════════════════
+   Motion blur
+   ══════════════════════════════════════════ */
+/* A custom Direct2D effect: every output pixel averages the input along a vector, which is what a
+   camera records while content travels that vector with the shutter open (a box filter in time) */
+static const GUID CLSID_MotionBlur      = { 0xad1e53dc, 0x36d7, 0x4ea4, { 0xa2, 0xd6, 0x55, 0x96, 0x10, 0xe7, 0xad, 0x8d } };
+static const GUID GUID_MotionBlurShader = { 0x20924afc, 0x55b9, 0x4d80, { 0xa7, 0x6a, 0x14, 0xaf, 0x61, 0x3b, 0x33, 0xbf } };
+
+static const char MOTION_BLUR_HLSL[] = R"(
+Texture2D Input : register(t0);
+SamplerState InputSampler : register(s0);
+cbuffer Params : register(b0) { float2 stride; float taps; };
+
+// TEXCOORD0: xy is the input position, zw the size of one output pixel in input coordinates
+float4 main(float4 pos : SV_POSITION, float4 scene : SCENE_POSITION, float4 uv : TEXCOORD0) : SV_Target {
+    float4 sum = 0;
+    [loop] for (float i = 0.5; i < taps; i += 1.0)
+        sum += Input.Sample(InputSampler, uv.xy + stride * i * uv.zw);
+    return sum / taps;
+}
+)";
+
+static const wchar_t MOTION_BLUR_XML[] = LR"(<?xml version='1.0'?>
+<Effect>
+  <Property name='DisplayName' type='string' value='Motion Blur'/>
+  <Property name='Author' type='string' value='Floral'/>
+  <Property name='Category' type='string' value='Blur'/>
+  <Property name='Description' type='string' value='Averages the input along a vector'/>
+  <Inputs><Input name='Source'/></Inputs>
+  <Property name='Vector' type='vector2'>
+    <Property name='DisplayName' type='string' value='Vector'/>
+    <Property name='Default' type='vector2' value='(0.0, 0.0)'/>
+  </Property>
+</Effect>)";
+
+static std::string g_blurShader;      // compiled pixel shader bytecode
+static const float BLUR_MAX_TAPS = 64.0f;
+
+class MotionBlurEffect final : public ID2D1EffectImpl, public ID2D1DrawTransform {
+public:
+    static HRESULT CALLBACK Create(IUnknown** effect) {
+        *effect = static_cast<ID2D1EffectImpl*>(new MotionBlurEffect());
+        return S_OK;
+    }
+
+    /* Accessors for the Vector property (in pixels); D2D passes back the IUnknown returned by Create */
+    static HRESULT CALLBACK SetVector(IUnknown* effect, const BYTE* data, UINT32 size) {
+        if (size != sizeof(D2D1_VECTOR_2F)) return E_INVALIDARG;
+        static_cast<MotionBlurEffect*>(static_cast<ID2D1EffectImpl*>(effect))->m_vector =
+            *reinterpret_cast<const D2D1_VECTOR_2F*>(data);
+        return S_OK;
+    }
+    static HRESULT CALLBACK GetVector(const IUnknown* effect, BYTE* data, UINT32 size, UINT32* actual) {
+        if (actual) *actual = sizeof(D2D1_VECTOR_2F);
+        if (!data || size < sizeof(D2D1_VECTOR_2F)) return E_NOT_SUFFICIENT_BUFFER;
+        *reinterpret_cast<D2D1_VECTOR_2F*>(data) =
+            static_cast<const MotionBlurEffect*>(static_cast<const ID2D1EffectImpl*>(effect))->m_vector;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** out) override {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID2D1EffectImpl))
+            *out = static_cast<ID2D1EffectImpl*>(this);
+        else if (riid == __uuidof(ID2D1DrawTransform) || riid == __uuidof(ID2D1Transform) ||
+                 riid == __uuidof(ID2D1TransformNode))
+            *out = static_cast<ID2D1DrawTransform*>(this);
+        else { *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return ++m_refs; }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        ULONG n = --m_refs;
+        if (n == 0) delete this;
+        return n;
+    }
+
+    IFACEMETHODIMP Initialize(ID2D1EffectContext* context, ID2D1TransformGraph* graph) override {
+        HRESULT hr = context->LoadPixelShader(GUID_MotionBlurShader,
+                                              reinterpret_cast<const BYTE*>(g_blurShader.data()),
+                                              (UINT32)g_blurShader.size());
+        return SUCCEEDED(hr) ? graph->SetSingleTransformNode(this) : hr;
+    }
+    IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE) override {
+        // About one tap per pixel of travel, each at the center of an equal step along the vector
+        const float length = sqrtf(m_vector.x * m_vector.x + m_vector.y * m_vector.y);
+        const float taps = (std::min)(BLUR_MAX_TAPS, (std::max)(1.0f, ceilf(length)));
+        const float params[4] = { m_vector.x / taps, m_vector.y / taps, taps, 0.0f };
+        return m_info->SetPixelShaderConstantBuffer(reinterpret_cast<const BYTE*>(params), sizeof(params));
+    }
+    IFACEMETHODIMP SetGraph(ID2D1TransformGraph*) override { return E_NOTIMPL; }
+
+    IFACEMETHODIMP SetDrawInfo(ID2D1DrawInfo* info) override {
+        m_info = info;
+        m_info->AddRef();
+        D2D1_INPUT_DESCRIPTION input = { D2D1_FILTER_MIN_MAG_MIP_LINEAR, 0 };
+        HRESULT hr = info->SetInputDescription(0, input);
+        return SUCCEEDED(hr) ? info->SetPixelShader(GUID_MotionBlurShader) : hr;
+    }
+    IFACEMETHODIMP MapOutputRectToInputRects(const D2D1_RECT_L* output, D2D1_RECT_L* inputs,
+                                           UINT32 count) const override {
+        if (count != 1) return E_INVALIDARG;
+        inputs[0] = Reach(*output, m_vector.x, m_vector.y);      // pixel p reads from p to p + vector
+        return S_OK;
+    }
+    IFACEMETHODIMP MapInputRectsToOutputRect(const D2D1_RECT_L* inputs, const D2D1_RECT_L*, UINT32 count,
+                                           D2D1_RECT_L* output, D2D1_RECT_L* opaque) override {
+        if (count != 1) return E_INVALIDARG;
+        *output = Reach(inputs[0], -m_vector.x, -m_vector.y);
+        *opaque = D2D1_RECT_L{ 0, 0, 0, 0 };
+        return S_OK;
+    }
+    IFACEMETHODIMP MapInvalidRect(UINT32, D2D1_RECT_L invalid, D2D1_RECT_L* output) const override {
+        *output = Reach(invalid, -m_vector.x, -m_vector.y);
+        return S_OK;
+    }
+    IFACEMETHODIMP_(UINT32) GetInputCount() const override { return 1; }
+
+private:
+    ~MotionBlurEffect() { if (m_info) m_info->Release(); }
+
+    /* r extended toward (dx, dy), plus one pixel for bilinear sampling */
+    static D2D1_RECT_L Reach(D2D1_RECT_L r, float dx, float dy) {
+        r.left   += (LONG)floorf((std::min)(dx, 0.0f)) - 1;
+        r.top    += (LONG)floorf((std::min)(dy, 0.0f)) - 1;
+        r.right  += (LONG)ceilf((std::max)(dx, 0.0f)) + 1;
+        r.bottom += (LONG)ceilf((std::max)(dy, 0.0f)) + 1;
+        return r;
+    }
+
+    ULONG          m_refs = 1;
+    D2D1_VECTOR_2F m_vector = { 0.0f, 0.0f };
+    ID2D1DrawInfo* m_info = nullptr;
+};
+
+/* Compiles the pixel shader with the system's d3dcompiler_47.dll and registers the effect.
+   If either step fails, moving content is drawn without blur */
+static void RegisterMotionBlur() {
+    HMODULE dll = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    pD3DCompile compile = dll ? reinterpret_cast<pD3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
+    ID3DBlob* code = nullptr;
+    if (compile && SUCCEEDED(compile(MOTION_BLUR_HLSL, sizeof(MOTION_BLUR_HLSL) - 1, nullptr, nullptr, nullptr,
+                                     "main", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, nullptr))) {
+        g_blurShader.assign(static_cast<const char*>(code->GetBufferPointer()), code->GetBufferSize());
+        code->Release();
+    }
+    if (dll) FreeLibrary(dll);
+
+    ID2D1Factory1* factory = nullptr;
+    HRESULT hr = E_FAIL;
+    if (!g_blurShader.empty() && SUCCEEDED(g_d2d->QueryInterface(IID_PPV_ARGS(&factory)))) {
+        const D2D1_PROPERTY_BINDING bindings[] = {
+            { L"Vector", MotionBlurEffect::SetVector, MotionBlurEffect::GetVector },
+        };
+        hr = factory->RegisterEffectFromString(CLSID_MotionBlur, MOTION_BLUR_XML, bindings, 1,
+                                               MotionBlurEffect::Create);
+        factory->Release();
+    }
+    if (FAILED(hr)) Logf("ERR", "运动模糊不可用（着色器编译或效果注册失败）");
+}
+
+static ID2D1RenderTarget* g_motionScreen = nullptr;   // target to return to while a motion layer is open
+static D2D1_VECTOR_2F     g_motionPx = { 0.0f, 0.0f };
+
+/* Content drawn between BeginMotionBlur and EndMotionBlur travels `blur` DIPs while the shutter is open.
+   When that is long enough to see, it goes to an offscreen layer and reaches the screen through the effect */
+static void BeginMotionBlur(D2D1_VECTOR_2F blur) {
+    float dpiX = 96.0f, dpiY = 96.0f;
+    g_rt->GetDpi(&dpiX, &dpiY);
+    g_motionPx = D2D1::Vector2F(blur.x * dpiX / 96.0f, blur.y * dpiY / 96.0f);
+    if (fabsf(g_motionPx.x) + fabsf(g_motionPx.y) < 0.5f) return;
+    // Taps more than 2 px apart leave gaps that show as separate copies, so longer blur is shortened
+    const float length = sqrtf(g_motionPx.x * g_motionPx.x + g_motionPx.y * g_motionPx.y);
+    if (length > 2.0f * BLUR_MAX_TAPS) {
+        g_motionPx.x *= 2.0f * BLUR_MAX_TAPS / length;
+        g_motionPx.y *= 2.0f * BLUR_MAX_TAPS / length;
+    }
+
+    if (!g_blurFx) {
+        ID2D1DeviceContext* dc = nullptr;
+        if (SUCCEEDED(g_rt->QueryInterface(IID_PPV_ARGS(&dc)))) {
+            dc->CreateEffect(CLSID_MotionBlur, &g_blurFx);
+            dc->Release();
+        }
+    }
+    // The layer has to match the screen target in pixel size and DPI, which both follow the window
+    const D2D1_SIZE_U size = g_rt->GetPixelSize();
+    if (g_layerRt) {
+        const D2D1_SIZE_U have = g_layerRt->GetPixelSize();
+        float layerDpiX = 0.0f, layerDpiY = 0.0f;
+        g_layerRt->GetDpi(&layerDpiX, &layerDpiY);
+        if (have.width != size.width || have.height != size.height || layerDpiX != dpiX || layerDpiY != dpiY) {
+            g_layerRt->Release();
+            g_layerRt = nullptr;
+        }
+    }
+    if (!g_layerRt) g_rt->CreateCompatibleRenderTarget(&g_layerRt);
+    if (!g_blurFx || !g_layerRt) return;
+
+    g_motionScreen = g_rt;
+    g_rt = g_layerRt;
+    g_layerRt->BeginDraw();
+    g_layerRt->Clear(D2D1::ColorF(0, 0, 0, 0));
+}
+
+static void EndMotionBlur() {
+    if (!g_motionScreen) return;
+    g_layerRt->EndDraw();
+    g_rt = g_motionScreen;
+    g_motionScreen = nullptr;
+
+    ID2D1Bitmap* layer = nullptr;
+    ID2D1DeviceContext* dc = nullptr;
+    if (SUCCEEDED(g_layerRt->GetBitmap(&layer)) && SUCCEEDED(g_rt->QueryInterface(IID_PPV_ARGS(&dc)))) {
+        g_blurFx->SetInput(0, layer);
+        g_blurFx->SetValue(0, g_motionPx);
+        dc->DrawImage(g_blurFx);
+    }
+    if (dc) dc->Release();
+    if (layer) layer->Release();
 }
 
 /* ══════════════════════════════════════════
@@ -596,13 +838,13 @@ static int HitTile(POINT p) {
    ─────────────────────────────── */
 static std::mutex  g_decMutex;
 static std::deque<std::wstring> g_decQueue;
-static std::vector<std::pair<std::wstring, IWICFormatConverter*>> g_decDone;
+static std::vector<std::pair<std::wstring, IWICBitmapSource*>> g_decDone;
 static std::vector<std::thread> g_decThreads;
 static std::atomic<bool> g_decRun{ false };
-static std::set<std::wstring> g_decRequested;      // main thread only
+static std::unordered_set<std::wstring> g_decRequested;      // main thread only
 
-static IWICFormatConverter* DecodeScaled(IWICImagingFactory* wic,
-                                         const std::wstring& path, UINT maxSize) {
+static IWICBitmapSource* DecodeScaled(IWICImagingFactory* wic,
+                                      const std::wstring& path, UINT maxSize) {
     IWICBitmapDecoder* dec = nullptr;
     if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
                                               WICDecodeMetadataCacheOnDemand, &dec)))
@@ -626,20 +868,21 @@ static IWICFormatConverter* DecodeScaled(IWICImagingFactory* wic,
             src = scaler;
     }
 
+    // WIC decodes lazily when pixels are read; copying into an IWICBitmap reads them here on the worker
+    IWICBitmap* bmp = nullptr;
     IWICFormatConverter* conv = nullptr;
     if (SUCCEEDED(wic->CreateFormatConverter(&conv))) {
-        if (FAILED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA,
-                                    WICBitmapDitherTypeNone, nullptr, 0.0,
-                                    WICBitmapPaletteTypeCustom))) {
-            conv->Release();
-            conv = nullptr;
-        }
+        if (SUCCEEDED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA,
+                                       WICBitmapDitherTypeNone, nullptr, 0.0,
+                                       WICBitmapPaletteTypeCustom)))
+            wic->CreateBitmapFromSource(conv, WICBitmapCacheOnLoad, &bmp);
+        conv->Release();
     }
 
     if (scaler) scaler->Release();
     frame->Release();
     dec->Release();
-    return conv;
+    return bmp;
 }
 
 static void DecodeWorkerMain() {
@@ -660,10 +903,10 @@ static void DecodeWorkerMain() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        IWICFormatConverter* conv = wic ? DecodeScaled(wic, path, 320) : nullptr;
+        IWICBitmapSource* bmp = wic ? DecodeScaled(wic, path, 320) : nullptr;
         {
             std::lock_guard<std::mutex> lk(g_decMutex);
-            g_decDone.emplace_back(std::move(path), conv);
+            g_decDone.emplace_back(std::move(path), bmp);
         }
         g_coverDirty = true;            // tell the UI a new cover is ready
     }
@@ -953,18 +1196,6 @@ static void FetchPlaylistsAsync() {
     Logf("APP", "歌单列表拉取完成 %d 个", n);
 }
 /** Main thread: adopt downloaded covers into the cache */
-/** Is there any cover work left (the timer keeps redrawing while there is) */
-static bool CoverWorkPending() {
-    {
-        std::lock_guard<std::mutex> lk(g_covMx);
-        if (!g_covQueue.empty() || !g_covDone.empty()) return true;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_decMutex);
-        if (!g_decDone.empty()) return true;
-    }
-    return false;
-}
 
 static void DrainCovers() {
     std::vector<int> done;
@@ -1023,17 +1254,21 @@ static void StopDecoder() {
 
 /** Main thread: move decoded covers into the cache */
 static void DrainDecoded() {
-    std::vector<std::pair<std::wstring, IWICFormatConverter*>> tmp;
+    std::vector<std::pair<std::wstring, IWICBitmapSource*>> tmp;
     {
         std::lock_guard<std::mutex> lk(g_decMutex);
         if (g_decDone.empty()) return;
         tmp.swap(g_decDone);
     }
-    for (auto& p : tmp) { MarkCoverReady(p.first); g_coverSrcs.push_back({ std::move(p.first), p.second }); }
+    for (auto& p : tmp) {
+        // a decode queued before the cache was cleared can arrive after the first one, even after its upload
+        const bool have = g_coverBmps.count(p.first) || !g_coverSrcs.try_emplace(p.first, p.second).second;
+        if (have && p.second) p.second->Release();
+    }
     g_mouseDirty = true;              // a new cover is available, trigger a redraw
 }
 
-static IWICFormatConverter* CoverSource(const std::wstring& path);   // forward declaration
+static IWICBitmapSource* CoverSource(const std::wstring& path);   // forward declaration
 
 /** Whether all first-screen covers are decoded (used to wait a little longer on the splash) */
 static bool CoversReadyForFirstScreen() {
@@ -1055,14 +1290,20 @@ static void AdoptLocalCovers() {
     }
     if (adopted) Logf("APP", "复用本地封面 %d 张", adopted);
 }
+
+/* Each new cover bitmap is an upload to the GPU (about 0.2 ms), so a screen of fresh covers is
+   spread over several frames; covers still waiting show their placeholder */
+static const int COVER_UPLOADS_PER_FRAME = 4;
+static int g_coverUploads = 0;
+
 /* Pre-build D2D bitmaps so scrolling does not create and upload them on the spot */
-static IWICFormatConverter* CoverSource(const std::wstring& path);   // defined below
+static IWICBitmapSource* CoverSource(const std::wstring& path);   // defined below
 static CoverBmp* CoverEntry(const std::wstring& path);
 static size_t g_prewarmIdx = 0;
 static void PrewarmCovers(int budget) {
     if (!g_rt || g_app.songs.empty()) return;
     int made = 0;
-    while (g_prewarmIdx < g_app.songs.size() && made < budget) {
+    while (g_prewarmIdx < g_app.songs.size() && made < budget && g_coverUploads > 0) {
         const Song& s = g_app.songs[g_prewarmIdx++];
         if (s.cover.empty()) continue;
         if (!CoverSource(s.cover)) continue;      // not decoded yet, try again next round
@@ -1071,30 +1312,30 @@ static void PrewarmCovers(int budget) {
 }
 
 /** Get a cover (only once decoded) */
-static IWICFormatConverter* CoverSource(const std::wstring& path) {
-    if (path.empty()) return nullptr;
-    for (auto& c : g_coverSrcs) if (c.path == path) return c.conv;
-    return nullptr;
+static IWICBitmapSource* CoverSource(const std::wstring& path) {
+    auto it = g_coverSrcs.find(path);
+    return it == g_coverSrcs.end() ? nullptr : it->second;
 }
 
 static ID2D1Bitmap* CoverBitmap(const std::wstring& path);
 static CoverBmp* CoverEntry(const std::wstring& path) {
-    IWICFormatConverter* src = CoverSource(path);
+    auto it = g_coverBmps.find(path);
+    if (it != g_coverBmps.end()) return &it->second;
+    IWICBitmapSource* src = CoverSource(path);
     if (!src) {
         QueueDecode(path);           // not decoded yet: hand it to the background, draw the placeholder meanwhile
         return nullptr;
     }
-    for (auto& b : g_coverBmps)
-        if (b.src == src && b.rt == g_rt) return &b;
-
-    g_coverBmps.push_back({ src, g_rt, nullptr, nullptr });
+    if (!g_rt || g_coverUploads <= 0) { g_mouseDirty = true; return nullptr; }   // uploaded on a following frame
+    g_coverUploads--;
+    CoverBmp e;
+    if (FAILED(g_rt->CreateBitmapFromWicBitmap(src, nullptr, &e.bmp))) return nullptr;
+    // Only the GPU copy is drawn from here on; if the render target is replaced, the file is decoded again
+    src->Release();
+    g_coverSrcs.erase(path);
+    g_decRequested.erase(path);
     MarkCoverReady(path);
-    CoverBmp& e = g_coverBmps.back();
-    if (FAILED(g_rt->CreateBitmapFromWicBitmap(src, nullptr, &e.bmp))) {
-        g_coverBmps.pop_back();
-        return nullptr;
-    }
-    return &e;
+    return &g_coverBmps.emplace(path, e).first->second;
 }
 
 /** Fill a rounded rect with a bitmap brush — no Layer, an order of magnitude faster than PushLayer */
@@ -1198,7 +1439,7 @@ static float ToastFade(ULONGLONG at, float life, float& dy) {
     dy = 0.0f;
     if (g_toastOverride >= 0.0f) { dy = 0.0f; return g_toastOverride; }
     if (!at) return 0.0f;
-    float t = (float)(GetTickCount64() - at) / 1000.0f;
+    float t = (float)(NowMs() - at) / 1000.0f;
     if (t < 0.0f || t > life) return 0.0f;
 
     const float inT = 0.18f, outT = 0.30f;   // note: IN/OUT are SDK macros and cannot be used as variable names
@@ -1213,7 +1454,7 @@ static float ToastFade(ULONGLONG at, float life, float& dy) {
     }
     return a < 0.0f ? 0.0f : a;
 }
-static void TogToast(const std::wstring& s) { g_togMsg = s; g_togMsgAt = GetTickCount64(); }
+static void TogToast(const std::wstring& s) { g_togMsg = s; g_togMsgAt = NowMs(); }
 static bool         g_loginChoose = false;   // show the "choose Kugou/NetEase" mini panel
 static bool         g_loginAsked  = false;   // auto-opened once already; avoid repeated popups
 static std::wstring g_settingsMsg;
@@ -1231,7 +1472,7 @@ static int          g_vipType = 0;
 
 static void SettingsToast(const wchar_t* msg) {
     g_settingsMsg = msg;
-    g_settingsMsgAt = GetTickCount64();
+    g_settingsMsgAt = NowMs();
 }
 
 static ULONGLONG FileStamp(const std::wstring& p) {
@@ -1263,14 +1504,13 @@ static void ClearCache() {
     if (!GetFullPathNameW(rel.c_str(), MAX_PATH, full, nullptr)) wcscpy(full, rel.c_str());
     std::wstring dir = full;
 
-    // 1) release the in-memory bitmaps first (otherwise the WIC decoder still holds the files and they cannot be deleted)
-    for (auto& b : g_coverBmps) {
-        if (b.brush) b.brush->Release();
-        if (b.bmp) b.bmp->Release();
+    // 1) drop the covers held in memory; songs download and decode them again on demand
+    for (auto& entry : g_coverBmps) {
+        if (entry.second.brush) entry.second.brush->Release();
+        if (entry.second.bmp) entry.second.bmp->Release();
     }
     g_coverBmps.clear();
-    // critical: WIC format converters hold file handles; without releasing them DeleteFile fails with 32 (in use)
-    for (auto& c : g_coverSrcs) if (c.conv) c.conv->Release();
+    for (auto& entry : g_coverSrcs) if (entry.second) entry.second->Release();
     g_coverSrcs.clear();
     g_decRequested.clear();
     for (auto& s : g_app.songs) s.cover.clear();
@@ -1941,18 +2181,9 @@ static void DrawGrid() {
     // Fetch covers on demand for viewport songs that lack one
     RequestVisibleCovers();
 
+    // The clip stays on the screen target, so tiles just outside it can still blur into view
     g_rt->PushAxisAlignedClip(D2D1::RectF(0, GRID_TOP - 10, W, H), D2D1_ANTIALIAS_MODE_ALIASED);
-
-    // Motion blur: take the larger of remaining distance and instantaneous speed, so the glide always leaves a trail
-    float glide = std::fabs(a.scrollTarget - a.scroll);
-    float bDist = (std::min)(1.0f, glide / 80.0f);
-    float bVel = (std::min)(1.0f, g_scrollVel / 1400.0f);
-    float blur = (std::max)(bDist, bVel);
-    float blurDir = (a.scrollTarget >= a.scroll) ? 1.0f : -1.0f;
-
-    const bool blurOn = blur > 0.04f;
-    const float step = 3.0f + 9.0f * blur;          // trail is ~60px at max speed
-    const float ghostA[5] = { 0.30f, 0.24f, 0.18f, 0.12f, 0.07f };
+    BeginMotionBlur(g_gridBlur);
 
     // Enter progress: 0→1.45 is the "fly in from the right one by one" run
     const bool entering = (g_gridEnter < 0.999f);
@@ -1979,14 +2210,6 @@ static void DrawGrid() {
                 enterDx = (1.0f - e) * (W + 60.0f - d.x);        // flies in from the right edge
             }
 
-            if (blurOn && !isHover && !entering) {
-                for (int k = 5; k >= 1; k--) {
-                    g_alphaMul = ghostA[k - 1] * blur;
-                    DrawTile(Rc(d.x, ty + blurDir * k * step, d.w, d.h), a.songs[i], i, 0.0f);
-                }
-                g_alphaMul = 1.0f;
-            }
-
             float keep = g_alphaMul;
             g_alphaMul = keep * enterA;
             DrawTile(Rc(d.x + enterDx, ty, d.w, d.h), a.songs[i], i, isHover ? a.tileAnim[i] : 0.0f);
@@ -1994,7 +2217,7 @@ static void DrawGrid() {
         }
     }
 
-    g_alphaMul = 1.0f;
+    EndMotionBlur();
     g_rt->PopAxisAlignedClip();
 }
 
@@ -3971,6 +4194,8 @@ static void PlCenterContent() {
     g_app.plSelT = 0.0f;
     g_app.plHover = -1;
     PlClampPan();
+    g_plLastX = g_app.plX;           // a jump, not motion: no blur on the next frame
+    g_plLastY = g_app.plY;
 }
 
 /* Offset by which other discs are pushed away after selection */
@@ -4062,7 +4287,7 @@ static void DrawPlaylistPicker() {
     // Playlist is loading: show a hint at the bottom so it doesn't look broken
     if (g_plBusy.load()) {
         FillRect(Rc(0, UI::TITLE_H, W, H - UI::TITLE_H), UI::BG, 0.55f);
-        DrawSpinner(W * 0.5f, H * 0.5f - 10.0f, 20.0f, (float)(GetTickCount64() % 4000) * 0.26f, 0.95f);
+        DrawSpinner(W * 0.5f, H * 0.5f - 10.0f, 20.0f, (float)(NowMs() % 4000) * 0.26f, 0.95f);
         int sel = a.plActive;
         if (sel >= 0 && sel < n) {
             Text(a.playlists[(size_t)sel].name, Fmt(13.0f, DWRITE_FONT_WEIGHT_NORMAL),
@@ -4206,6 +4431,7 @@ static void DrawPlaylistPicker() {
 
     // Unselected discs: fade out as the card expands ("fade everything else" of Container Transform)
     float othersA = 1.0f - selE * 0.92f;
+    BeginMotionBlur(g_plBlur);
     for (int i = 0; i < n; i++) {
         if (i == a.plActive) continue;                 // The selected one is represented by the card avatar instead
         float cx = 0, cy = 0;
@@ -4236,6 +4462,7 @@ static void DrawPlaylistPicker() {
         Hit h; h.r = Rc(cx - rd, cy - rd, rd * 2, rd * 2); h.kind = HK_PL; h.index = i;
         if (g_alpha > 0.5f && a.plActive < 0) a.hits.push_back(h);   // faded out once selected
     }
+    EndMotionBlur();
 
     // Selected item's avatar: slides with the card from the disc center to the card's left
     if (selIdx >= 0 && selIdx < n && selE > 0.01f) {
@@ -4318,6 +4545,7 @@ static void DrawIntro() {
 
 static void DrawUI(ID2D1RenderTarget* rt) {
     Bind(rt);
+    g_coverUploads = g_snapUI ? INT_MAX : COVER_UPLOADS_PER_FRAME;   // a screenshot is a single frame
     {   // Theme changed: rebuild the placeholder gradient too
         static int lastGen = -1;
         if (lastGen != ThemeGeneration()) {
@@ -4484,10 +4712,11 @@ static void DrawUI(ID2D1RenderTarget* rt) {
    ══════════════════════════════════════════ */
 /** Real elapsed seconds (animation time must not accumulate a fixed 16ms, or it stretches at low frame rates) */
 static float DeltaSeconds() {
-    static ULONGLONG last = 0;
-    ULONGLONG now = GetTickCount64();
-    if (last == 0) { last = now; return 0.016f; }
-    float dt = (float)(now - last) / 1000.0f;
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last;
+    const Clock::time_point now = Clock::now();
+    if (last == Clock::time_point()) { last = now; return 0.016f; }
+    float dt = std::chrono::duration<float>(now - last).count();
     last = now;
     if (dt > 0.10f) dt = 0.10f;      // On hitches, don't let the animation jump too far
     return dt;
@@ -4854,7 +5083,7 @@ static bool Animate() {
 
     // Keep redrawing while a toast is alive, or its fade won't animate
     {
-        ULONGLONG nowT2 = GetTickCount64();
+        ULONGLONG nowT2 = NowMs();
         if (g_settingsMsgAt && nowT2 - g_settingsMsgAt < 5500) need = true;
         if (g_togMsgAt      && nowT2 - g_togMsgAt      < 6500) need = true;
     }
@@ -4946,12 +5175,14 @@ static bool Animate() {
         }
 
         if (!a.plDragging) {
-            // Inertia
+            // Inertia: the velocity is per 16 ms step; scaling by dt keeps the glide the same at any frame rate
             if (a.plActive < 0) {
-                a.plX += a.plVelX;
-                a.plY += a.plVelY;
-                a.plVelX *= 0.90f;
-                a.plVelY *= 0.90f;
+                const float steps = dt * 62.5f;
+                const float decay = powf(0.90f, steps);
+                a.plX += a.plVelX * steps;
+                a.plY += a.plVelY * steps;
+                a.plVelX *= decay;
+                a.plVelY *= decay;
                 if (fabsf(a.plVelX) < 0.25f) a.plVelX = 0.0f;
                 if (fabsf(a.plVelY) < 0.25f) a.plVelY = 0.0f;
                 if (a.plVelX != 0.0f || a.plVelY != 0.0f) need = true;
@@ -4994,6 +5225,10 @@ static bool Animate() {
             }
         }
     }
+    // Dragging moves the pan between steps as well, so blur covers all travel since the last step
+    g_plBlur = D2D1::Vector2F((a.plX - g_plLastX) * SHUTTER, (a.plY - g_plLastY) * SHUTTER);
+    g_plLastX = a.plX;
+    g_plLastY = a.plY;
 
     // Panel enter/exit progress
     {
@@ -5036,8 +5271,10 @@ static bool Animate() {
         }
     }
 
-    // Smooth scrolling: actual position eases toward target (frame-rate independent)
+    // Smooth scrolling: actual position eases toward target (frame-rate independent).
+    // The blur follows this step only, so jumps such as loading another playlist stay sharp
     {
+        const float before = a.scroll;
         float d = a.scrollTarget - a.scroll;
         if (std::fabs(d) > 0.4f) {
             a.scroll += d * Ease(0.22f, dt);
@@ -5046,15 +5283,14 @@ static bool Animate() {
             a.scroll = a.scrollTarget;
             need = true;
         }
+        g_gridBlur = D2D1::Vector2F(0.0f, (before - a.scroll) * SHUTTER);
     }
-
-    // Scroll velocity -> motion blur strength
+    // Content that has stayed still for a moment is drawn once more without blur. Pointer input slower
+    // than the display moves it only every other frame, and the wait keeps those frames from flickering
     {
-        float moved = a.scroll - g_prevScroll;
-        g_prevScroll = a.scroll;
-        float v = std::fabs(moved) / ((dt > 1e-4f) ? dt : 0.016f);
-        g_scrollVel += (v - g_scrollVel) * 0.45f;
-        if (g_scrollVel < 3.0f) g_scrollVel = 0.0f;
+        static ULONGLONG lastMoved = 0;
+        if (g_gridBlur.y != 0.0f || g_plBlur.x != 0.0f || g_plBlur.y != 0.0f) lastMoved = NowMs();
+        else if (lastMoved && NowMs() - lastMoved > 30) { lastMoved = 0; need = true; }
     }
 
     float target = (a.page == Page::Player) ? 1.0f : 0.0f;
@@ -5374,16 +5610,22 @@ static bool GfxInit() {
                                    reinterpret_cast<IUnknown**>(&g_dw)))) return false;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&g_wic)))) return false;
+    RegisterMotionBlur();
     return true;
 }
 
 static void GfxRelease() {
-    for (auto& e : g_fmts) if (e.f) e.f->Release();
+    for (auto& entry : g_fmts) entry.second->Release();
     g_fmts.clear();
-    for (auto& b : g_coverBmps) if (b.bmp) b.bmp->Release();
+    for (auto& entry : g_coverBmps) {
+        if (entry.second.brush) entry.second.brush->Release();
+        if (entry.second.bmp) entry.second.bmp->Release();
+    }
     g_coverBmps.clear();
-    for (auto& c : g_coverSrcs) if (c.conv) c.conv->Release();
+    for (auto& entry : g_coverSrcs) if (entry.second) entry.second->Release();
     g_coverSrcs.clear();
+    if (g_blurFx)  { g_blurFx->Release();  g_blurFx = nullptr; }
+    if (g_layerRt) { g_layerRt->Release(); g_layerRt = nullptr; }
     for (int i = 0; i < 8; i++) {
         if (g_covBrush[i]) { g_covBrush[i]->Release(); g_covBrush[i] = nullptr; }
     }
@@ -6043,9 +6285,9 @@ static POINT DipPoint(LPARAM lp) {
     p.y = (LONG)lroundf((float)p.y / g_dpiScale);
     return p;
 }
-static void Paint(HWND hwnd) {
-    PAINTSTRUCT ps;
-    BeginPaint(hwnd, &ps);
+/* Draws one frame and returns whether it reached the screen. EndDraw (with D2D1_PRESENT_OPTIONS_NONE)
+   waits for the next vertical blank, so frames drawn back to back follow the display's refresh rate */
+static bool Render(HWND hwnd) {
     ++g_paintCount;
 
     RECT rc;
@@ -6080,10 +6322,85 @@ static void Paint(HWND hwnd) {
             g_hwndRt->Release();
             g_hwndRt = nullptr;
             g_rt = nullptr;
-        } else {
-            // Don't wait for vsync here: DwmFlush blocks the UI thread and makes things stutter more
         }
     }
+    return g_hwndRt != nullptr;   // false also while the target cannot be created, such as during a device reset
+}
+
+/* A window in the background draws about 60 frames per second, each shown for the same whole number of
+   display refreshes. The next frame is drawn early in the last refresh before the vertical blank it is for */
+static LONGLONG g_nextFrameQpc = 0;   // a window in the background may draw again from this QPC time
+static LONGLONG QpcFrequency() {
+    static const LONGLONG f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x.QuadPart; }();
+    return f;
+}
+static void ScheduleBackgroundFrame() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    DWM_TIMING_INFO ti = {};
+    ti.cbSize = sizeof(ti);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &ti)) || !ti.qpcRefreshPeriod) {
+        g_nextFrameQpc = now.QuadPart + QpcFrequency() / 60;
+        return;
+    }
+    const LONGLONG period = (LONGLONG)ti.qpcRefreshPeriod;
+    const LONGLONG refreshes = (std::max)(1LL, std::llround((double)QpcFrequency() / period / 60.0));
+    // The frame just presented appears on the next vertical blank
+    const LONGLONG sinceBlank = ((now.QuadPart - (LONGLONG)ti.qpcVBlank) % period + period) % period;
+    const LONGLONG shown = now.QuadPart - sinceBlank + period;
+    g_nextFrameQpc = shown + (refreshes - 1) * period + period / 4;
+}
+
+/* Advances animation and background work by one step, then draws a frame if anything changed.
+   Returns how long the caller may sleep: 0 after drawing a frame, INFINITE when no frame is waiting */
+static DWORD Tick(HWND hwnd) {
+    const bool background = GetForegroundWindow() != hwnd;
+    if (background) {
+        // Stepping only when the frame is due makes each step, and so the motion blur, span the whole frame
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < g_nextFrameQpc) return (DWORD)((g_nextFrameQpc - now.QuadPart) * 1000 / QpcFrequency() + 1);
+    }
+    bool need = Animate();
+    if (g_mouseDirty) { g_mouseDirty = false; need = true; }
+    if (g_coverDirty.exchange(false)) need = true;   // a cover was decoded in the background, repaint once
+    static int shownLogin = 0;                       // worker threads update the login state; repaint to show the hint
+    if (g_loginState != shownLogin) { shownLogin = g_loginState; need = true; }
+    if (g_coverFading) { g_coverFading = false; need = true; }
+    size_t bmpsBefore = g_coverBmps.size();
+    if (g_app.page == Page::Grid) PrewarmCovers(2);   // only prewarm on the song grid
+    if (g_coverBmps.size() != bmpsBefore) need = true;
+    if (g_showFps) {
+        static ULONGLONG last = 0;
+        ULONGLONG now = GetTickCount64();
+        if (last == 0) last = now;
+        if (now - last >= 1000) {
+            wchar_t buf[64];
+            swprintf(buf, 64, L"Floral  fps=%d", g_paintCount);
+            SetWindowTextW(hwnd, buf);
+            g_paintCount = 0;
+            last = now;
+        }
+    }
+    if (!need) return INFINITE;
+    // A hidden, minimized or occluded window does not wait for the vertical blank, and neither does a frame
+    // that fails to draw, so the loop would spin. The frame stays requested until it reaches the screen
+    if (IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+        !(g_hwndRt && (g_hwndRt->CheckWindowState() & D2D1_WINDOW_STATE_OCCLUDED)) && Render(hwnd)) {
+        if (background) ScheduleBackgroundFrame();
+        return 0;
+    }
+    g_mouseDirty = true;
+    return INFINITE;
+}
+
+/* The system asks for a frame, for example after InvalidateRect or when the window is uncovered.
+   It goes through Tick so that animation steps first and the frame does not repeat the previous one */
+static void Paint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    BeginPaint(hwnd, &ps);
+    g_mouseDirty = true;
+    Tick(hwnd);
     EndPaint(hwnd, &ps);
 }
 
@@ -6241,7 +6558,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.mouse.x = mx;
             g_app.mouse.y = my;
             g_hoverArmed = true;      // mouse moved, re-enable hover zoom
-            g_mouseDirty = true;      // don't repaint directly, let the timer throttle it
+            g_mouseDirty = true;
         }
         return 0;
     }
@@ -6371,7 +6688,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_app.scrollTarget > g_app.maxScroll) g_app.scrollTarget = g_app.maxScroll;
         g_hoverArmed = false;         // no hover pop-open during or after scrolling
         g_app.hoverTile = -1;
-        g_mouseDirty = true;          // let the timer drive the animation
+        g_mouseDirty = true;
         return 0;
     }
 
@@ -6461,33 +6778,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_TIMER: {
-
-        bool need = Animate();
-        if (g_mouseDirty) { g_mouseDirty = false; need = true; }
-        if (g_coverDirty.exchange(false)) need = true;   // a cover was decoded in the background, repaint once
-        static int shownLogin = 0;                       // worker threads update the login state; repaint to show the hint
-        if (g_loginState != shownLogin) { shownLogin = g_loginState; need = true; }
-        if (!need && CoverWorkPending()) need = true;    // covers still queued/downloading/decoding
-        size_t bmpsBefore = g_coverBmps.size();
-        if (g_app.page == Page::Grid) PrewarmCovers(2);   // only prewarm on the song grid
-        if (g_coverBmps.size() != bmpsBefore) need = true;
-        if (!IsWindowVisible(hwnd)) need = false;      // hidden in the tray, no need to repaint
-        if (need) InvalidateRect(hwnd, nullptr, FALSE);
-        if (g_showFps) {
-            static ULONGLONG last = 0;
-            ULONGLONG now = GetTickCount64();
-            if (last == 0) last = now;
-            if (now - last >= 1000) {
-                wchar_t buf[64];
-                swprintf(buf, 64, L"Floral  fps=%d", g_paintCount);
-                SetWindowTextW(hwnd, buf);
-                g_paintCount = 0;
-                last = now;
-            }
-        }
+    case WM_TIMER:
+        Tick(hwnd);
         return 0;
-    }
 
     case WM_SIZE:
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -6873,9 +7166,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     if (toastT >= 0.0f) {
         g_toastOverride = toastT;
         g_settingsMsg = L"歌单已更新";     // fabricate a toast for the screenshot
-        g_settingsMsgAt = GetTickCount64();
+        g_settingsMsgAt = NowMs();
         g_togMsg = std::wstring(T(L"已和 ", L"Connected with ")) + L"朋友的电脑";
-        g_togMsgAt = GetTickCount64();
+        g_togMsgAt = NowMs();
     }
     if (textT >= 0.0f) {
         g_textT = textT;
@@ -6939,12 +7232,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     }
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
-    SetTimer(hwnd, 1, 8, nullptr);   // 8ms keeps vsync
+    // Keeps animation and background work going while the loop below sleeps, the window is hidden,
+    // or a modal loop (window drag, tray menu) holds the thread
+    SetTimer(hwnd, 1, 8, nullptr);
 
+    // While anything animates, each pass draws a frame and EndDraw paces it to the display;
+    // otherwise the thread sleeps until a message, the timer or the next background frame arrives
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    for (;;) {
+        if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        } else if (DWORD wait = Tick(hwnd)) {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, wait, QS_ALLINPUT);
+        }
     }
 
     if (g_hwndRt) g_hwndRt->Release();
