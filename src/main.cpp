@@ -2518,17 +2518,15 @@ static std::string HttpGet(const std::wstring& url) {
     return out;
 }
 
-/* ── Embedded resources: service exe + default playlist data ── */
-static bool ReadRes(int id, std::string& out) {
+/* ── Embedded resources: the data stays in the mapped exe image and is read from disk only when touched ── */
+static bool FindRes(int id, const void*& data, DWORD& size) {
     HRSRC h = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
     if (!h) return false;
     HGLOBAL g = LoadResource(nullptr, h);
     if (!g) return false;
-    DWORD sz = SizeofResource(nullptr, h);
-    const void* p = LockResource(g);
-    if (!p || !sz) return false;
-    out.assign((const char*)p, (size_t)sz);
-    return true;
+    size = SizeofResource(nullptr, h);
+    data = LockResource(g);
+    return data && size;
 }
 
 
@@ -2650,20 +2648,21 @@ static void EnsureSidecar() {
     // Kugou: embedded single-file pkg exe, no node needed
     if (PortListening(3000)) return;
 
-    std::string bytes;
-    if (!ReadRes(IDR_KUGOU_API, bytes) || bytes.size() < 100000) return;
+    const void* data = nullptr;
+    DWORD size = 0;
+    if (!FindRes(IDR_KUGOU_API, data, size) || size < 100000) return;
 
     std::wstring dir = LocalDir();
     std::wstring exe = dir + L"\\kugou-api.exe";
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
     bool need = !GetFileAttributesExW(exe.c_str(), GetFileExInfoStandard, &fad) ||
-                fad.nFileSizeLow != (DWORD)bytes.size();
+                fad.nFileSizeLow != size;
     if (need) {
         FILE* f = nullptr;
         _wfopen_s(&f, exe.c_str(), L"wb");
         if (!f) return;
-        fwrite(bytes.data(), 1, bytes.size(), f);
+        fwrite(data, 1, size, f);
         fclose(f);
     }
 
@@ -7056,8 +7055,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
     LoadPlaylists();
     AdoptLocalCovers(g_app.songs);   // only fills in paths, no decoding: startup no longer loads song covers
-    // First screen only waits for the playlist list; the song list and covers are fetched when the user opens a playlist
-    if (!g_token.empty()) g_bootRefreshPending = true;
+    // The first screen waits for the playlist list only when none is cached; a cached list shows at once
+    // and the refresh below replaces it if it changed
+    if (!g_token.empty() && g_app.playlists.empty()) g_bootRefreshPending = true;
     std::thread([]() {
         EnsureSidecar();
         CheckLoginAsync();
