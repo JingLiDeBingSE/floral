@@ -56,19 +56,18 @@ static std::wstring Trim(const std::wstring& s) {
 
 std::wstring g_likesName = L"kugou-likes.tsv";
 
-void InitData() {
-    g_app.songs.clear();
+std::vector<Song> ReadSongs(const std::wstring& name) {
+    std::vector<Song> songs;
 
     std::string bytes;
-    std::wstring path = FindAsset(g_likesName);
+    std::wstring path = FindAsset(name);
 
     if (!path.empty()) {
         std::ifstream f(path.c_str(), std::ios::binary);
         if (f) bytes.assign((std::istreambuf_iterator<char>(f)),
                             std::istreambuf_iterator<char>());
     }
-    if (bytes.empty()) return;        // no playlist: stay empty, fetch after login
-    if (bytes.empty()) return;
+    if (bytes.empty()) return songs;        // no playlist: stay empty, fetch after login
 
     if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF &&
         (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF)
@@ -111,8 +110,12 @@ void InitData() {
             s.coverUrl.assign(u.begin(), u.end());
         }
         if (s.title.empty()) continue;
-        g_app.songs.push_back(s);
+        songs.push_back(s);
     }
+    return songs;
+}
 
+void InitData() {
+    g_app.songs = ReadSongs(g_likesName);
     g_app.tileAnim.assign(g_app.songs.size(), 0.0f);
 }

@@ -36,6 +36,7 @@
 #include <atomic>
 #include <algorithm>
 #include <exception>
+#include <optional>
 
 App g_app;
 static HWND g_hwnd = nullptr;      // main window (drives explicit redraws)
@@ -1027,10 +1028,10 @@ static void LoadPlaylists() {
         if (s.empty()) continue;
         if (first && s.rfind("name\t", 0) == 0) { first = false; continue; }   // header row
         first = false;
-        // name \t gcid \t count \t coverUrl
+        // name \t gcid \t count \t coverUrl \t ver
         std::vector<std::string> col;
         size_t p = 0;
-        while (col.size() < 4) {
+        while (col.size() < 5) {
             size_t q = s.find('\t', p);
             if (q == std::string::npos) { col.push_back(s.substr(p)); break; }
             col.push_back(s.substr(p, q - p));
@@ -1044,6 +1045,7 @@ static void LoadPlaylists() {
         pl.gcid = col[1];
         pl.count = (col.size() > 2) ? atoi(col[2].c_str()) : 0;
         pl.coverUrl = (col.size() > 3) ? col[3] : "";
+        pl.ver = (col.size() > 4) ? atoi(col[4].c_str()) : 0;
         g_app.playlists.push_back(std::move(pl));
     }
     fclose(f);
@@ -1054,7 +1056,7 @@ static void SavePlaylists() {
     FILE* f = nullptr;
     _wfopen_s(&f, PlaylistsFile().c_str(), L"wb");
     if (!f) return;
-    fputs("name\tgcid\tcount\tcoverUrl\n", f);
+    fputs("name\tgcid\tcount\tcoverUrl\tver\n", f);
     for (const Playlist& pl : g_app.playlists) {
         std::string name;
         int n = WideCharToMultiByte(CP_UTF8, 0, pl.name.c_str(), (int)pl.name.size(),
@@ -1062,7 +1064,7 @@ static void SavePlaylists() {
         name.resize((size_t)n);
         WideCharToMultiByte(CP_UTF8, 0, pl.name.c_str(), (int)pl.name.size(),
                             &name[0], n, nullptr, nullptr);
-        fprintf(f, "%s\t%s\t%d\t%s\n", name.c_str(), pl.gcid.c_str(), pl.count, pl.coverUrl.c_str());
+        fprintf(f, "%s\t%s\t%d\t%s\t%d\n", name.c_str(), pl.gcid.c_str(), pl.count, pl.coverUrl.c_str(), pl.ver);
     }
     fclose(f);
 }
@@ -1129,12 +1131,23 @@ static void FetchPlaylistsAsync() {
         pl.gcid = kp.gcid;
         pl.count = kp.count;
         pl.coverUrl = kp.coverUrl;
+        pl.ver = kp.ver;
         pl.isDefault = kp.isDefault;
         g_plPending.push_back(std::move(pl));
     }
     g_plReady = true;
     g_bootRefreshPending = false;       // the first screen waits on this alone
     Logf("APP", "歌单列表拉取完成 %d 个", n);
+}
+
+/* Fetches the playlist list again in the background; a playlist whose version changed has outdated cached tracks */
+static void RefreshPlaylistsAsync() {
+    static std::atomic<bool> running{ false };
+    if (g_token.empty() || running.exchange(true)) return;
+    std::thread([] {
+        FetchPlaylistsAsync();
+        running = false;
+    }).detach();
 }
 /** Main thread: adopt downloaded covers into the cache */
 
@@ -1218,10 +1231,9 @@ static bool CoversReadyForFirstScreen() {
 }
 /** Re-adopt covers already on disk into s.cover and queue them for decoding
     Previously only column 5 of the TSV was trusted, but exported tsv leaves it empty, so already-downloaded covers were treated as missing */
-static void AdoptLocalCovers() {
+static void AdoptLocalCovers(std::vector<Song>& songs) {
     int adopted = 0;
-    for (int i = 0; i < (int)g_app.songs.size(); i++) {
-        Song& s = g_app.songs[(size_t)i];
+    for (Song& s : songs) {
         if (!s.cover.empty() || s.hash.empty()) continue;
         std::wstring p = AssetDir() + L"\\covers\\" +
                          std::wstring(s.hash.begin(), s.hash.end()) + L".jpg";
@@ -3931,81 +3943,181 @@ static void DrawPlayerPage() {
     g_alphaMul = 1.0f;      // Restore, so the title bar isn't affected
 }
 
-/* ── Playlist selected: fetch tracks in the background → swap playlist on the main thread ── */
+/* ── Playlist selected: tracks load on a worker thread, the UI thread swaps them in ──
+   Track lists are cached as pl-<gcid>.<list_ver>.tsv. The copy of the current version opens at once;
+   without one, an older copy opens while the current tracks are fetched, and they replace it on arrival */
 static std::string PlSafe(const std::string& s) {
     std::string r = s;
     for (char& c : r) if (!(isalnum((unsigned char)c) || c == '_' || c == '-')) c = '_';
     return r;
 }
 
-static std::mutex      g_plSwapMx;
-static std::atomic<bool> g_plBusy{ false };
-static std::wstring    g_plSwapFile;       // Name of the fetched tsv file
-static int             g_plSwapIdx = -1;
-static std::wstring    g_plSwapErr;
-
-static void SelectPlaylistAsync(int idx) {
-    if (idx < 0 || idx >= (int)g_app.playlists.size()) return;
-    if (g_plBusy.exchange(true)) return;
-
-    std::string gcid = g_app.playlists[(size_t)idx].gcid;
+static std::wstring PlTracksFile(const std::string& gcid, int ver) {
     const std::string safe = PlSafe(gcid);          // Note: don't call begin/end on two temporaries
-    std::wstring name = L"pl-" + std::wstring(safe.begin(), safe.end()) + L".tsv";
-    std::wstring path = AssetDir() + L"\\" + name;
+    return L"pl-" + std::wstring(safe.begin(), safe.end()) + L"." + std::to_wstring(ver) + L".tsv";
+}
 
-    Logf("APP", "切换歌单 idx=%d %s", idx, Narrow(g_app.playlists[(size_t)idx].name).c_str());
-    std::thread([gcid, name, path, idx]() {
-        std::wstring err;
-        int n = KgExportPlaylist(g_token, g_userid, gcid, path, err);
-        {
+/* Names of every cached track file of a playlist, including the unversioned pl-<gcid>.tsv of older builds */
+static std::vector<std::wstring> PlCachedTracks(const std::string& gcid) {
+    const std::string safe = PlSafe(gcid);
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((AssetDir() + L"\\pl-" + std::wstring(safe.begin(), safe.end()) + L".*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return names;
+    do names.push_back(fd.cFileName); while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return names;
+}
+
+struct PlaylistTracks {
+    int seq = 0;                // open request this answers; 0 when it updates the playlist already shown
+    int idx = -1;
+    std::string gcid;
+    int ver = 0;                // version the request asked for
+    std::wstring file;
+    std::vector<Song> songs;
+    std::wstring err;           // nothing could be loaded
+};
+
+static std::mutex                  g_plSwapMx;
+static std::vector<PlaylistTracks> g_plArrived;          // written by workers, taken by the UI thread
+
+/* UI thread only */
+static int  g_plOpenSeq = 0;                              // latest open request
+static bool g_plWaiting = false;                          // the latest open request has no result yet
+static std::optional<PlaylistTracks> g_plOpened, g_plUpdated;
+static std::string g_plShownGcid;                         // playlist whose tracks are in g_app.songs
+static int         g_plShownVer = 0;
+
+/* seq > 0 opens the playlist; seq == 0 only refreshes the tracks of the playlist on screen */
+static void LoadPlaylistAsync(int idx, int seq) {
+    const Playlist& pl = g_app.playlists[(size_t)idx];
+    std::thread([idx, seq, gcid = pl.gcid, ver = pl.ver, count = pl.count,
+                 token = g_token, userid = g_userid]() mutable {
+        auto deliver = [&](const std::wstring& file, std::vector<Song> songs, const std::wstring& err) {
+            PlaylistTracks t;
+            t.seq = seq;
+            t.idx = idx;
+            t.gcid = gcid;
+            t.ver = ver;
+            t.file = file;
+            t.songs = std::move(songs);
+            t.err = err;
+            AdoptLocalCovers(t.songs);
             std::lock_guard<std::mutex> lk(g_plSwapMx);
-            if (n > 0) { g_plSwapFile = name; g_plSwapIdx = idx; g_plSwapErr.clear(); }
-            else       { g_plSwapErr = err; g_plSwapIdx = -1; }
+            g_plArrived.push_back(std::move(t));
+            g_coverDirty = true;
+        };
+
+        const std::wstring file = PlTracksFile(gcid, ver);
+        if (ver > 0) {
+            std::vector<Song> songs = ReadSongs(file);
+            if (!songs.empty()) {
+                deliver(file, std::move(songs), L"");
+                return;
+            }
         }
-        g_plBusy = false;
-        g_coverDirty = true;
+        if (seq > 0) {
+            for (const std::wstring& old : PlCachedTracks(gcid)) {
+                std::vector<Song> songs = ReadSongs(old);
+                if (songs.empty()) continue;
+                deliver(old, std::move(songs), L"");
+                seq = 0;                // the fetched tracks below replace this copy
+                break;
+            }
+        }
+
+        std::wstring err;
+        const ULONGLONG start = GetTickCount64();
+        const int n = KgExportPlaylist(token, userid, gcid, count, AssetDir() + L"\\" + file, err);
+        if (n <= 0) {
+            Logf("ERR", "拉取歌单失败: %s", Narrow(err).c_str());
+            if (seq > 0) deliver(L"", {}, err);
+            return;
+        }
+        Logf("APP", "拉取歌单 %d 首，用时 %llu ms", n, GetTickCount64() - start);
+        for (const std::wstring& old : PlCachedTracks(gcid))
+            if (old != file) DeleteFileW((AssetDir() + L"\\" + old).c_str());
+        deliver(file, ReadSongs(file), L"");
     }).detach();
 }
 
-/* Main thread: swap in the fetched playlist */
+static void SelectPlaylistAsync(int idx) {
+    if (idx < 0 || idx >= (int)g_app.playlists.size()) return;
+    Logf("APP", "切换歌单 idx=%d %s", idx, Narrow(g_app.playlists[(size_t)idx].name).c_str());
+    g_plWaiting = true;
+    LoadPlaylistAsync(idx, ++g_plOpenSeq);
+}
+
+/* Replaces g_app.songs with a loaded track list and resets the state that indexes into the old list */
+static void ShowTracks(PlaylistTracks& t) {
+    App& a = g_app;
+    g_likesName = t.file;
+    a.songs = std::move(t.songs);
+    a.tileAnim.assign(a.songs.size(), 0.0f);
+    g_covFlag.assign(a.songs.size(), 0);
+    g_prewarmIdx = 0;
+    { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }
+    a.current = -1;
+    a.hoverTile = -1;
+    g_plShownGcid = t.gcid;
+    g_plShownVer = t.ver;
+    EnsureBase(a.width, (int)a.songs.size());
+    EnsureTarget(a.width, (int)a.songs.size(), -1);
+}
+
+/* Main thread: swap in the loaded playlist */
 static void DrainPlaylistSwap() {
-    std::wstring file;
-    std::wstring err;
-    int idx = -1;
     {
         std::lock_guard<std::mutex> lk(g_plSwapMx);
-        if (!g_plSwapFile.empty()) { file = g_plSwapFile; idx = g_plSwapIdx; g_plSwapFile.clear(); }
-        else if (!g_plSwapErr.empty()) { err = g_plSwapErr; g_plSwapErr.clear(); }
+        for (PlaylistTracks& t : g_plArrived) {
+            if (t.seq > 0) {
+                if (t.seq != g_plOpenSeq) continue;          // superseded by a later open
+                g_plOpened = std::move(t);
+                g_plWaiting = false;
+            } else if (t.gcid == (g_plOpened ? g_plOpened->gcid : g_plShownGcid)) {
+                g_plUpdated = std::move(t);
+            }
+        }
+        g_plArrived.clear();
     }
-    if (!file.empty()) {
-        g_likesName = file;
-        InitData();
-        AdoptLocalCovers();
-        g_covFlag.assign(g_app.songs.size(), 0);
-        App& a = g_app;
-        a.current = -1;
+
+    App& a = g_app;
+    if (g_plOpened && g_plPhase != 1) {                 // the picker finishes its exit first
+        PlaylistTracks t = std::move(*g_plOpened);
+        g_plOpened.reset();
+        if (!t.err.empty()) {
+            Logf("ERR", "切换歌单失败: %s", Narrow(t.err).c_str());
+            g_plPhase = 0;                 // abort the transition, stay on the picker
+            g_plT = 0.0f;
+            g_gridEnter = 1.0f;
+            return;
+        }
+        ShowTracks(t);
         a.playing = false;
         a.pos = 0.0;
         a.scroll = 0.0f;
         a.scrollTarget = 0.0f;
-        // Precompute the grid layout now, while the loading ring still covers the screen:
-        // doing it on the first fly-in frame would freeze that frame for a visible moment
-        EnsureBase(a.width, (int)a.songs.size());
-        EnsureTarget(a.width, (int)a.songs.size(), -1);
-
         a.pageAnim = 0.0f;
         a.page = Page::Grid;
-        a.plActive = idx;
+        a.plActive = t.idx;
         // Hold the fly-in until the loading ring has faded out (phase 3 finishes it)
         g_gridEnter = (g_plPhase == 2) ? -1.0f : 0.0f;
         g_swapDone = true;
         g_coverDirty = true;
         Logf("APP", "歌单已切换：%d 首", (int)a.songs.size());
-    } else if (!err.empty()) {
-        Logf("ERR", "切换歌单失败: %s", Narrow(err).c_str());
-        g_plPhase = 0;                 // abort the transition, stay on the picker
-        g_plT = 0.0f;
-        g_gridEnter = 1.0f;
+    }
+
+    if (g_plUpdated && !g_plOpened) {
+        if (a.page == Page::Grid && (g_plPhase != 0 || g_gridEnter < 1.0f)) return;   // let the fly-in land first
+        // Once a song is picked, its index must stay valid; the next open reads the new tracks from the cache
+        if (a.page == Page::Grid && a.current < 0) {
+            ShowTracks(*g_plUpdated);
+            Logf("APP", "歌单已更新：%d 首", (int)a.songs.size());
+        } else {
+            g_likesName = g_plUpdated->file;    // older copies are deleted, so a reload by InitData reads this one
+        }
+        g_plUpdated.reset();
     }
 }
 /* ══════════════════════════════════════════
@@ -4225,17 +4337,6 @@ static void DrawPlaylistPicker() {
              Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
              Rc(0, cyE + 46, W, 20), UI::TEXT3, DWRITE_TEXT_ALIGNMENT_CENTER);
         return;
-    }
-
-    // Playlist is loading: show a hint at the bottom so it doesn't look broken
-    if (g_plBusy.load()) {
-        FillRect(Rc(0, UI::TITLE_H, W, H - UI::TITLE_H), UI::BG, 0.55f);
-        DrawSpinner(W * 0.5f, H * 0.5f - 10.0f, 20.0f, (float)(NowMs() % 4000) * 0.26f, 0.95f);
-        int sel = a.plActive;
-        if (sel >= 0 && sel < n) {
-            Text(a.playlists[(size_t)sel].name, Fmt(13.0f, DWRITE_FONT_WEIGHT_NORMAL),
-                 Rc(0, H * 0.5f + 26, W, 22), UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
     }
 
     const float R = PL_D * 0.5f;
@@ -4546,7 +4647,7 @@ static void DrawUI(ID2D1RenderTarget* rt) {
             float e = g_plT * g_plT * (3.0f - 2.0f * g_plT);   // smoothstep
             FillRect(Rc(0, (float)UI::TITLE_H, W, H - (float)UI::TITLE_H), UI::BG, e);
             // Last 30%: the ring fades in underneath, so there is no blank beat between them
-            if (g_plT > 0.70f) DrawPlLoader(W, H, (g_plT - 0.70f) / 0.30f);
+            if (g_plWaiting && g_plT > 0.70f) DrawPlLoader(W, H, (g_plT - 0.70f) / 0.30f);
         }
         // Page curtain: covers the picker while switching in or out
         if (g_curtainPhase != 0) {
@@ -4943,7 +5044,7 @@ static bool Animate() {
             InitData();
     Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
     LoadPlaylists();
-    AdoptLocalCovers();
+    AdoptLocalCovers(g_app.songs);
             g_covFlag.assign(g_app.songs.size(), 0);
             g_layoutCount = -1;
             g_layoutWidth = -1;
@@ -5057,8 +5158,6 @@ static bool Animate() {
         need = true;
     }
 
-    DrainPlaylistSwap();
-
     // Page curtain: cover the old page, swap, then reveal the new one
     if (g_curtainPhase != 0) {
         need = true;
@@ -5088,7 +5187,10 @@ static bool Animate() {
         need = true;
         if (g_plPhase == 1) {                       // wipe out, bottom to top
             g_plT += dt / 0.26f;
-            if (g_plT >= 1.0f) { g_plT = 0.0f; g_plPhase = 2; }
+            if (g_plT >= 1.0f) {
+                g_plT = 0.0f;
+                g_plPhase = g_plWaiting ? 2 : 0;    // tracks already loaded: fly in without the loading ring
+            }
         } else if (g_plPhase == 2) {                // loading ring
             g_plT += dt;
             if (g_swapDone && g_plT > 0.18f) { g_plT = 0.0f; g_plPhase = 3; }
@@ -5104,18 +5206,30 @@ static bool Animate() {
             }
         }
     }
+    // After the transition step: when the picker's exit ends this frame, the songs replace it in the same frame
+    DrainPlaylistSwap();
 
     // ── Playlist picker: merge background data, inertia, hover ──
     if (g_plReady.load()) {
         std::vector<Playlist> got;
         { std::lock_guard<std::mutex> lk(g_plMx); got.swap(g_plPending); }
         g_plReady = false;
-        if (!got.empty()) {
+        if (!got.empty() && got != a.playlists) {
             a.playlists = std::move(got);
             SavePlaylists();
             g_plCovAsked.clear();
             a.plHover = -1;
             need = true;
+            // The playlist on screen changed elsewhere: fetch it again so the new tracks replace the old ones
+            for (int i = 0; i < (int)a.playlists.size(); i++) {
+                const Playlist& pl = a.playlists[(size_t)i];
+                if (pl.gcid != g_plShownGcid) continue;
+                if (pl.ver != g_plShownVer) {
+                    g_plShownVer = pl.ver;
+                    LoadPlaylistAsync(i, 0);
+                }
+                break;
+            }
         }
     }
     if (a.page == Page::Playlists) {
@@ -5875,6 +5989,7 @@ static void GoPickerNow() {
     PlCenterContent();
     g_plEnter = 1.0f;          // the curtain does the reveal, so no double fade
     g_mouseDirty = true;
+    RefreshPlaylistsAsync();
 }
 
 static void GoGrid() {
@@ -5989,7 +6104,7 @@ static void OnClick(POINT p) {
             InitData();
     Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
     LoadPlaylists();
-    AdoptLocalCovers();
+    AdoptLocalCovers(g_app.songs);
             g_covFlag.assign(g_app.songs.size(), 0);
             g_layoutCount = -1;
             g_layoutWidth = -1;
@@ -6177,7 +6292,7 @@ static void OnClick(POINT p) {
             InitData();
     Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
     LoadPlaylists();
-    AdoptLocalCovers();
+    AdoptLocalCovers(g_app.songs);
             g_covFlag.assign(g_app.songs.size(), 0);
             g_layoutCount = -1;
             g_layoutWidth = -1;
@@ -6940,7 +7055,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     InitData();
     Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
     LoadPlaylists();
-    AdoptLocalCovers();          // only fills in paths, no decoding: startup no longer loads song covers
+    AdoptLocalCovers(g_app.songs);   // only fills in paths, no decoding: startup no longer loads song covers
     // First screen only waits for the playlist list; the song list and covers are fetched when the user opens a playlist
     if (!g_token.empty()) g_bootRefreshPending = true;
     std::thread([]() {

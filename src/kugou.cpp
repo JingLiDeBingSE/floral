@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <wininet.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -328,7 +329,7 @@ static std::string Clean(const std::string& s) {
 
 /* Forward declaration: fetch tracks by playlist id (defined below) */
 static int KgExportTracksByGcid(const std::string& token, const std::string& userid,
-                                const std::string& gcid,
+                                const std::string& gcid, int countHint,
                                 const std::wstring& outTsv, std::wstring& err);
 /* All playlists under the account */
 int KgFetchPlaylists(const std::string& token, const std::string& userid,
@@ -371,6 +372,8 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
             const JVal* cnt = p->get("count");
             if (!cnt) cnt = p->get("song_count");
             if (cnt) kp.count = (int)cnt->ll();
+            const JVal* ver = p->get("list_ver");
+            if (ver) kp.ver = (int)ver->ll();
             const JVal* pic = p->get("pic");
             if (pic) kp.coverUrl = pic->str();
             const JVal* def = p->get("is_def");
@@ -391,135 +394,168 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
 }
 
 /* Tracks of the specified playlist */
-int KgExportPlaylist(const std::string& token, const std::string& userid,
-                     const std::string& gcid, const std::wstring& outTsv, std::wstring& err) {
+int KgExportPlaylist(const std::string& token, const std::string& userid, const std::string& gcid,
+                     int countHint, const std::wstring& outTsv, std::wstring& err) {
     if (gcid.empty()) { err = L"歌单 id 为空"; return -1; }
-    return KgExportTracksByGcid(token, userid, gcid, outTsv, err);
+    return KgExportTracksByGcid(token, userid, gcid, countHint, outTsv, err);
 }
+
+/* TSV row for one track of /playlist/track/all; empty when the track has no title */
+static std::string TrackRow(const JVal* t, std::string& hash) {
+    if (!t || t->t != JVal::OBJ) return "";
+
+    // name looks like "artistA, artistB - actual title"; remark is a Chinese alias, don't use it as the title
+    const JVal* name2 = t->get("name");
+    std::string raw = name2 ? name2->str() : "";
+    size_t dash = raw.find(" - ");
+    std::string title = (dash == std::string::npos) ? raw : raw.substr(dash + 3);
+    if (title.empty()) {                      // fall back to remark only when name is missing
+        const JVal* remark = t->get("remark");
+        if (remark) title = remark->str();
+    }
+    title = Clean(title);
+    if (title.empty()) return "";
+
+    std::string artist;
+    const JVal* si = t->get("singerinfo");
+    if (si && si->t == JVal::ARR) {
+        for (int i = 0; i < si->count(); i++) {
+            const JVal* a = si->at(i);
+            const JVal* an = a ? a->get("name") : nullptr;
+            if (an && !an->str().empty()) {
+                if (!artist.empty()) artist += "、";
+                artist += an->str();
+            }
+        }
+    }
+
+    std::string album;
+    const JVal* ai = t->get("albuminfo");
+    const JVal* an2 = ai ? ai->get("name") : nullptr;
+    if (an2) album = an2->str();
+
+    const JVal* tl = t->get("timelen");
+    long long sec = tl ? (tl->ll() / 1000) : 0;
+
+    std::string cover;
+    const JVal* cv = t->get("cover");
+    if (cv) {
+        cover = cv->str();
+        size_t p = cover.find("{size}");
+        if (p != std::string::npos) cover.replace(p, 6, "400");
+    }
+
+    const JVal* h = t->get("hash");
+    hash = h ? h->str() : "";
+
+    const JVal* mid = t->get("mixsongid");
+    if (!mid) mid = t->get("add_mixsongid");
+    if (!mid) mid = t->get("audio_id");
+    long long mixId = mid ? mid->ll() : 0;
+
+    const JVal* aid = t->get("album_id");
+    long long albumId = aid ? aid->ll() : 0;
+
+    return Clean(title) + "\t" + Clean(artist) + "\t" + Clean(album) + "\t" +
+           std::to_string(sec) + "\t\t" + hash + "\t" + std::to_string(mixId) + "\t" +
+           std::to_string(albumId) + "\t" + cover + "\n";
+}
+
+static const int kTrackPageSize = 300;   // the service returns at most 300 tracks per page
+
+struct TrackPage {
+    int listed = 0;                                          // tracks in the response, rows without a title included
+    long long total = -1;                                    // track count of the whole playlist; -1 when absent
+    std::vector<std::pair<std::string, std::string>> rows;   // (hash, TSV row)
+};
+
+/* Fetches one page with up to 3 attempts. The service occasionally returns an empty list for a page
+   that has tracks, so an empty page is accepted only when the playlist's count places it past the end */
+static bool FetchTrackPage(const std::string& url, int page, TrackPage& out) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt) Sleep(150 + 120 * (DWORD)attempt);
+        JVal r;
+        if (!Json(Http(Wide(url + "&page=" + std::to_string(page))), r)) continue;
+        const JVal* d = r.get("data");
+        const JVal* songs = d ? (d->get("info") ? d->get("info")
+                              : (d->get("songs") ? d->get("songs") : d->get("lists"))) : nullptr;
+        if (!songs) continue;
+        const JVal* count = d->get("count");
+        const long long total = count ? count->ll() : -1;
+        const bool pastEnd = total >= 0 && (long long)(page - 1) * kTrackPageSize >= total;
+        if (songs->count() == 0 && !pastEnd) continue;
+
+        out.listed = songs->count();
+        out.total = total;
+        out.rows.clear();
+        for (int i = 0; i < songs->count(); i++) {
+            std::string hash;
+            std::string row = TrackRow(songs->at(i), hash);
+            if (!row.empty()) out.rows.emplace_back(std::move(hash), std::move(row));
+        }
+        return true;
+    }
+    return false;
+}
+
 /* Fetch all tracks by playlist id and write the TSV (shared by Likes / any playlist) */
 static int KgExportTracksByGcid(const std::string& token, const std::string& userid,
-                                const std::string& gcid,
+                                const std::string& gcid, int countHint,
                                 const std::wstring& outTsv, std::wstring& err) {
     std::string cookie = "token=" + token + ";userid=" + userid;
-    const std::string auth = "&cookie=" + UriEnc(cookie) + "&userid=" + userid +
-                             "&token=" + UriEnc(token) + "&timestamp=" +
-                             std::to_string(GetTickCount64());
-    auto api = [&](const std::string& path) {
-        return Http(Wide("http://127.0.0.1:3000" + path + auth));
-    };
-    (void)api;    // 2) fetch tracks and build the TSV directly — no JVal pointers kept, so no dangling after vector realloc
+    const std::string url = "http://127.0.0.1:3000/playlist/track/all?id=" + UriEnc(gcid) +
+                            "&pagesize=" + std::to_string(kTrackPageSize) +
+                            "&cookie=" + UriEnc(cookie) + "&userid=" + userid +
+                            "&token=" + UriEnc(token) + "&timestamp=" + std::to_string(GetTickCount64());
+
+    // Pages are requested in parallel, four at a time, so the wait is about as long as the slowest page.
+    // The count in the responses decides whether more pages remain; if any page fails, nothing is written
+    DWORD conns = 8;     // WinInet allows two connections per server by default; this raises it for the whole process
+    InternetSetOptionW(nullptr, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &conns, sizeof(conns));
+    std::vector<TrackPage> pages;
+    int want = countHint > 0 ? (countHint + kTrackPageSize - 1) / kTrackPageSize : 1;
+    while ((int)pages.size() < want) {
+        const int first = (int)pages.size();
+        pages.resize((size_t)want);
+        std::atomic<int>  next{ first };
+        std::atomic<bool> failed{ false };
+        auto fetch = [&] {
+            for (int i; !failed && (i = next++) < want;)
+                if (!FetchTrackPage(url, i + 1, pages[(size_t)i])) failed = true;
+        };
+        std::vector<std::thread> pool;
+        for (int k = 0; k < (std::min)(4, want - first); k++) pool.emplace_back(fetch);
+        for (std::thread& th : pool) th.join();
+        if (failed) { err = L"拉歌单失败（分页请求出错，已保留旧歌单）"; return -1; }
+
+        long long total = -1;
+        for (const TrackPage& p : pages) total = (std::max)(total, p.total);
+        if (total >= 0) want = (int)((total + kTrackPageSize - 1) / kTrackPageSize);
+        else if (pages.back().listed == kTrackPageSize) want++;   // no count: keep going while pages are full
+        want = (std::min)(want, 30);
+    }
+
     std::string out = "title\tartist\talbum\tseconds\tcover\thash\tmixsongid\talbum_id\tcoverUrl\n";
     int n = 0;
-
-    auto appendTo = [&](const JVal* t, std::string& dst, int& cnt) {
-        if (!t || t->t != JVal::OBJ) return;
-
-        // name looks like "artistA, artistB - actual title"; remark is a Chinese alias, don't use it as the title
-        const JVal* name2 = t->get("name");
-        std::string raw = name2 ? name2->str() : "";
-        size_t dash = raw.find(" - ");
-        std::string title = (dash == std::string::npos) ? raw : raw.substr(dash + 3);
-        if (title.empty()) {                      // fall back to remark only when name is missing
-            const JVal* remark = t->get("remark");
-            if (remark) title = remark->str();
-        }
-        title = Clean(title);
-        if (title.empty()) return;
-
-        std::string artist;
-        const JVal* si = t->get("singerinfo");
-        if (si && si->t == JVal::ARR) {
-            for (int i = 0; i < si->count(); i++) {
-                const JVal* a = si->at(i);
-                const JVal* an = a ? a->get("name") : nullptr;
-                if (an && !an->str().empty()) {
-                    if (!artist.empty()) artist += "、";
-                    artist += an->str();
-                }
-            }
-        }
-
-        std::string album;
-        const JVal* ai = t->get("albuminfo");
-        const JVal* an2 = ai ? ai->get("name") : nullptr;
-        if (an2) album = an2->str();
-
-        const JVal* tl = t->get("timelen");
-        long long sec = tl ? (tl->ll() / 1000) : 0;
-
-        std::string cover;
-        const JVal* cv = t->get("cover");
-        if (cv) {
-            cover = cv->str();
-            size_t p = cover.find("{size}");
-            if (p != std::string::npos) cover.replace(p, 6, "400");
-        }
-
-        const JVal* h = t->get("hash");
-        std::string hash = h ? h->str() : "";
-
-        const JVal* mid = t->get("mixsongid");
-        if (!mid) mid = t->get("add_mixsongid");
-        if (!mid) mid = t->get("audio_id");
-        long long mixId = mid ? mid->ll() : 0;
-
-        const JVal* aid = t->get("album_id");
-        long long albumId = aid ? aid->ll() : 0;
-
-        out += Clean(title) + "\t" + Clean(artist) + "\t" + Clean(album) + "\t" +
-               std::to_string(sec) + "\t\t" + hash + "\t" + std::to_string(mixId) + "\t" +
-               std::to_string(albumId) + "\t" + cover + "\n";
-        n++;
-    };
-
-    // Sequential paging: the API is serial anyway; concurrency is not faster and tends to drop pages
-    // Up to 3 retries per page; if any page ultimately fails, fail the whole export and don't write a partial playlist
-    std::set<std::string> seen;          // dedupe by hash (pages occasionally overlap)
-    bool failed = false;
-    for (int page = 1; page <= 30 && !failed; page++) {
-        const JVal* arr = nullptr;
-        JVal r;
-        for (int attempt = 0; attempt < 3 && !arr; attempt++) {
-            if (attempt) Sleep(150 + 120 * (DWORD)attempt);
-            r = JVal();
-            if (!Json(api("/playlist/track/all?id=" + UriEnc(gcid) + "&page=" +
-                          std::to_string(page) + "&pagesize=300"), r)) continue;
-            const JVal* rd = r.get("data");
-            const JVal* cand = rd ? (rd->get("info") ? rd->get("info")
-                                  : (rd->get("songs") ? rd->get("songs") : rd->get("lists"))) : nullptr;
-            if (cand && cand->count() > 0) arr = cand;
-        }
-        if (!arr) { failed = true; break; }
-
-        int total = arr->count();
-        std::string buf;
-        for (int i = 0; i < total; i++) {
-            buf.clear();
-            int c = 0;
-            appendTo(arr->at(i), buf, c);
-            if (buf.empty()) continue;
-            // column 6 is hash; use it to dedupe
-            int col = 0;
-            size_t a = 0, b = 0;
-            for (; b < buf.size(); b++) {
-                if (buf[b] != '\t') continue;
-                if (++col == 5) { a = b + 1; }
-                else if (col == 6) break;
-            }
-            std::string key = (col >= 6 && a > 0 && b > a) ? buf.substr(a, b - a) : buf;
-            if (!seen.insert(key).second) continue;
-            out += buf;
+    std::set<std::string> seen;          // pages occasionally overlap; keep the first copy of each hash
+    for (const TrackPage& p : pages) {
+        for (const auto& [hash, row] : p.rows) {
+            if (!seen.insert(hash.empty() ? row : hash).second) continue;
+            out += row;
             n++;
         }
-        if (total < 300) break;              // last page
     }
-    if (failed) { err = L"拉歌单失败（分页请求出错，已保留旧歌单）"; return -1; }    if (n == 0) { err = L"歌单里没有歌曲"; return -1; }
+    if (n == 0) { err = L"歌单里没有歌曲"; return -1; }
 
     FILE* f = nullptr;
     _wfopen_s(&f, outTsv.c_str(), L"wb");
     if (!f) { err = L"写 tsv 失败"; return -1; }
-    fwrite(out.data(), 1, out.size(), f);
-    fclose(f);
+    const bool written = fwrite(out.data(), 1, out.size(), f) == out.size();
+    if (fclose(f) != 0 || !written) {    // a truncated file would later be read as the whole playlist
+        DeleteFileW(outTsv.c_str());
+        err = L"写 tsv 失败";
+        return -1;
+    }
     return n;
 }
 
@@ -570,7 +606,7 @@ int KgExportLikes(const std::string& token, const std::string& userid,
     if (gcid.empty()) { err = L"没找到可用的歌单"; return -1; }
 
     // hand off to the shared helper to fetch tracks by gcid
-    return KgExportTracksByGcid(token, userid, gcid, outTsv, err);
+    return KgExportTracksByGcid(token, userid, gcid, 0, outTsv, err);
 }
 
 

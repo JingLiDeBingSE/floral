@@ -28,7 +28,13 @@ struct Playlist {
     std::string  gcid;        // Kugou global_collection_id
     int          count = 0;
     std::string  coverUrl;
+    int          ver = 0;     // Kugou list_ver: changes whenever the tracks change; 0 when unknown
     bool         isDefault = false;
+
+    bool operator==(const Playlist& o) const {
+        return name == o.name && gcid == o.gcid && count == o.count && coverUrl == o.coverUrl &&
+               ver == o.ver && isDefault == o.isDefault;
+    }
 };
 
 /* ───────── Pages ───────── */
@@ -130,6 +136,8 @@ extern std::wstring g_dataDir;
 enum { WB_MIN = 0, WB_MAX = 1, WB_CLOSE = 2 };
 
 void InitData();
+/* Songs listed in a track list TSV, found the same way as other data files; callable from worker threads */
+std::vector<Song> ReadSongs(const std::wstring& name);
 extern std::wstring g_likesName;
 
 /* Embedded resource: default playlist data (used by data.cpp) */
