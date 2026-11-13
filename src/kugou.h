@@ -39,16 +39,17 @@ struct KgPlaylist {
     std::wstring name;
     std::string coverUrl;
     int         count = 0;
-    bool        isDefault = false;
+    int         ver = 0;          // list_ver, which the service increases whenever the tracks change
 };
 
 /** Fetch all playlists of the account */
 int KgFetchPlaylists(const std::string& token, const std::string& userid,
                      std::vector<KgPlaylist>& out, std::wstring& err);
 
-/** Fetch tracks of the given playlist and write a tsv; returns the track count (-1 on failure) */
-int KgExportPlaylist(const std::string& token, const std::string& userid,
-                     const std::string& gcid, const std::wstring& outTsv, std::wstring& err);
+/** Fetch tracks of the given playlist and write a tsv; returns the track count (-1 on failure).
+    countHint is the expected track count, used to request every page at once; 0 when unknown */
+int KgExportPlaylist(const std::string& token, const std::string& userid, const std::string& gcid,
+                     int countHint, const std::wstring& outTsv, std::wstring& err);
 
 /** Fetch the "Liked" songs and write a tsv; returns the number of songs written (-1 on failure) */
 int  KgExportLikes(const std::string& token, const std::string& userid,
