@@ -5,6 +5,7 @@
 #include "log.h"
 #include "lang.h"
 #include "audio.h"
+#include "tiles.h"
 
 #include <d2d1_1.h>
 #include <d2d1effectauthor.h>
@@ -633,33 +634,31 @@ static void EndMotionBlur() {
    ══════════════════════════════════════════ */
 struct TileBox {
     float x, y, w, h;    // relative to the content origin (scroll not subtracted)
-    int cw, ch;          // how many cells it spans
 };
 
 /* Three layouts:
- *   g_base   —— no hover, stable, used for mouse hit-testing
- *   g_target —— with hover (that tile grows to 2×2), the other tiles pushed aside
+ *   g_base   —— no hover
+ *   g_target —— the hovered tile grown to 2×2, the tiles around it shrunk or moved to make room
  *   g_draw   —— current animated values, used for drawing
  */
 static std::vector<TileBox> g_base, g_target, g_draw;
-static float g_baseHeight = 0.0f;
+static std::vector<TileBox> g_drawVel;   // velocity of each g_draw value, DIPs per second
 static float g_gridHeight = 0.0f;
 static int   g_layoutCount = -1;
 static float g_layoutWidth = -1.0f;
 static int   g_layoutHover = -2;
 static bool  g_layoutDirty = false;
 
-/* Hover tile: grows in place from its anchor (no reflow, so it does not jump elsewhere); near an edge it grows toward the center */
+/* The base and target layouts in cells; g_targetOwner gives the tile on each cell of the target, -1 when empty */
+static TileLayout        g_tiles;
+static std::vector<Tile> g_targetTiles;
+static std::vector<int>  g_targetOwner;
 static float g_cellSize = 140.0f;
-static int   g_colsNow = 6;
-static int   g_hvIdx = -1;               // hover tile currently animating
-static D2D1_RECT_F g_hvCur{};
-static D2D1_RECT_F g_hvTarget{};
 static bool  g_snapUI = false;           // jump straight to the final state for offscreen screenshots
 
 /* Vertical band index: each frame only touches the bands near the viewport instead of scanning all 2000 tiles */
 static const float BAND_H = 220.0f;
-static std::vector<std::vector<int>> g_baseBands, g_tgtBands;
+static std::vector<std::vector<int>> g_tgtBands;
 
 /* Tiles visible this frame (deduplicated with a stamp) */
 static std::vector<int> g_vis;
@@ -668,87 +667,12 @@ static uint32_t g_stampVal = 0;
 
 static const float GRID_TOP = UI::TITLE_H + 18.0f;
 
-static inline uint32_t Hash32(uint32_t x) {
-    x ^= x >> 16; x *= 0x7feb352du;
-    x ^= x >> 15; x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
+static TileBox BoxOf(const Tile& t) {
+    const float pitch = g_cellSize + UI::GAP;
+    return { UI::PAD + t.x * pitch, t.y * pitch, t.w * pitch - UI::GAP, t.h * pitch - UI::GAP };
 }
 
-/** Cells per tile: mostly 1×1, a few wide/tall ones, very rarely 2×2 */
-static void PickSize(int i, int cols, int& cw, int& ch) {
-    int r = (int)(Hash32((uint32_t)i * 2654435761u) % 100u);
-    if (cols >= 2 && r < 3)       { cw = 2; ch = 2; }
-    else if (cols >= 2 && r < 15) { cw = 2; ch = 1; }
-    else if (r < 27)              { cw = 1; ch = 2; }
-    else                          { cw = 1; ch = 1; }
-}
-
-/** Packing: the hoverIdx tile grows to 2×2 and is anchored to column hoverCol (growing toward the center near an edge);
- *  the other tiles shift to the lowest free slot and are pushed aside naturally. */
-static void PackLayout(float W, int count, int hoverIdx, int hoverCol,
-                       std::vector<TileBox>& out, float& totalHeight) {
-    int cols = (int)((W - UI::PAD * 2 + UI::GAP) / 150.0f);
-    if (cols < 3) cols = 3;
-    if (cols > 10) cols = 10;
-    float cell = (W - UI::PAD * 2 - UI::GAP * (cols - 1)) / cols;
-    g_cellSize = cell;
-    g_colsNow = cols;
-
-    out.clear();
-    out.reserve((size_t)count);
-
-    std::vector<int> heights((size_t)cols, 0);
-
-    for (int i = 0; i < count; i++) {
-        int cw = 1, ch = 1;
-        bool anchored = (i == hoverIdx);
-
-        if (anchored) {
-            cw = 2; ch = 2;
-            if (cw > cols) cw = cols;
-        } else {
-            PickSize(i, cols, cw, ch);
-            if (cw > cols) cw = cols;
-        }
-
-        // anchor column: grow leftward at the right edge, rightward otherwise
-        int anchorCol = -1;
-        if (anchored) {
-            anchorCol = (std::min)(hoverCol < 0 ? 0 : hoverCol, cols - cw);
-            if (anchorCol < 0) anchorCol = 0;
-        }
-
-        int bestCol = 0, bestRow = 0x7fffffff;
-        if (anchorCol >= 0) {
-            int r = 0;
-            for (int k = 0; k < cw; k++) r = (std::max)(r, heights[(size_t)(anchorCol + k)]);
-            bestCol = anchorCol;
-            bestRow = r;
-        } else {
-            for (int c = 0; c + cw <= cols; c++) {
-                int r = 0;
-                for (int k = 0; k < cw; k++) r = (std::max)(r, heights[(size_t)(c + k)]);
-                if (r < bestRow) { bestRow = r; bestCol = c; }
-            }
-        }
-        for (int k = 0; k < cw; k++) heights[(size_t)(bestCol + k)] = bestRow + ch;
-
-        TileBox b;
-        b.cw = cw; b.ch = ch;
-        b.x = UI::PAD + bestCol * (cell + UI::GAP);
-        b.y = bestRow * (cell + UI::GAP);
-        b.w = cw * cell + (cw - 1) * UI::GAP;
-        b.h = ch * cell + (ch - 1) * UI::GAP;
-        out.push_back(b);
-    }
-
-    int rows = 0;
-    for (int h : heights) rows = (std::max)(rows, h);
-    totalHeight = rows * (cell + UI::GAP) - UI::GAP;
-}
-
-/** Split tiles into vertical bands so drawing/hit-testing only reads the relevant ones (reuses capacity to avoid reallocating on every relayout) */
+/** Split tiles into vertical bands so drawing only reads the relevant ones (reuses capacity to avoid reallocating on every relayout) */
 static void BuildBands(const std::vector<TileBox>& boxes, std::vector<std::vector<int>>& bands) {
     if (boxes.empty()) { bands.clear(); return; }
 
@@ -769,30 +693,24 @@ static void BuildBands(const std::vector<TileBox>& boxes, std::vector<std::vecto
     }
 }
 
-static void EnsureBase(float W, int count) {
-    if (count == g_layoutCount && W == g_layoutWidth) return;
-    PackLayout(W, count, -1, -1, g_base, g_baseHeight);
-    BuildBands(g_base, g_baseBands);
-    g_layoutCount = count;
-    g_layoutWidth = W;
-    g_layoutHover = -2;                 // force the target layout to be recomputed
-}
-
-static void EnsureTarget(float W, int count, int hoverIdx) {
-    EnsureBase(W, count);
-    if (hoverIdx == g_layoutHover) return;
-
-    // take this tile's column in the base layout as the anchor column after growing
-    int hcol = -1;
-    if (hoverIdx >= 0 && hoverIdx < (int)g_base.size()) {
-        float pitch = g_cellSize + UI::GAP;
-        if (pitch > 0.0f)
-            hcol = (int)std::lround((g_base[(size_t)hoverIdx].x - UI::PAD) / pitch);
+/* Adopts a target layout given in cells: its rects in DIPs, the tile on each cell, and the band index */
+static void SetTarget(std::vector<Tile> tiles) {
+    g_targetTiles = std::move(tiles);
+    const int cols = g_tiles.Columns();
+    int rows = 0;
+    g_target.clear();
+    for (const Tile& t : g_targetTiles) {
+        g_target.push_back(BoxOf(t));
+        rows = (std::max)(rows, t.y + t.h);
     }
-
-    PackLayout(W, count, hoverIdx, hcol, g_target, g_gridHeight);
+    g_targetOwner.assign((size_t)(rows * cols), -1);
+    for (int i = 0; i < (int)g_targetTiles.size(); i++) {
+        const Tile& t = g_targetTiles[(size_t)i];
+        for (int y = t.y; y < t.y + t.h; y++)
+            for (int x = t.x; x < t.x + t.w; x++) g_targetOwner[(size_t)(y * cols + x)] = i;
+    }
+    g_gridHeight = rows * (g_cellSize + UI::GAP) - UI::GAP;
     BuildBands(g_target, g_tgtBands);
-    g_layoutHover = hoverIdx;
     g_layoutDirty = true;
     if (g_draw.size() != g_target.size()) {
         g_draw = g_target;
@@ -800,33 +718,56 @@ static void EnsureTarget(float W, int count, int hoverIdx) {
     }
 }
 
-/** Which tile the mouse is over (-1 = none)
- *  Check the hovered tile's whole grown area first, otherwise the region it grew into would be attributed to its neighbours */
+static void EnsureBase(float W, int count) {
+    if (count == g_layoutCount && W == g_layoutWidth) return;
+    int cols = (int)((W - UI::PAD * 2 + UI::GAP) / 150.0f);
+    if (cols < 3) cols = 3;
+    if (cols > 10) cols = 10;
+    g_cellSize = (W - UI::PAD * 2 - UI::GAP * (cols - 1)) / cols;
+    if (cols != g_tiles.Columns() || count != (int)g_tiles.Rest().size()) g_tiles = TileLayout(cols, count);
+
+    g_base.clear();
+    for (const Tile& t : g_tiles.Rest()) g_base.push_back(BoxOf(t));
+    SetTarget(g_tiles.Rest());
+    g_layoutCount = count;
+    g_layoutWidth = W;
+    g_layoutHover = -1;
+}
+
+/* Mouse position in grid cells, where each cell also owns half of the gaps around it; false beside or above the grid */
+static bool GridCell(POINT p, float& cx, float& cy) {
+    const float pitch = g_cellSize + UI::GAP;
+    cx = ((float)p.x - UI::PAD + UI::GAP * 0.5f) / pitch;
+    cy = ((float)p.y - GRID_TOP + g_app.scroll + UI::GAP * 0.5f) / pitch;
+    return cx >= 0.0f && cy >= 0.0f && cx < (float)g_tiles.Columns();
+}
+
+/* The hovered tile grows over the cell under the mouse, and the tiles around it make room */
+static void EnsureTarget(float W, int count, int hoverIdx) {
+    EnsureBase(W, count);
+    if (hoverIdx == g_layoutHover) return;
+    float cx = 0.0f, cy = 0.0f;
+    if (hoverIdx >= 0 && GridCell(g_app.mouse, cx, cy)) {
+        const float pitch = g_cellSize + UI::GAP;
+        const int viewTop = (int)ceilf(g_app.scroll / pitch);
+        const int viewBottom = (int)floorf((g_app.scroll + g_app.height - GRID_TOP + UI::GAP) / pitch);
+        SetTarget(g_tiles.Expand(hoverIdx, g_targetTiles[(size_t)hoverIdx], cx, cy, viewTop, viewBottom));
+    } else {
+        SetTarget(g_tiles.Rest());
+    }
+    g_layoutHover = hoverIdx;
+}
+
+/** Which tile of the target layout the mouse is over (-1 = none) */
 static int HitTile(POINT p) {
     App& a = g_app;
     if (a.songs.empty()) return -1;
     if (p.y < GRID_TOP - 6) return -1;
     EnsureBase(a.width, (int)a.songs.size());
-
-    // 1) hovered tile: its whole grown area belongs to it (target rect, stable, no jitter)
-    int cur = a.hoverTile;
-    if (cur >= 0 && cur < (int)g_target.size()) {
-        const TileBox& h = g_target[(size_t)cur];
-        D2D1_RECT_F hr = Rc(h.x, GRID_TOP + h.y - a.scroll, h.w, h.h);
-        if (Inside(hr, p)) return cur;
-    }
-
-    // 2) everything else hits the base layout (band lookup, no full scan)
-    float cy = (float)p.y - GRID_TOP + a.scroll;
-    int band = (int)(cy / BAND_H);
-    if (band < 0 || band >= (int)g_baseBands.size()) return -1;
-
-    for (int i : g_baseBands[(size_t)band]) {
-        const TileBox& b = g_base[(size_t)i];
-        D2D1_RECT_F r = Rc(b.x, GRID_TOP + b.y - a.scroll, b.w, b.h);
-        if (Inside(r, p)) return i;
-    }
-    return -1;
+    float cx = 0.0f, cy = 0.0f;
+    if (!GridCell(p, cx, cy)) return -1;
+    const size_t cell = (size_t)((int)cy * g_tiles.Columns() + (int)cx);
+    return cell < g_targetOwner.size() ? g_targetOwner[cell] : -1;
 }
 
 /* ══════════════════════════════════════════
@@ -2110,7 +2051,7 @@ static void DrawGrid() {
         a.hoverTile = (gliding || !g_hoverArmed || g_settingsOpen) ? -1 : HitTile(a.mouse);
     }
     int hov = (a.page == Page::Grid && a.pageAnim < 0.02f) ? a.hoverTile : -1;
-    EnsureTarget(W, n, hov);         // anchor column + local reflow: push neighbors aside without teleporting
+    EnsureTarget(W, n, hov);
 
     float viewH = (std::max)(0.0f, H - GRID_TOP - UI::PAD);
     a.maxScroll = (std::max)(0.0f, g_gridHeight - viewH);
@@ -2189,13 +2130,15 @@ static void DrawGrid() {
     const bool entering = (g_gridEnter < 0.999f);
     const float entT = g_gridEnter * 1.45f;
 
-    // Draw normal tiles first, then the hovered one (so it covers its neighbors)
+    // Still tiles first, then moving ones, then the hovered one, so tiles in motion pass over the still ones
     int order = 0;
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 3; pass++) {
         for (int i : g_vis) {
             bool isHover = (i == hov);
-            if ((pass == 0) == isHover) continue;
             const TileBox& d = g_draw[(size_t)i];
+            const TileBox& t = g_target[(size_t)i];
+            const bool moving = d.x != t.x || d.y != t.y || d.w != t.w || d.h != t.h;
+            if (pass != (isHover ? 2 : moving ? 1 : 0)) continue;
             float ty = GRID_TOP + d.y - a.scroll;
 
             float enterA = 1.0f, enterDx = 0.0f;
@@ -4727,6 +4670,21 @@ static float Ease(float perFrame, float dt) {
     return 1.0f - powf(1.0f - perFrame, dt * 62.5f);
 }
 
+/* Critically damped spring: reaches the target without overshoot and keeps its velocity when the target changes.
+   Steps by the exact solution, so the motion does not depend on the frame rate. Returns whether it still moves */
+static bool SpringStep(float& value, float& velocity, float target, float dt) {
+    const float stiffness = 16.0f;   // angular frequency; settles in about 0.3 s
+    const float offset = value - target;
+    const float drift = velocity + stiffness * offset;
+    const float decay = expf(-stiffness * dt);
+    value = target + (offset + drift * dt) * decay;
+    velocity = (velocity - stiffness * drift * dt) * decay;
+    if (std::fabs(value - target) > 0.1f || std::fabs(velocity) > 2.0f) return true;
+    value = target;
+    velocity = 0.0f;
+    return false;
+}
+
 static void GoPlayer(int idx);  // Defined later
 static void SwitchTrack(int delta);
 
@@ -5567,8 +5525,9 @@ static bool Animate() {
         need = true;
     }
 
-    // Grid push-apart animation: ease only the tiles near the viewport, the rest snap straight into place
+    // Grid tiles follow their targets on springs; only the tiles near the viewport animate, the rest snap into place
     if (g_draw.size() == g_target.size()) {
+        if (g_drawVel.size() != g_draw.size()) g_drawVel.assign(g_draw.size(), TileBox{});
         if (g_layoutDirty) {
             g_layoutDirty = false;
             ++g_stampVal;
@@ -5576,8 +5535,10 @@ static bool Animate() {
             for (int i : g_vis)
                 if (i >= 0 && i < (int)g_stamp.size()) g_stamp[(size_t)i] = g_stampVal;
             for (int i = 0; i < (int)g_draw.size() && i < (int)g_stamp.size(); i++) {
-                if (g_stamp[(size_t)i] != g_stampVal)
+                if (g_stamp[(size_t)i] != g_stampVal) {
                     g_draw[(size_t)i] = g_target[(size_t)i];
+                    g_drawVel[(size_t)i] = TileBox{};
+                }
             }
             need = true;
         }
@@ -5585,17 +5546,14 @@ static bool Animate() {
         for (int i : g_vis) {
             if (i < 0 || i >= (int)g_draw.size()) continue;
             TileBox& d = g_draw[(size_t)i];
+            TileBox& v = g_drawVel[(size_t)i];
             const TileBox& t = g_target[(size_t)i];
-            float dx = t.x - d.x, dy = t.y - d.y;
-            float dw = t.w - d.w, dh = t.h - d.h;
-            if (std::fabs(dx) + std::fabs(dy) + std::fabs(dw) + std::fabs(dh) > 0.35f) {
-                float k = Ease(0.24f, dt);
-                d.x += dx * k; d.y += dy * k;
-                d.w += dw * k; d.h += dh * k;
-                need = true;
-            } else {
-                d = t;
-            }
+            // All four values must step, so the results are combined without short-circuiting
+            bool moving = SpringStep(d.x, v.x, t.x, dt);
+            moving |= SpringStep(d.y, v.y, t.y, dt);
+            moving |= SpringStep(d.w, v.w, t.w, dt);
+            moving |= SpringStep(d.h, v.h, t.h, dt);
+            need |= moving;
         }
     }
     return need;

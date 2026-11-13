@@ -38,6 +38,7 @@ set(FLORAL_SOURCES
     src/audio.cpp
     src/kugou.cpp
     src/lang.cpp
+    src/tiles.cpp
 )
 
 add_executable(floral WIN32 ${FLORAL_SOURCES})
