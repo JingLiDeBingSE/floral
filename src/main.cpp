@@ -682,7 +682,6 @@ static void QueueDecode(const std::wstring& path) {
 
 /* ── On-demand cover download: songs whose cover is not local are fetched when scrolled into view ── */
 static std::string  HttpGet(const std::wstring& url);
-static std::wstring FindProjectFile(const std::wstring& name);
 static std::wstring Widen(const std::string& s);
 
 /* The queue carries copies of url/hash; worker threads never touch g_app (avoids racing cache clears/reloads) */
@@ -2317,24 +2316,6 @@ static int   g_pendingSeekMs = -1;     // position to seek to after reload (used
 static bool      g_seekDrag = false;
 static ULONGLONG g_lastSeek = 0;
 
-static std::wstring FindProjectFile(const std::wstring& name) {
-    if (GetFileAttributesW(name.c_str()) != INVALID_FILE_ATTRIBUTES) return name;
-    wchar_t exe[MAX_PATH] = { 0 };
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-        std::wstring dir(exe);
-        size_t p = dir.find_last_of(L"\\/");
-        if (p != std::wstring::npos) {
-            std::wstring base = dir.substr(0, p);
-            std::wstring c1 = base + L"\\" + name;
-            if (GetFileAttributesW(c1.c_str()) != INVALID_FILE_ATTRIBUTES) return c1;
-            std::wstring up = base.substr(0, base.find_last_of(L"\\/"));
-            std::wstring c2 = up + L"\\" + name;
-            if (GetFileAttributesW(c2.c_str()) != INVALID_FILE_ATTRIBUTES) return c2;
-        }
-    }
-    return L"";
-}
-
 static std::string HttpGet(const std::wstring& url) {
     std::string out;
     HINTERNET hInet = InternetOpenW(L"KugouPlayer/1.0", INTERNET_OPEN_TYPE_DIRECT,
@@ -2565,12 +2546,10 @@ static std::wstring Widen(const std::string& s) {
     return w;
 }
 
-/** Read token / userid from kugou-session.json */
+/** Read token / userid from the current source's session file */
 static void LoadSession() {
-    std::wstring p = FindProjectFile(L"kugou-session.json");
-    if (p.empty()) return;
     FILE* f = nullptr;
-    _wfopen_s(&f, p.c_str(), L"rb");
+    _wfopen_s(&f, SessionFile().c_str(), L"rb");
     if (!f) return;
     std::string s;
     char buf[2048];
@@ -2789,13 +2768,14 @@ static std::wstring ResolvePlayUrl(int idx) {
     return L"";
 }
 
-/** Find this song's local audio: audio/<hash>.mp3 (use it when present, else stream) */
+/** Local copy of this song at audio\<hash>.mp3 in the data directory; empty when absent, so it is streamed */
 static std::wstring FindAudio(int idx) {
     App& a = g_app;
     if (idx < 0 || idx >= (int)a.songs.size()) return L"";
     const std::string& h = a.songs[(size_t)idx].hash;
     if (h.empty()) return L"";
-    return FindProjectFile(L"audio\\" + std::wstring(h.begin(), h.end()) + L".mp3");
+    std::wstring p = AssetDir() + L"\\audio\\" + std::wstring(h.begin(), h.end()) + L".mp3";
+    return FileExistsW(p) ? p : L"";
 }
 
 /** Trace log: off by default, only written when started with --trace (keeps the packaged build litter-free) */
@@ -5962,10 +5942,11 @@ static void OnClick(POINT p) {
         break;
     }
     case HK_SET_LOGIN: {
-        // Sign in again: clear everything first (cache + both platforms' sign-in data), then pick a platform
+        // Sign in again: clear the cache and every platform's sign-in data, then pick a platform
         ClearCache();
         DeleteFileW((AssetDir() + L"\\kugou-session.json").c_str());
         DeleteFileW((AssetDir() + L"\\netease-session.json").c_str());
+        DeleteFileW((AssetDir() + L"\\qq-session.json").c_str());
         g_token.clear();
         g_userid.clear();
         g_nickname.clear();
