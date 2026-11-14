@@ -2,6 +2,7 @@
 #include "resource.h"
 #include "kugou.h"
 #include "together.h"
+#include "relay.h"
 #include "log.h"
 #include "lang.h"
 #include "audio.h"
@@ -1365,14 +1366,6 @@ static std::wstring g_qrPath;            // QR code file for this login (renamed
 static bool         g_togOpen = false;      // listen-together panel
 static bool         g_togInput = false;     // input field focused
 static std::wstring g_togInputText;         // connection code being typed
-static std::wstring g_togMyCode;            // my connection code
-static bool         g_togBusy    = false;   // opening a room / joining
-static bool         g_togHosting = false;   // room open but nobody has joined yet
-static bool         g_togForcePush = false; // force the next PushLocalState (seek/loading change)
-static bool         g_togIsHost  = false;   // I am the host (can control playback)
-static int          g_togAddrIdx = -1;      // selected local address index (-1 = auto)
-static std::wstring g_togPeer;              // peer nickname
-static bool         g_togLost = false;      // disconnect notice
 static std::wstring g_togMsg;               // in-panel message
 static ULONGLONG    g_togMsgAt = 0;
 /* Toast fade: 180ms in, 300ms out, moves up 6px while fading in
@@ -2616,14 +2609,14 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
 }
 
 #ifndef FLORAL_NO_TOGETHER
-/* Listen-together helper: MQTT credentials are passed via environment variables */
-static void StartTogetherHelper() {
-    SetEnvironmentVariableW(L"FLORAL_MQTT_HOST", L"k9bf6e3a.ala.cn-shenzhen.emqxsl.cn");
-    SetEnvironmentVariableW(L"FLORAL_MQTT_PORT", L"8883");
-    SetEnvironmentVariableW(L"FLORAL_MQTT_USER", L"Floral");
-    SetEnvironmentVariableW(L"FLORAL_MQTT_PASS", L"qwertyuiop!@#$%^&*()");
-    SetEnvironmentVariableW(L"FLORAL_LISTEN_PORT", L"4100");
-    StartNodeSidecar(L"together", L"together-server.js", 4100, "一起听助手");
+static const RelayBroker kRelayBroker = {
+    "k9bf6e3a.ala.cn-shenzhen.emqxsl.cn", 8883, "Floral", "qwertyuiop!@#$%^&*()"
+};
+
+/* RelayLaunch for the listen-together helper */
+static bool LaunchRelayHelper(HANDLE* toHelper, HANDLE* fromHelper, HANDLE* process) {
+    *toHelper = *fromHelper = *process = nullptr;
+    return false;
 }
 #endif
 
@@ -3436,7 +3429,7 @@ static void DrawVolume(float px, float by, float cy) {
     {
         D2D1_RECT_F tb2 = Rc(qb.right + 10.0f, by, 40.0f, 40.0f);
         bool th2 = Inside(tb2, g_app.mouse);
-        bool on = TogetherActive();
+        bool on = TogetherStatus().phase != TogetherPhase::Off;
         if (th2 || g_togOpen) FillRound(tb2, 20.0f, UI::HOVER);
         UINT32 icol = on ? UI::ACCENT : UI::TEXT2;
         const float ccx = tb2.left + 20.0f, ccy = by + 22.0f;
@@ -3456,104 +3449,6 @@ static void DrawVolume(float px, float by, float cy) {
         Hit ht2; ht2.r = tb2; ht2.kind = HK_TOG;
         if (g_alpha > 0.5f) g_app.hits.push_back(ht2);
 
-        if (g_togT > 0.01f) {
-            PanelFx fxt(g_togT, tb2.left + 20.0f, by + 46.0f);
-            const float pw2 = 430.0f, ph2 = on ? 96.0f : 176.0f;
-            D2D1_RECT_F tp = Rc(tb2.left - pw2 + 40.0f, by + 46.0f, pw2, ph2);
-            if (tp.left < 12.0f) tp = Rc(12.0f, by + 46.0f, pw2, ph2);
-            FillRound(Rc(tp.left + 3, tp.top + 8, pw2, ph2), 12.0f, UI::SHADOW, 0.14f);
-            FillRound(tp, 12.0f, UI::PANEL);
-            {   // swallow clicks on the card's empty area so it doesn't close on any touch
-                Hit hcard; hcard.r = tp; hcard.kind = HK_TOG_CARD;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hcard);
-            }
-
-            if (on) {
-                std::wstring who = g_togPeer.empty()
-                    ? (g_togHosting ? T(L"房间已开，等待对方加入…", L"Room open, waiting…") : T(L"已连接", L"Connected"))
-                    : (std::wstring(T(L"正在与 ", L"Listening with ")) + g_togPeer);
-                Text(who, Fmt(12.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 16, pw2 - 120, 22), UI::TEXT);
-                std::wstring code = Widen(TogetherMyCode());
-                if (!code.empty())
-                    Text(std::wstring(T(L"你的房间码：", L"Your room code: ")) + code, Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                         Rc(tp.left + 16, tp.top + 44, pw2 - 32, 18), UI::TEXT3);
-                D2D1_RECT_F cp = Rc(tp.right - 152, tp.top + 16, 60, 26);
-                {
-                    bool ch2 = Inside(cp, g_app.mouse);
-                    FillRound(cp, 8.0f, ch2 ? UI::SELECT : UI::GHOST);
-                    Text(T(L"复制", L"Copy"), Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL), cp,
-                         ch2 ? UI::ACCENT_TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-                    Hit hcp; hcp.r = cp; hcp.kind = HK_TOG_COPY;
-                    if (g_alpha > 0.5f) g_app.hits.push_back(hcp);
-                }
-                D2D1_RECT_F lv = Rc(tp.right - 84, tp.top + 16, 68, 26);
-                bool lh = Inside(lv, g_app.mouse);
-                if (lh) FillRound(lv, 8.0f, UI::SELECT);
-                Text(T(L"退出", L"Leave"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), lv,
-                     lh ? UI::ACCENT_TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-                Hit hl; hl.r = lv; hl.kind = HK_TOG_LEAVE;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hl);
-            } else {
-                // first row: my connection code
-                Text(T(L"我的房间码", L"My room code"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 12, 100, 16), UI::TEXT3);
-
-                std::wstring code = g_togMyCode;
-                Text(code.empty() ? T(L"未开房", L"No room") : code,
-                     Fmt(9.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 30, pw2 - 130, 18),
-                     code.empty() ? UI::TEXT3 : UI::TEXT);
-                D2D1_RECT_F hb = Rc(tp.right - 96, tp.top + 12, 80, 26);
-                bool hh = Inside(hb, g_app.mouse);
-                if (hh) FillRound(hb, 8.0f, UI::SELECT);
-                Text(code.empty() ? T(L"开房", L"Open room") : T(L"复制", L"Copy"),
-                     Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), hb,
-                     hh ? UI::ACCENT_TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-                Hit hb2; hb2.r = hb;
-                hb2.kind = code.empty() ? HK_TOG_HOST : HK_TOG_COPY;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hb2);
-
-                // second row: enter the peer's connection code
-                Text(T(L"输入房间码，回车加入", L"Enter room code, press Enter"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 92, pw2 - 32, 16), UI::TEXT3);
-                D2D1_RECT_F ib = Rc(tp.left + 16, tp.top + 112, pw2 - 116, 30);
-                FillRound(ib, 8.0f, g_togInput ? UI::BG : UI::GHOST);
-                if (g_togInput) FillRound(ib, 8.0f, 0xFFFFFF);
-                std::wstring shown = g_togInputText;
-                if (shown.empty() && !g_togInput) shown = L"";
-                Text(shown, Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(ib.left + 10, ib.top, ib.right - ib.left - 20, 30),
-                     UI::TEXT, DWRITE_TEXT_ALIGNMENT_LEADING);
-                if (g_togInput) {
-                    float cx2 = ib.left + 10 + (float)shown.size() * 6.2f;
-                    Line(cx2, ib.top + 7, cx2, ib.bottom - 7, UI::ACCENT, 1.4f);
-                }
-                Hit hi; hi.r = ib; hi.kind = HK_TOG_INPUT;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hi);
-
-                D2D1_RECT_F jb = Rc(tp.right - 88, tp.top + 112, 72, 30);
-                const bool hasTxt = !g_togInputText.empty();
-                bool jh = Inside(jb, g_app.mouse) && hasTxt;
-                FillRound(jb, 8.0f, jh ? UI::SELECT : (hasTxt ? UI::BG : UI::GHOST));
-                Text(T(L"加入", L"Join"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), jb,
-                     hasTxt ? (jh ? UI::ACCENT_TEXT : UI::TEXT2) : 0xB9A6AD,
-                     DWRITE_TEXT_ALIGNMENT_CENTER);
-                if (!g_togInputText.empty()) {
-                    Hit hj; hj.r = jb; hj.kind = HK_TOG_JOIN;
-                    if (g_alpha > 0.5f) g_app.hits.push_back(hj);
-                }
-                if (!g_togMsg.empty()) {
-                    float dy = 0.0f;
-                    float ta = ToastFade(g_togMsgAt, 6.0f, dy);
-                    if (ta > 0.01f) {
-                        Text(g_togMsg, Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                             Rc(tp.left + 16, tp.top + 148 + dy, pw2 - 32, 18), 0xB04A63,
-                             DWRITE_TEXT_ALIGNMENT_LEADING, ta);
-                    }
-                }
-            }
-        }
     }
 #endif  // FLORAL_NO_TOGETHER
 
@@ -4852,218 +4747,9 @@ static bool SpringStep(float& value, float& velocity, float target, float dt) {
     return false;
 }
 
-static void GoPlayer(int idx);  // Defined later
-static void SwitchTrack(int delta);
-
-/* ── Listen Together: cross-platform matching (async, don't block the UI) ── */
-struct PendPlay {
-    bool has = false;
-    bool failed = false;
-    std::string hash;
-    long long mixId = 0, albumId = 0;
-    std::wstring title, artist, err;
-    int posMs = 0;
-    bool playing = true;
-};
-static std::mutex g_ppMx;
-static PendPlay     g_pp;
-static std::string  g_matchKey;
-
-static void TryMatchAsync(const TogetherEvent& ev) {
-    std::string key = ev.song + "|" + ev.title;
-    {
-        std::lock_guard<std::mutex> lk(g_ppMx);
-        if (key == g_matchKey) return;          // Don't re-match the same song
-        g_matchKey = key;
-        g_pp = PendPlay{};
-    }
-    Logf("TOG", "跨平台匹配: %s - %s", ev.title.c_str(), ev.artist.c_str());
-    std::string title = ev.title, artist = ev.artist;
-    int pos = ev.posMs;
-    bool play = ev.playing;
-    std::thread([title, artist, pos, play]() {
-        std::string h; std::wstring err;
-        long long mix = 0, alb = 0;
-        bool ok = MatchOnPlatform(g_source, title, artist, 0, h, mix, alb, err);
-        std::lock_guard<std::mutex> lk(g_ppMx);
-        g_pp.has = true;
-        g_pp.failed = !ok;
-        g_pp.hash = h;
-        g_pp.mixId = mix;
-        g_pp.albumId = alb;
-        g_pp.err = err;
-        g_pp.title = Widen(title);
-        g_pp.artist = Widen(artist);
-        g_pp.posMs = pos;
-        g_pp.playing = play;
-        Logf(ok ? "TOG" : "ERR", "匹配%s %s", ok ? "成功" : "失败", ok ? h.c_str() : Narrow(err).c_str());
-    }).detach();
-}
-/* ── Listen Together: receive and apply the peer's state ── */
-static void ApplyRemoteState(const TogetherEvent& ev) {
-    App& a = g_app;
-    if (ev.song.empty()) { Logf("TOG", "收到状态但没有曲目 id，忽略"); return; }
-    Logf("TOG", "收到状态 song=%.20s pos=%d play=%d", ev.song.c_str(), ev.posMs, ev.playing ? 1 : 0);
-
-    int idx = -1;
-    for (int i = 0; i < (int)a.songs.size(); i++) {
-        if (a.songs[i].hash == ev.song) { idx = i; break; }   // hash is a std::string
-    }
-    if (idx < 0) {
-        Logf("TOG", "本地没有该曲目，开始跨平台匹配");
-        TryMatchAsync(ev);
-        return;
-    }
-    Logf("TOG", "本地命中 idx=%d 当前=%d", idx, a.current);
-
-    // Expected position: peer's position + elapsed time (UTC ms, comparable across machines)
-    long long now = (long long)TogetherNowMs();
-    long long elapsed = (now > ev.stampMs) ? (now - ev.stampMs) : 0;
-    if (elapsed > 60000) elapsed = 0;                 // If clock skew is too large, just use the received position
-    long long expectedLL = (long long)ev.posMs + (ev.playing ? elapsed : 0);
-    int dur = (idx >= 0 && idx < (int)a.songs.size()) ? a.songs[(size_t)idx].durationSec : 0;
-    if (dur > 0 && expectedLL > (long long)dur * 1000 - 1000) expectedLL = (long long)dur * 1000 - 1000;
-    if (expectedLL < 0) expectedLL = 0;
-    int expected = (int)expectedLL;
-
-    if (idx != a.current) {
-        Logf("TOG", "跟随切歌 %d -> %d", a.current, idx);
-        GoPlayer(idx);
-        g_pendingSeekMs = expected;                 // Jump straight to the peer's position once opened
-        if (!ev.playing) a.playing = false;
-        return;
-    }
-    if (ev.playing != a.playing) {                  // Play/pause follows the peer
-        a.playing = ev.playing;
-        if (ev.playing) AudioPlay(); else AudioPause();
-    }
-    if (ev.playing) {
-        int mine = (int)(a.pos * 1000.0);
-        if (abs(mine - expected) > 800) {           // Correct only when the event point is off by more than 0.8s
-            AudioSeekMS(expected);
-            a.pos = expected / 1000.0;
-        }
-    }
-}
-
-/* ── Listen Together: push out our own state ── */
-static void PushLocalState(bool force) {
-    if (!TogetherActive()) return;
-    // Both push: the host pushes authoritative state; a follower's push only lets the host know someone is listening
-    App& a = g_app;
-    if (a.current < 0 || a.current >= (int)a.songs.size()) return;
-
-    static std::string  lastHash;
-    static bool         lastPlaying = false;
-    static ULONGLONG    lastPush = 0;
-    static int          lastSeekMs = -1;
-
-    const Song& s = a.songs[a.current];
-    ULONGLONG now = GetTickCount64();
-    int posMs = (int)(a.pos * 1000.0);
-
-    // Sync only on key actions: song change, play/pause, seek, loading-state change
-    bool changed = force || g_togForcePush ||
-                   s.hash != lastHash || a.playing != lastPlaying;
-    if (!changed) return;
-    g_togForcePush = false;
-
-    lastHash = s.hash;
-    lastPlaying = a.playing;
-    lastPush = now;
-    lastSeekMs = posMs;
-    TogetherPushState(s.hash,
-                      g_source == 2 ? "qq" : (g_source == 1 ? "netease" : "kugou"),
-                      posMs, a.playing,
-                      Narrow(s.title), Narrow(s.artist));
-}
 static void RefreshPlaylistsAsync();
 static bool Animate() {
-#ifndef FLORAL_NO_TOGETHER
-    // ── Listen Together: consume events, push state ──
-    {
-        TogetherEvent ev;
-        while (TogetherPoll(ev)) {
-            if (ev.kind == 1) {
-                Logf("TOG", "检测到对端：%s", ev.nick.c_str());
-                g_togHosting = false;
-                g_togForcePush = true;          // Just joined: push the current state right away
-                TogetherSayHello();            // Send a hello back so the peer sees me too
-                g_togPeer = Widen(ev.nick);
-                g_togMyCode = Widen(TogetherMyCode());
-                std::wstring hello = std::wstring(T(L"已和 ", L"Connected with ")) + g_togPeer + T(L" 连接成功，一起听", L"");
-                TogToast(hello);
-            } else if (ev.kind == 3) {
-                g_togPeer.clear();
-                TogToast(T(L"对方已断开", L"Peer disconnected"));
-            } else if (ev.kind == 4) {
-                TogToast(ev.err.empty() ? T(L"连接失败", L"Connection failed") : ev.err);
-                TogetherStop();
-            } else if (ev.kind == 5) {
-                if (g_togIsHost) {
-                    Logf("TOG", "对方播放失败，房主跳过");
-                    TogToast(T(L"对方无该曲目，已跳到下一首", L"Peer lacks this track, skipped to next"));
-                    SwitchTrack(1);
-                }
-            } else if (ev.kind == 2) {
-                if (g_togIsHost) {
-                    // The host is authoritative; don't follow a visitor's state
-                } else {
-                    ApplyRemoteState(ev);
-                }
-            }
-        }
-        {   // Presence heartbeat: report the nickname every 15s so each side sees the other
-            static ULONGLONG lastHello = 0;
-            ULONGLONG nowH = GetTickCount64();
-            if (nowH - lastHello > 15000) {
-                lastHello = nowH;
-                TogetherSayHello();
-            }
-        }
-        {   // Loading state changed (buffering / recovered): sync once
-            static bool lastLoading = false;
-            if (g_audioLoading != lastLoading) {
-                lastLoading = g_audioLoading;
-                g_togForcePush = true;
-            }
-        }
-        PushLocalState(false);
-
-        // Cross-platform match result
-        {
-            PendPlay pp;
-            {
-                std::lock_guard<std::mutex> lk(g_ppMx);
-                if (!g_pp.has) { /* no result */ }
-                pp = g_pp;
-                if (g_pp.has) g_pp.has = false;     // Consume only once
-            }
-            if (pp.has) {
-                if (pp.failed) {
-                    TogToast(T(L"该曲目没有对应版本，已通知房主跳过", L"No matching version, asked the host to skip"));
-                    if (g_audioOk) { AudioPause(); g_app.playing = false; }
-                    if (!g_togIsHost) TogetherRequestSkip();
-                } else {
-                    Logf("TOG", "注入匹配结果 hash=%.20s 并播放", pp.hash.c_str());
-                    // Inject into the local list and play
-                    Song s;
-                    s.title = pp.title;
-                    s.artist = pp.artist;
-                    s.hash = pp.hash;
-                    s.mixId = pp.mixId;
-                    s.albumId = pp.albumId;
-                    g_app.songs.push_back(s);
-                    g_covFlag.push_back(0);
-                    g_layoutCount = -1;
-                    int i2 = (int)g_app.songs.size() - 1;
-                    GoPlayer(i2);
-                    g_pendingSeekMs = pp.posMs;
-                }
-            }
-        }
-    }
-#endif  // FLORAL_NO_TOGETHER
+    TogetherTick(GetTickCount64());
     App& a = g_app;
     bool need = false;
     const float dt = DeltaSeconds();
@@ -5512,7 +5198,9 @@ static bool Animate() {
             if (r > 0) {
                 g_audioOk = true;
                 g_audioLoading = false;
-                if (g_pendingSeekMs >= 0) {          // Quality switch / Listen Together: resume mid-track with a fade-in
+                const int roomStartMs = TogetherStartPosMs(a.current);
+                if (roomStartMs >= 0) g_pendingSeekMs = roomStartMs;
+                if (g_pendingSeekMs >= 0) {          // quality switch, resume or listen together: start mid-track with a fade-in
                     AudioSeekMS(g_pendingSeekMs);
                     a.pos = g_pendingSeekMs / 1000.0;
                     g_pendingSeekMs = -1;
@@ -5651,12 +5339,8 @@ static bool Animate() {
                     g_audioErrKind = 3;
                 } else if (AudioIsEnded() && g_fadeDir >= 0) {   // a fade-out in progress already leads elsewhere
                     Logf("AUD", "自动连播：ms=%d", ms);
-                    bool follower = false;
-#ifndef FLORAL_NO_TOGETHER
-                    follower = TogetherActive() && !g_togIsHost;
-#endif
-                    if (follower) {
-                        a.playing = false;         // wait for the host to push the next track, don't switch on our own
+                    if (TogetherHoldsTrackEnd()) {
+                        a.playing = false;
                         AudioPause();
                     } else {
                         SwitchTrackNow(1);         // the track is over, so there is nothing to fade out
@@ -5666,12 +5350,7 @@ static bool Animate() {
         } else if (g_urlState != 1 && !g_audioError) {   // while resolving/failed, don't pretend it's playing
             a.pos += dt;
             if (a.pos >= a.songs[a.current].durationSec) {
-                // In Together only the host may switch tracks; guests stop and wait for the host's next track
-                bool follower = false;
-#ifndef FLORAL_NO_TOGETHER
-                follower = TogetherActive() && !g_togIsHost;
-#endif
-                if (follower) {
+                if (TogetherHoldsTrackEnd()) {
                     a.pos = (float)a.songs[a.current].durationSec;   // park at the end, don't run past it
                     a.playing = false;
                     AudioPause();
@@ -5990,6 +5669,30 @@ static void SeekToX(float x) {
     if (g_audioOk) AudioSeekMS((int)(a.pos * 1000.0));
 }
 
+/* Whether the song grid is showing the list the play queue came from */
+static bool GridShowsQueue() { return true; }
+
+/* Shows the play queue's list in the song grid */
+static void ShowQueueInGrid() {}
+
+/* Nickname of the signed-in account in UTF-8, empty when unknown */
+static std::string AccountName() { return ""; }
+
+/* The player as seen by the listen-together session */
+class PlayerSide : public TogetherPlayer {
+public:
+    State Now() override { return State{}; }
+    const std::vector<Song>& Queue() override { return g_app.songs; }
+    std::string Name() override { return AccountName(); }
+    void SetQueue(std::vector<Song>, bool) override {}
+    void Play(int, bool) override {}
+    void SetPlaying(bool) override {}
+    void Seek(int) override {}
+    void Step(int) override {}
+    void Retry() override {}
+};
+static PlayerSide g_playerSide;
+
 static void OnClick(POINT p) {
     App& a = g_app;
     if (g_curtainPhase != 0) return;      // page is mid-swap: ignore clicks
@@ -6025,7 +5728,14 @@ static void OnClick(POINT p) {
     if (!h) return;
 
     switch (h->kind) {
-    case HK_TILE:  GoPlayer(h->index); break;
+    case HK_TILE:
+        if (TogetherRoutesControls()) {
+            if (GridShowsQueue()) TogetherRequest(TogetherOp::Pick, h->index);
+            else TogToast(T(L"正在一起听，退出一起听后才能点这里的歌", L"Leave listen-together to play from this list"));
+            break;
+        }
+        GoPlayer(h->index);
+        break;
     case HK_BACK:  ExitPlayer(); break;
     case HK_PICKER:
     case HK_PL_PICK:
@@ -6082,39 +5792,18 @@ static void OnClick(POINT p) {
     case HK_TOG_INPUT:
         g_togInput = true;
         break;
-        Logf("TOG", "点击创建房间");
-    case HK_TOG_HOST: {
-        Logf("TOG", "点击创建房间");
-        if (g_togBusy) break;
-        g_togBusy = true;
-        g_togPeer.clear();
-        TogToast(T(L"正在连接服务器…", L"Connecting…"));
-        std::thread([]() {
-            std::string code; std::wstring err;
-            bool ok = TogetherHost(TogetherDefaultNick(true), code, err, -1);
-            if (ok) {
-                g_togMyCode = Widen(code);
-                g_togHosting = true;
-                g_togIsHost = true;
-                Logf("TOG", "房间创建成功 code=%s", code.c_str());
-                TogToast(T(L"房间已开，分享房间码给朋友吧", L"Room open, share the code"));
-            } else {
-                g_togHosting = false;
-                Logf("ERR", "创建房间失败: %s", Narrow(err).c_str());
-                TogToast(err);
-            }
-            g_togBusy = false;
-        }).detach();
+    case HK_TOG_HOST:
+        TogetherHost();
         break;
-    }
     case HK_TOG_COPY: {
+        const std::wstring code = Widen(TogetherStatus().code);
         if (OpenClipboard(nullptr)) {
             EmptyClipboard();
-            size_t n2 = (g_togMyCode.size() + 1) * sizeof(wchar_t);
+            size_t n2 = (code.size() + 1) * sizeof(wchar_t);
             HGLOBAL g2 = GlobalAlloc(GMEM_MOVEABLE, n2);
             if (g2) {
                 void* p2 = GlobalLock(g2);
-                memcpy(p2, g_togMyCode.c_str(), n2);
+                memcpy(p2, code.c_str(), n2);
                 GlobalUnlock(g2);
                 SetClipboardData(CF_UNICODETEXT, g2);
             }
@@ -6123,30 +5812,14 @@ static void OnClick(POINT p) {
         TogToast(T(L"房间码已复制", L"Room code copied"));
         break;
     }
-    case HK_TOG_JOIN: {
-        if (!g_togMyCode.empty() && g_togInputText == g_togMyCode) {
-            TogToast(T(L"房间码，发给朋友以邀请加入", L"Send this code to invite"));
-            break;
-        }
-        std::wstring err;
-        std::string code(g_togInputText.begin(), g_togInputText.end());
-        Logf("TOG", "尝试加入 code=%s", code.c_str());
-        if (TogetherJoin(code, TogetherDefaultNick(false), err)) {
-            g_togInput = false;
-            TogToast(T(L"正在连接…", L"Connecting…"));
-        } else {
-            TogToast(err);
-        }
+    case HK_TOG_JOIN:
+        TogetherJoin(Narrow(g_togInputText));
+        g_togInput = false;
         break;
-    }
     case HK_TOG_CARD: break;
     case HK_TOG_LEAVE:
-        TogetherStop();
-        g_togPeer.clear();
-        g_togMyCode.clear();
-        g_togHosting = false;
+        TogetherLeave();
         g_togOpen = false;
-        TogToast(T(L"已退出一起听", L"Left the room"));
         break;
 #endif  // FLORAL_NO_TOGETHER
     case HK_SCROLL: {
@@ -6267,11 +5940,21 @@ static void OnClick(POINT p) {
             LoadAudioFor(a.current);
             break;
         }
+        if (TogetherRoutesControls()) {
+            TogetherRequest(a.playing ? TogetherOp::Pause : TogetherOp::Resume);
+            break;
+        }
         a.playing = !a.playing;
         if (g_audioOk) { if (a.playing) AudioPlay(); else AudioPause(); }
         break;
-    case HK_PREV:  SwitchTrack(-1); break;
-    case HK_NEXT:  SwitchTrack(1); break;
+    case HK_PREV:
+        if (TogetherRoutesControls()) TogetherRequest(TogetherOp::Prev);
+        else SwitchTrack(-1);
+        break;
+    case HK_NEXT:
+        if (TogetherRoutesControls()) TogetherRequest(TogetherOp::Next);
+        else SwitchTrack(1);
+        break;
     case HK_PROGRESS: {
         if (a.current < 0) break;
         g_seekDrag = true;          // start dragging as soon as it's pressed
@@ -6709,7 +6392,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        if (g_seekDrag) g_togForcePush = true;      // finished dragging the progress bar: sync the position once
+        if (g_seekDrag && TogetherRoutesControls())
+            TogetherRequest(TogetherOp::Seek, (int)(g_app.pos * 1000.0));
         g_seekDrag = false;
         g_volDrag = false;
         g_scrollDrag = false;
@@ -6797,18 +6481,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (c == 8) {                                  // backspace
                 if (!g_togInputText.empty()) g_togInputText.pop_back();
             } else if (c == 13) {                          // Enter to join
-                if (!g_togMyCode.empty() && g_togInputText == g_togMyCode) {
-                    TogToast(T(L"这是你自己的房间码，发给朋友让他加入", L"That is your own room code"));
-                    return 0;
-                }
-                std::string code(g_togInputText.begin(), g_togInputText.end());
-                std::wstring err;
-                if (TogetherJoin(code, TogetherDefaultNick(false), err)) {
-                    g_togInput = false;
-                    TogToast(T(L"正在连接…", L"Connecting…"));
-                } else {
-                    TogToast(err);
-                }
+                TogetherJoin(Narrow(g_togInputText));
+                g_togInput = false;
             } else if (c >= 32 && c < 127) {
                 g_togInputText += c;
             }
@@ -6848,9 +6522,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         RemoveTrayIcon();
         SaveWindowRect(hwnd);
-#ifndef FLORAL_NO_TOGETHER
-        TogetherStop();
-#endif
+        TogetherLeave();
         CloseAudioNow();                    // stop the device and join the audio threads
         PostQuitMessage(0);
         return 0;
@@ -7036,7 +6708,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }).detach();
 #ifndef FLORAL_NO_TOGETHER
-    std::thread(StartTogetherHelper).detach();   // login and playlists do not depend on it, so it starts separately
+    static Relay relay(LaunchRelayHelper, kRelayBroker);
+    TogetherInit(&g_playerSide, &relay);
 #endif
     if (!GfxInit()) {
         MessageBoxW(nullptr, T(L"图形初始化失败", L"Graphics init failed"), T(L"错误", L"Error"), MB_ICONERROR);

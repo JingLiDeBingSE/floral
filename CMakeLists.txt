@@ -32,6 +32,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(FLORAL_SOURCES
     src/main.cpp
     src/together.cpp
+    src/relay.cpp
+    src/json.cpp
     src/log.cpp
     src/theme.cpp
     src/data.cpp

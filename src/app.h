@@ -9,18 +9,7 @@
 #include <string>
 #include <vector>
 
-/* ───────── Data ───────── */
-struct Song {
-    std::wstring title;
-    std::wstring artist;
-    std::wstring album;
-    int durationSec = 0;
-    std::wstring cover;     // Local cover path; may be empty
-    std::string  coverUrl;  // Cover URL; downloaded on demand when not local
-    std::string  hash;      // Kugou hash
-    long long    mixId = 0; // mixsongid; use as album_audio_id when resolving stream URL
-    long long    albumId = 0;
-};
+#include "song.h"
 
 /* ───────── Playlists ───────── */
 struct Playlist {
