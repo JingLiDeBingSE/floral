@@ -48,7 +48,7 @@ try {
     }
 
     # 2) 链接
-    $src = @('main.cpp','together.cpp','log.cpp','theme.cpp','data.cpp','audio.cpp','kugou.cpp','lang.cpp','tiles.cpp')
+    $src = @('main.cpp','together.cpp','log.cpp','theme.cpp','data.cpp','audio.cpp','kugou.cpp','lang.cpp','tiles.cpp','vinyl.cpp')
     if ($res) { $src += $res }
     $libs = @('-ld2d1','-ldwrite','-lwindowscodecs','-lole32','-luuid','-lshell32',
               '-lgdi32','-ldwmapi','-lwinmm','-lwininet','-lws2_32','-liphlpapi')
