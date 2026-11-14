@@ -1,21 +1,20 @@
 #pragma once
 #include <string>
 
-/* Play audio via Windows MCI: local files or http URLs (support depends on system codecs).
-   Everything is wide-char, and all return values carry error codes for UI prompts. */
+/* Plays a local file or an http(s) stream (FLAC / MP3 / WAV) at its own sample rate.
+   On failure AudioLastError() returns a message for the UI. */
 
-bool AudioOpen(const std::wstring& path);   // Open and prepare for playback
+bool AudioOpen(const std::wstring& path);   // Load and prepare; playback starts with AudioPlay
 void AudioPlay();
 void AudioPause();
-void AudioStop();
 void AudioClose();
 
 void AudioSeekMS(int ms);
 void AudioSetVolume(int v);                 // 0..1000
 int  AudioPosMS();                          // -1 if unavailable
-int  AudioLenMS();
-bool AudioIsOpen();
 bool AudioIsPlaying();
-bool AudioIsSeeking();                      // Seek in progress in background (UI uses this to show loading)
+bool AudioIsSeeking();                      // Seek queued or running in the background (UI shows loading)
+bool AudioIsEnded();                        // The decoder has played the whole track
+bool AudioIsFailed();                       // Playback stopped early because the download broke off
 
 std::wstring AudioLastError();
