@@ -56,7 +56,7 @@ static std::wstring Trim(const std::wstring& s) {
 
 std::wstring g_likesName = L"kugou-likes.tsv";
 
-std::vector<Song> ReadSongs(const std::wstring& name) {
+std::vector<Song> ReadSongs(const std::wstring& name, int source) {
     std::vector<Song> songs;
 
     std::string bytes;
@@ -93,6 +93,7 @@ std::vector<Song> ReadSongs(const std::wstring& name) {
         if (col.size() < 4) continue;
 
         Song s;
+        s.source = source;
         s.title = Trim(col[0]);
         s.artist = Trim(col[1]);
         s.album = col.size() > 2 ? Trim(col[2]) : L"";
@@ -115,7 +116,6 @@ std::vector<Song> ReadSongs(const std::wstring& name) {
     return songs;
 }
 
-void InitData() {
-    g_app.songs = ReadSongs(g_likesName);
-    g_app.tileAnim.assign(g_app.songs.size(), 0.0f);
+void InitData(int source) {
+    SetGridSongs(ReadSongs(g_likesName, source));
 }

@@ -43,6 +43,14 @@ std::string Narrow(const std::wstring& w) {
     return s;
 }
 
+std::wstring Widen(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
 std::wstring LogPath() {
     if (g_path.empty()) g_path = LocalDir() + L"\\floral-log.txt";
     return g_path;

@@ -1,5 +1,6 @@
 #include "kugou.h"
 #include "json.h"
+#include "log.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 #include <mutex>
@@ -46,14 +48,6 @@ static std::string Http(const std::wstring& url) {
     }
     InternetCloseHandle(inet);
     return out;
-}
-
-static std::wstring Wide(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
-    return w;
 }
 
 static std::string UriEnc(const std::string& s) {
@@ -103,7 +97,7 @@ bool KgLoginStart(const std::wstring& qrPath, std::wstring& err) {
     g_qrKey.clear();
 
     JVal k;
-    if (!Json(Http(Wide("http://127.0.0.1:3000/login/qr/key?timestamp=" +
+    if (!Json(Http(Widen("http://127.0.0.1:3000/login/qr/key?timestamp=" +
                         std::to_string(GetTickCount64()))), k)) {
         err = L"接口没响应，kugou-api 起来了吗";
         return false;
@@ -114,7 +108,7 @@ bool KgLoginStart(const std::wstring& qrPath, std::wstring& err) {
     g_qrKey = q->str();
 
     JVal c;
-    if (!Json(Http(Wide("http://127.0.0.1:3000/login/qr/create?key=" + UriEnc(g_qrKey) +
+    if (!Json(Http(Widen("http://127.0.0.1:3000/login/qr/create?key=" + UriEnc(g_qrKey) +
                         "&qrimg=true")), c)) {
         err = L"生成二维码超时";
         return false;
@@ -134,7 +128,7 @@ int KgLoginPoll(std::string& token, std::string& userid, std::wstring& err) {
     if (g_qrKey.empty()) { err = L"没有二维码 key"; return 4; }
 
     JVal r;
-    std::string raw = Http(Wide("http://127.0.0.1:3000/login/qr/check?key=" + UriEnc(g_qrKey) +
+    std::string raw = Http(Widen("http://127.0.0.1:3000/login/qr/check?key=" + UriEnc(g_qrKey) +
                                 "&timestamp=" + std::to_string(GetTickCount64())));
     if (raw.empty() || !Json(raw, r)) return 0;    // transient failure: keep waiting
 
@@ -214,7 +208,7 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
                              "&token=" + UriEnc(token) + "&timestamp=" +
                              std::to_string(GetTickCount64());
     auto api = [&](const std::string& path) {
-        return Http(Wide("http://127.0.0.1:3000" + path + auth));
+        return Http(Widen("http://127.0.0.1:3000" + path + auth));
     };
 
     // At most 3 pages (100 per page) is enough
@@ -348,7 +342,7 @@ static bool FetchTrackPage(const std::string& url, int page, TrackPage& out) {
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt) Sleep(150 + 120 * (DWORD)attempt);
         JVal r;
-        if (!Json(Http(Wide(url + "&page=" + std::to_string(page))), r)) continue;
+        if (!Json(Http(Widen(url + "&page=" + std::to_string(page))), r)) continue;
         const JVal* d = r.get("data");
         const JVal* songs = d ? (d->get("info") ? d->get("info")
                               : (d->get("songs") ? d->get("songs") : d->get("lists"))) : nullptr;
@@ -451,7 +445,7 @@ int KgExportLikes(const std::string& token, const std::string& userid,
                              "&token=" + UriEnc(token) + "&timestamp=" +
                              std::to_string(GetTickCount64());
     auto api = [&](const std::string& path) {
-        return Http(Wide("http://127.0.0.1:3000" + path + auth));
+        return Http(Widen("http://127.0.0.1:3000" + path + auth));
     };
 
     // 1) playlist list, locate "Likes"
@@ -527,7 +521,7 @@ bool NgLoginStart(const std::wstring& qrPath, std::wstring& err) {
     // this endpoint occasionally returns 502; retry a few times
     for (int i = 0; i < 4 && g_ngKey.empty(); i++) {
         JVal k;
-        if (!Json(NgHttp(Wide("http://127.0.0.1:4000/login/qr/key?timestamp=" +
+        if (!Json(NgHttp(Widen("http://127.0.0.1:4000/login/qr/key?timestamp=" +
                             std::to_string(GetTickCount64()))), k)) {
             Sleep(600);
             continue;
@@ -540,7 +534,7 @@ bool NgLoginStart(const std::wstring& qrPath, std::wstring& err) {
     if (g_ngKey.empty()) { err = L"拿二维码 key 失败（接口 502，稍后重试）"; return false; }
 
     JVal c;
-    if (!Json(NgHttp(Wide("http://127.0.0.1:4000/login/qr/create?key=" + UriEnc(g_ngKey) +
+    if (!Json(NgHttp(Widen("http://127.0.0.1:4000/login/qr/create?key=" + UriEnc(g_ngKey) +
                         "&qrimg=true")), c)) {
         err = L"生成二维码超时";
         return false;
@@ -560,7 +554,7 @@ int NgLoginPoll(std::string& cookie, std::wstring& err) {
     if (g_ngKey.empty()) { err = L"没有二维码 key"; return 4; }
     JVal r;
     // This NetEase endpoint intermittently returns 502 or drops the connection: one failure must not end polling; keep waiting for the next round
-    std::string raw = NgHttp(Wide("http://127.0.0.1:4000/login/qr/check?key=" + UriEnc(g_ngKey) +
+    std::string raw = NgHttp(Widen("http://127.0.0.1:4000/login/qr/check?key=" + UriEnc(g_ngKey) +
                                   "&timestamp=" + std::to_string(GetTickCount64())));
     if (raw.empty() || !Json(raw, r)) return 0;
     const JVal* c = r.get("code");
@@ -586,7 +580,7 @@ static std::string g_anonCookie;
 static std::string GetAnonCookie() {
     if (!g_anonCookie.empty()) return g_anonCookie;
     JVal r;
-    std::string raw = NgHttp(Wide("http://127.0.0.1:4000/register/anonimous?timestamp=" +
+    std::string raw = NgHttp(Widen("http://127.0.0.1:4000/register/anonimous?timestamp=" +
                                 std::to_string(GetTickCount64())));
     if (!raw.empty() && Json(raw, r)) {
         const JVal* c = r.get("cookie");
@@ -616,13 +610,13 @@ std::wstring NgResolveUrl(const std::string& songId, int level, const std::strin
                         "&level=" + kLevels[q];
         if (!session.empty()) u += "&cookie=" + UriEnc(NgTrimCookie(session));
         JVal r;
-        if (!Json(NgHttp(Wide(u)), r)) continue;
+        if (!Json(NgHttp(Widen(u)), r)) continue;
         const JVal* d = r.get("data");
         const JVal* first = d ? d->at(0) : nullptr;
         const JVal* url = first ? first->get("url") : nullptr;
         if (url && !url->str().empty()) {
             if (gotLevel) *gotLevel = NgTier(first->get("level"), q);
-            return Wide(url->str());
+            return Widen(url->str());
         }
     }
     err = L"这首歌没有可用地址（可能要 VIP 或版权受限）";
@@ -651,10 +645,10 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
     std::string ckQ = enc.empty() ? "" : ("?cookie=" + enc);   // first query parameter
 
     // 1) current account uid
-    std::string accRaw = NgHttp(L"http://127.0.0.1:4000/user/account" + Wide(ckQ));
+    std::string accRaw = NgHttp(L"http://127.0.0.1:4000/user/account" + Widen(ckQ));
     if (accRaw.empty()) { err = L"接口服务未启动（netease-api）"; return -1; }
     JVal acc;
-    if (!Json(accRaw, acc)) { err = L"账号接口返回异常：" + Wide(accRaw.substr(0, 80)); return -1; }
+    if (!Json(accRaw, acc)) { err = L"账号接口返回异常：" + Widen(accRaw.substr(0, 80)); return -1; }
     const JVal* codeJ = acc.get("code");
     long long code = codeJ ? codeJ->ll() : 200;
     if (code == 301 || code == 401 || code == 403) { err = L"登录已失效，请重新登录"; return -1; }
@@ -665,7 +659,7 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
     // 2) find "Liked Music"
     JVal pl;
     if (!Json(NgHttp(L"http://127.0.0.1:4000/user/playlist?uid=" +
-                   Wide(std::to_string(uid->ll())) + Wide(ck)), pl)) {
+                   Widen(std::to_string(uid->ll())) + Widen(ck)), pl)) {
         err = L"拉歌单超时";
         return -1;
     }
@@ -692,7 +686,7 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
         std::string u = "http://127.0.0.1:4000/playlist/track/all?id=" + std::to_string(pid) +
                         "&limit=100&offset=" + std::to_string(off) + ck;
         for (int attempt = 0; attempt < 8; attempt++) {
-            std::string raw = NgHttp(Wide(u));
+            std::string raw = NgHttp(Widen(u));
             if (!raw.empty() && Json(raw, r)) {
                 songs = r.get("songs");
                 if (songs && songs->count() > 0) break;
@@ -789,7 +783,7 @@ bool QqLoginStart(const std::wstring& qrPath, std::wstring& err) {
     if (g_qqKey.empty()) { err = L"拿二维码 key 失败（qq-api 未启动？）"; return false; }
 
     JVal c;
-    if (!Json(QqHttp(L"http://127.0.0.1:3200/login/qr/create?key=" + Wide(UriEnc(g_qqKey)) +
+    if (!Json(QqHttp(L"http://127.0.0.1:3200/login/qr/create?key=" + Widen(UriEnc(g_qqKey)) +
                      L"&qrimg=true"), c)) {
         err = L"生成二维码超时";
         return false;
@@ -808,7 +802,7 @@ bool QqLoginStart(const std::wstring& qrPath, std::wstring& err) {
 int QqLoginPoll(std::string& cookie, std::wstring& err) {
     if (g_qqKey.empty()) { err = L"没有二维码 key"; return 4; }
     JVal r;
-    std::string raw = QqHttp(L"http://127.0.0.1:3200/login/qr/check?key=" + Wide(UriEnc(g_qqKey)));
+    std::string raw = QqHttp(L"http://127.0.0.1:3200/login/qr/check?key=" + Widen(UriEnc(g_qqKey)));
     if (raw.empty() || !Json(raw, r)) return 0;          // keep waiting on transient glitches
 
     const JVal* c = r.get("code");
@@ -836,7 +830,7 @@ std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie,
         std::string u = "http://127.0.0.1:3200/getMusicPlay/" + UriEnc(mid) + "?quality=" + kQuality[q] +
                         QqSessionParam(cookie);
         JVal r;
-        if (!Json(QqHttp(Wide(u)), r)) continue;
+        if (!Json(QqHttp(Widen(u)), r)) continue;
         const JVal* d = r.get("data");
         const JVal* pu = d ? d->get("playUrl") : nullptr;
         const JVal* one = pu ? pu->get(mid.c_str()) : nullptr;
@@ -847,7 +841,7 @@ std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie,
                 const std::string s = served ? served->str() : "";
                 *gotLevel = (s == "flac") ? 2 : (s == "320") ? 1 : (s == "128") ? 0 : q;
             }
-            return Wide(url->str());
+            return Widen(url->str());
         }
     }
     err = L"这首歌没有可用地址（可能要 VIP 或版权受限）";
@@ -862,7 +856,7 @@ int QqExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
         std::string u = "http://127.0.0.1:3200/user/liked-songs?offset=" + std::to_string(off) +
                         "&limit=100" + QqSessionParam(cookie);
         for (int attempt = 0; attempt < 5; attempt++) {
-            std::string raw = QqHttp(Wide(u));
+            std::string raw = QqHttp(Widen(u));
             if (!raw.empty() && Json(raw, r)) {
                 songs = r.get("songs");
                 break;
@@ -919,7 +913,7 @@ int QqExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
     fclose(f);
     return n;
 }
-/* ══════════════ Cross-platform matching: search the local platform for similar tracks by title + artist ══════════════ */
+/* ══════════════ Cross-platform matching: find a song of another platform by title, artist and length ══════════════ */
 
 static std::string Lower(const std::string& s) {
     std::string o;
@@ -927,50 +921,78 @@ static std::string Lower(const std::string& s) {
     return o;
 }
 
-/* Strip common suffixes: (Live) (Remaster) (Explicit) etc. */
+/* Lowercased title without bracketed parts such as "(Live)" or "（Live）"; a title that is all brackets stays whole */
 static std::string NormTitle(const std::string& s) {
     std::string o;
     int depth = 0;
-    for (char c : s) {
-        if (c == '(' || c == '[' || c == L'（') { depth++; continue; }
-        if (c == ')' || c == ']' || c == L'）') { if (depth) depth--; continue; }
-        if (depth) continue;
-        o += c;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (s.compare(i, 3, "（") == 0) { c = '('; i += 2; }     // full-width brackets are 3 bytes in UTF-8
+        else if (s.compare(i, 3, "）") == 0) { c = ')'; i += 2; }
+        if (c == '(' || c == '[') { depth++; continue; }
+        if (c == ')' || c == ']') { if (depth) depth--; continue; }
+        if (!depth) o += c;
     }
     while (!o.empty() && (o.back() == ' ' || o.back() == '-')) o.pop_back();
-    return Lower(o);
+    return Lower(o.empty() ? s : o);
 }
 
+/* Names in an artist credit such as "周杰伦、费玉清" or "A/B", without spaces and normalized like titles */
+static std::vector<std::string> ArtistNames(std::string credit) {
+    for (std::string_view sep : { "、", "，", ",", "&", ";" })
+        for (size_t p; (p = credit.find(sep)) != std::string::npos; ) credit.replace(p, sep.size(), "/");
+    std::vector<std::string> names;
+    std::string name;
+    for (char c : credit + "/") {
+        if (c != '/') { if (c != ' ') name += c; continue; }
+        if (!name.empty()) names.push_back(NormTitle(name));
+        name.clear();
+    }
+    return names;
+}
+
+/* How closely a search result (t2, a2, dur2) fits the wanted song (t1, a1, wantDur); 60 or more counts as
+   the same song. An empty artist or a zero length is unknown and not compared */
 static int Score(const std::string& t1, const std::string& a1,
                  const std::string& t2, const std::string& a2, int dur2, int wantDur) {
     int sc = 0;
-    std::string n1 = NormTitle(t1), n2 = NormTitle(t2);
-    if (n1 == n2) sc += 60;
-    else if (n2.find(n1) != std::string::npos || n1.find(n2) != std::string::npos) sc += 30;
+    const std::string n1 = NormTitle(t1), n2 = NormTitle(t2);
+    if (n1 == n2) sc = (Lower(t1) == Lower(t2)) ? 65 : 60;   // the exact title wins over its live or remix takes
+    else if (n2.find(n1) != std::string::npos || n1.find(n2) != std::string::npos) sc = 20;   // needs a close length too
+    else return 0;
 
-    std::string l1 = Lower(a1), l2 = Lower(a2);
-    if (!l1.empty() && !l2.empty()) {
-        if (l1 == l2) sc += 30;
-        else if (l2.find(l1) != std::string::npos || l1.find(l2) != std::string::npos) sc += 20;
+    if (!a1.empty() && !a2.empty()) {
+        int artist = 0;                   // 30 when the credits share a name, 20 when one name contains another
+        for (const std::string& x : ArtistNames(a1))
+            for (const std::string& y : ArtistNames(a2)) {
+                if (x == y) artist = 30;
+                else if (!artist && (x.find(y) != std::string::npos || y.find(x) != std::string::npos)) artist = 20;
+            }
+        if (!artist) return 0;
+        sc += artist;
     }
-    if (wantDur > 0 && dur2 > 0 && abs(wantDur - dur2) <= 3) sc += 10;
+    if (wantDur > 0 && dur2 > 0) {
+        const int diff = abs(wantDur - dur2);
+        if (diff > 15) return 0;          // another cut of the song, or a preview clip
+        if (diff <= 3) sc += 10;
+    }
     return sc;
 }
 
-/* Search on the source platform; returns true on a hit and fills hash */
-bool MatchOnPlatform(int source, const std::string& title, const std::string& artist,
-                     int wantDur, std::string& hashOut, long long& mixIdOut, long long& albumIdOut,
+bool MatchOnPlatform(int source, const std::string& title, const std::string& artist, int wantDur,
+                     const std::string& cookie, std::string& hashOut, long long& mixIdOut, long long& albumIdOut,
                      std::wstring& err) {
-    std::string q = title;
-    if (!artist.empty()) q += " " + artist;
-    std::string enc = UriEnc(q);
+    // The QQ service rejects keywords longer than 60 characters
+    std::string enc = UriEnc(Narrow(Widen(artist.empty() ? title : title + " " + artist).substr(0, 60)));
 
+    // NetEase's /search answers anonymous requests with unrelated songs; /cloudsearch does not.
+    // QQ Music rejects anonymous searches made in quick succession, so a signed-in account uses its session
     std::string base;
-    if (source == 2)      base = "http://127.0.0.1:3200/search?keyword=" + enc + "&limit=10";
-    else if (source == 1) base = "http://127.0.0.1:4000/search?keywords=" + enc + "&limit=10";
+    if (source == 2)      base = "http://127.0.0.1:3200/search?keyword=" + enc + "&limit=10" + QqSessionParam(cookie);
+    else if (source == 1) base = "http://127.0.0.1:4000/cloudsearch?keywords=" + enc + "&limit=10";
     else                  base = "http://127.0.0.1:3000/search?keyword=" + enc + "&page=1&pagesize=10";
 
-    std::string raw = (source == 1) ? NgHttp(Wide(base)) : (source == 2 ? QqHttp(Wide(base)) : Http(Wide(base)));
+    std::string raw = (source == 1) ? NgHttp(Widen(base)) : (source == 2 ? QqHttp(Widen(base)) : Http(Widen(base)));
     if (raw.empty()) { err = L"搜索接口没响应"; return false; }
 
     JVal r;
@@ -978,12 +1000,22 @@ bool MatchOnPlatform(int source, const std::string& title, const std::string& ar
 
     int best = -1;
     std::string bestHash;
-    long long curMixId = 0, curAlbumId = 0, bestMix = 0, bestAlbum = 0;
+    long long bestMix = 0, bestAlbum = 0;
 
     auto pick = [](const JVal* it, const char* k1, const char* k2) -> const JVal* {
         const JVal* v = it->get(k1);
         if (!v && k2) v = it->get(k2);
         return v;
+    };
+
+    // Joins the names of an artist array the way the exported track lists do
+    auto names = [](const JVal* artists) {
+        std::string s;
+        for (int i = 0; artists && i < artists->count(); i++) {
+            const JVal* an = artists->at(i)->get("name");
+            if (an && !an->str().empty()) { if (!s.empty()) s += "、"; s += an->str(); }
+        }
+        return s;
     };
 
     auto tryItem = [&](const JVal* it) {
@@ -992,57 +1024,43 @@ bool MatchOnPlatform(int source, const std::string& title, const std::string& ar
         if (!nm) return;
         std::string t2 = nm->str();
 
-        std::string a2, h, dur;
+        std::string a2;
+        long long dur = 0, mixId = 0, albumId = 0;
         const JVal* id = nullptr;
         if (source == 2) {
-            const JVal* sg = it->get("singer");
-            if (sg && sg->t == JVal::ARR && sg->count() > 0) {
-                const JVal* an = sg->at(0)->get("name");
-                if (an) a2 = an->str();
-            }
+            a2 = names(it->get("singer"));
             id = it->get("mid");
             const JVal* iv = it->get("interval");
-            if (iv) dur = std::to_string(iv->ll());
+            if (iv) dur = iv->ll();
         } else if (source == 1) {
-            const JVal* ar = it->get("ar");
-            if (ar && ar->t == JVal::ARR && ar->count() > 0) {
-                const JVal* an = ar->at(0)->get("name");
-                if (an) a2 = an->str();
-            }
+            a2 = names(it->get("ar"));
             id = it->get("id");
             const JVal* dt = it->get("dt");
-            if (dt) dur = std::to_string(dt->ll() / 1000);
+            if (dt) dur = dt->ll() / 1000;
         } else {
             const JVal* sg = pick(it, "SingerName", "singername");
             if (sg) a2 = sg->str();
             id = pick(it, "FileHash", "hash");
             const JVal* du = pick(it, "Duration", "duration");
-            if (du) dur = std::to_string(du->ll());
-            const JVal* mix = pick(it, "MixSongID", nullptr);
-            const JVal* alb = pick(it, "AlbumID", nullptr);
-            if (mix) curMixId = mix->ll();
-            if (alb) curAlbumId = alb->ll();
+            if (du) dur = du->ll();
+            const JVal* mix = it->get("MixSongID");
+            const JVal* alb = it->get("AlbumID");
+            if (mix) mixId = mix->ll();
+            if (alb) albumId = alb->ll();
         }
         if (!id) return;
         std::string idStr = (id->t == JVal::NUM) ? std::to_string(id->ll()) : id->str();
         if (idStr.empty()) return;
 
-        int sc = Score(title, artist, t2, a2, dur.empty() ? 0 : atoi(dur.c_str()), wantDur);
-        if (sc > best) { best = sc; bestHash = idStr; bestMix = curMixId; bestAlbum = curAlbumId; }
+        int sc = Score(title, artist, t2, a2, (int)dur, wantDur);
+        if (sc > best) { best = sc; bestHash = idStr; bestMix = mixId; bestAlbum = albumId; }
     };
 
-    if (source == 2) {
-        const JVal* items = r.get("items");
-        if (items && items->t == JVal::ARR) for (int i = 0; i < items->count(); i++) tryItem(items->at(i));
-    } else if (source == 1) {
-        const JVal* res = r.get("result");
-        const JVal* songs = res ? res->get("songs") : nullptr;
-        if (songs && songs->t == JVal::ARR) for (int i = 0; i < songs->count(); i++) tryItem(songs->at(i));
-    } else {
-        const JVal* data = r.get("data");
-        const JVal* lists = data ? data->get("lists") : nullptr;
-        if (lists && lists->t == JVal::ARR) for (int i = 0; i < lists->count(); i++) tryItem(lists->at(i));
-    }
+    // Results are at items for QQ Music, result.songs for NetEase and data.lists for Kugou
+    const JVal* outer = (source == 2) ? &r : r.get(source == 1 ? "result" : "data");
+    const JVal* list = outer ? outer->get(source == 2 ? "items" : source == 1 ? "songs" : "lists") : nullptr;
+    if (!list || list->t != JVal::ARR) { err = L"搜索没有返回结果列表: " + Widen(raw.substr(0, 120)); return false; }
+    for (int i = 0; i < list->count(); i++) tryItem(list->at(i));
 
     if (best < 60) { err = L"没有匹配的版本"; return false; }
     hashOut = bestHash;

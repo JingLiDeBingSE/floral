@@ -10,5 +10,6 @@
 void LogInit();                                   // clear file and write startup header
 void Logf(const char* tag, const char* fmt, ...); // printf-style
 void LogW(const char* tag, const wchar_t* msg);   // single wide-char line
-std::wstring LogPath();
-std::string  Narrow(const std::wstring& w);                           // full path of the log file
+std::wstring LogPath();                           // full path of the log file
+std::string  Narrow(const std::wstring& w);       // UTF-16 to UTF-8
+std::wstring Widen(const std::string& s);         // UTF-8 to UTF-16

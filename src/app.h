@@ -58,7 +58,7 @@ enum HitKind {
     HK_TOG_INPUT,   // Room code input
     HK_TOG_JOIN,    // Join
     HK_TOG_LEAVE,   // Leave listen-together
-    HK_TOG_SWAP,    // Change local address (deprecated placeholder)
+    HK_TOG_QUEUE,   // Guest: show the host's list in the song grid
     HK_TOG_CARD,    // Card blank area: swallow clicks; don't close panel
     HK_SCROLL,      // Song picker scrollbar
     HK_PL,          // Playlist picker circle
@@ -74,7 +74,8 @@ struct Hit {
 };
 
 struct App {
-    std::vector<Song> songs;
+    std::vector<Song> songs;            // List shown in the song grid
+    std::vector<Song> queue;            // Play queue; may differ from the list in the grid
     std::vector<Playlist> playlists;
 
     /* Playlist picker: pan + drag inertia */
@@ -98,7 +99,7 @@ struct App {
     int hoverTile = -1;
     std::vector<float> tileAnim;        // Per-tile hover anim 0..1
 
-    int current = -1;                   // Currently playing track
+    int current = -1;                   // Index in queue of the current track, -1 when none is selected
     bool playing = false;
     double pos = 0.0;                   // Playback position (seconds)
 
@@ -122,10 +123,14 @@ extern std::wstring g_dataDir;
 
 enum { WB_MIN = 0, WB_MAX = 1, WB_CLOSE = 2 };
 
-void InitData();
-/* Songs listed in a track list TSV, found the same way as other data files; callable from worker threads */
-std::vector<Song> ReadSongs(const std::wstring& name);
+/* Loads g_likesName into g_app.songs; source is the SRC_* platform the file was fetched from */
+void InitData(int source);
+/* Songs listed in a track list TSV, found the same way as other data files, with `source` as their platform;
+   callable from worker threads */
+std::vector<Song> ReadSongs(const std::wstring& name, int source);
 extern std::wstring g_likesName;
+/* Replaces the list shown in the song grid; implemented by main.cpp */
+void SetGridSongs(std::vector<Song> songs);
 
 /* Embedded resource: default playlist data (used by data.cpp) */
 bool LoadEmbeddedLikes(std::string& out);

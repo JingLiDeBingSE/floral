@@ -10,7 +10,7 @@
  * The host broadcasts its complete playback state; each guest converges to the latest state it has
  * received, so a lost, repeated or late message never leaves a lasting difference. A room lives in one
  * session object that exists from joining until leaving. main.cpp supplies the player and the relay
- * link through the two interfaces below; the self-test supplies fakes of both.
+ * link through the two interfaces below.
  */
 
 /* Period of the host's state broadcast and of each guest's status report */
@@ -111,6 +111,3 @@ int  TogetherStartPosMs(int index);   // where to start the track just opened, -
 bool TogetherHoldsTrackEnd();         // a following guest pauses at the end of a track and waits for the host
 bool TogetherRoutesControls();        // a guest's playback controls become requests to the host
 void TogetherRequest(TogetherOp op, int arg = 0);   // arg: milliseconds for Seek, queue index for Pick
-
-/* Runs host and guest sessions against fake players over a lossy link; writes a report, 0 when all pass */
-int TogetherSelfTest(const std::wstring& reportPath);
