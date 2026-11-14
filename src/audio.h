@@ -13,7 +13,8 @@ void AudioSeekMS(int ms);
 void AudioSetVolume(int v);                 // 0..1000
 int  AudioPosMS();                          // -1 if unavailable
 bool AudioIsPlaying();
-bool AudioIsSeeking();                      // Seek in progress in background (UI uses this to show loading)
+bool AudioIsSeeking();                      // Seek queued or running in the background (UI shows loading)
 bool AudioIsEnded();                        // The decoder has played the whole track
+bool AudioIsFailed();                       // Playback stopped early because the download broke off
 
 std::wstring AudioLastError();

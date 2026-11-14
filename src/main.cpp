@@ -2347,7 +2347,7 @@ static bool g_audioOk = false;      // whether the current track is really playi
 /* ── Playback loading animation ── */
 static bool      g_audioLoading = false;
 static bool      g_audioError = false;
-static int       g_audioErrKind = 0;      // 1 resolve failed / 2 cannot open (undecodable)
+static int       g_audioErrKind = 0;      // 1 resolve failed / 2 cannot open (undecodable) / 3 download broke off
 static ULONGLONG g_loadingSince = 0;
 static ULONGLONG g_loadingMin = 0;        // show at least until this tick; anything faster is invisible
 static int       g_audioRetry = 0;        // allow one automatic retry when open succeeds but no sound comes out
@@ -2391,6 +2391,14 @@ static void BeginOpenAsync(const std::wstring& url) {
         g_openResult = ok ? 1 : -1;
     }).detach();
 }
+
+/* Close audio on the UI thread; background opens still queued or running are dropped */
+static void CloseAudioNow() {
+    ++g_openGen;
+    g_openResult = 0;
+    AudioClose();
+}
+
 static int           g_urlIdx = -1;
 
 static std::string   g_token2_unused;
@@ -2430,8 +2438,10 @@ static unsigned char QualMaskFor(int idx) {
 }
 static void SetQualMask(int idx, int requested, int gotLevel) {
     std::lock_guard<std::mutex> lk(g_qmMx);
+    const unsigned char upToServed = (unsigned char)((2u << gotLevel) - 1);
+    if (gotLevel < requested) g_qmMask = upToServed;
+    else g_qmMask = (idx == g_qmIdx) ? (unsigned char)(g_qmMask | upToServed) : 0xFF;   // keep tiers ruled out before
     g_qmIdx = idx;
-    g_qmMask = (gotLevel < requested) ? (unsigned char)((2u << gotLevel) - 1) : 0xFF;
 }
 
 static std::wstring QualFile() { return LocalDir() + L"\\quality.txt"; }
@@ -2870,7 +2880,9 @@ static std::wstring ResolvePlayUrl(const Song& s, int quality, int& gotLevel) {
     std::string cookie = "dfid=" + dfid + ";userid=" + g_userid + ";token=" + g_token;
     char url[2048] = "";
     std::string lastResp;
-    for (int q = quality; q >= 0; q--) {
+    std::wstring best;
+    int bestLevel = -1;
+    for (int q = quality; q > bestLevel; q--) {   // a lower tier cannot beat the file already found
         sprintf(url,
                 "http://127.0.0.1:3000/song/url?hash=%s&album_audio_id=%lld&album_id=%lld&quality=%s&cookie=%s",
                 hash.c_str(), s.mixId, s.albumId, kQualApi[q], UrlEnc(cookie).c_str());
@@ -2885,11 +2897,15 @@ static std::wstring ResolvePlayUrl(const Song& s, int quality, int& gotLevel) {
             }
             // Kugou answers a tier the song lacks with a 128k MP3, so the tier comes from the file returned
             int got = (JsonStr(r, "extName") == "flac") ? q : (JsonInt(r, "bitRate") >= 256000 ? 1 : 0);
-            if (got < q) break;                // the next tier down may still beat this file
-            gotLevel = got;
-            Logf("SRC", "酷狗解析成功 档位=%d", got);
-            return Widen(u);
+            if (got > bestLevel) { best = Widen(u); bestLevel = got; }
+            break;
         }
+        if (bestLevel >= q) break;
+    }
+    if (!best.empty()) {
+        gotLevel = bestLevel;
+        Logf("SRC", "酷狗解析成功 档位=%d", bestLevel);
+        return best;
     }
 
     {   // on failure dump the request and response to ease debugging
@@ -2970,8 +2986,8 @@ static void PrefetchUrl(int idx) {
     }).detach();
 }
 
-/** Change track: try the local file first, else resolve the URL in the background and stream */
-static void LoadAudioFor(int idx) {
+/** Change track: try the local file first (unless useLocal is false), else resolve the URL in the background and stream */
+static void LoadAudioFor(int idx, bool useLocal = true) {
     Trace("LoadAudioFor idx=%d", idx);
     BeginCloseAsync();
     g_audioOk = false;
@@ -2982,7 +2998,7 @@ static void LoadAudioFor(int idx) {
     g_audioLoading = true;              // raise "loading" first; clear it once there's a position
     g_loadingSince = GetTickCount64();
 
-    std::wstring local = FindAudio(idx);
+    std::wstring local = useLocal ? FindAudio(idx) : L"";
     if (!local.empty()) {
         g_loadingMin = 0;
         BeginOpenAsync(local);
@@ -3054,6 +3070,7 @@ static void SwitchTrackNow(int dir) {
     a.pos = 0.0;
     a.playing = true;
     g_audioRetry = 0;              // new song: reset the retry count
+    g_pendingSeekMs = -1;          // a new song starts from its beginning
 
     LoadAudioFor(to);
 }
@@ -3827,7 +3844,9 @@ static void DrawPlayerPage() {
         }
 
         if (g_audioError) {
-            Text(g_audioErrKind == 2 ? T(L"无法播放 · 解码失败", L"Cannot play · decode failed") : T(L"无法播放 · 地址解析失败", L"Cannot play · URL failed"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL),
+            Text(g_audioErrKind == 3 ? T(L"播放中断 · 网络错误", L"Stopped · network error")
+                 : g_audioErrKind == 2 ? T(L"无法播放 · 解码失败", L"Cannot play · decode failed")
+                 : T(L"无法播放 · 地址解析失败", L"Cannot play · URL failed"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL),
                  Rc(px, cy - 10, pw, 18), UI::ACCENT);
         }
 
@@ -5500,9 +5519,11 @@ static bool Animate() {
                     g_vol = 1.0f;
                     ApplyVolume();
                 }
-                AudioPlay();
+                if (a.playing) AudioPlay();          // stays paused if the user paused while it loaded
                 Trace("open  ok idx=%d", a.current);
                 PrefetchUrl((a.current + 1) % (int)a.songs.size());
+            } else if (r < 0 && g_openUrl.rfind(L"http", 0) != 0) {   // a local file that won't open: stream instead
+                LoadAudioFor(a.current, false);
             } else if (r < 0) {
                 g_audioError = true;
                 g_audioErrKind = 2;
@@ -5544,7 +5565,7 @@ static bool Animate() {
     }
 
     // Watchdog: the stream opened but its position never advances, so treat it as dead
-    if (g_audioLoading && g_audioOk && AudioPosMS() <= 120 &&
+    if (g_audioLoading && g_audioOk && a.playing && AudioPosMS() <= 120 &&
         GetTickCount64() - g_loadingSince > 4000) {
         Trace("wd1 fire idx=%d", a.current);
         AudioClose();
@@ -5573,6 +5594,7 @@ static bool Animate() {
     if (seeking) {
         g_audioLoading = true;
         g_loadingMin = 0;
+        g_loadingSince = GetTickCount64();   // the watchdog above counts from the end of the seek
     }
 
     // Spinner: keep spinning until a position can be read (and show for at least g_loadingMin)
@@ -5587,9 +5609,9 @@ static bool Animate() {
         }
     }
 
-    // Fade in / fade out
+    // Fade in / fade out; a fade-in waits while a seek keeps the output silent
     if (g_fadeDir != 0) {
-        g_vol += g_fadeDir * (dt / (g_fadeDir > 0 ? 0.45f : 0.25f));
+        if (g_fadeDir < 0 || !seeking) g_vol += g_fadeDir * (dt / (g_fadeDir > 0 ? 0.45f : 0.25f));
         if (g_vol > 1.0f) g_vol = 1.0f;
         if (g_vol < 0.0f) g_vol = 0.0f;
         ApplyVolume();
@@ -5601,7 +5623,7 @@ static bool Animate() {
             if (g_pendingPick >= 0) {        // switching to one specific track
                 int i = g_pendingPick;
                 g_pendingPick = -1;
-                LoadAudioFor(i);             // StartFadeIn is called inside
+                LoadAudioFor(i);
             } else {
                 int d = g_pendingDir;
                 g_pendingDir = 0;
@@ -5618,8 +5640,14 @@ static bool Animate() {
                 int ms = AudioPosMS();
                 if (ms >= 0) a.pos = ms / 1000.0;
 
-                // A fade-out in progress already leads to the track the user picked
-                if (AudioIsEnded() && g_fadeDir >= 0) {
+                if (AudioIsFailed()) {         // the download broke off: stop, and let a retry resume from here
+                    Logf("ERR", "下载中断 ms=%d", ms);
+                    g_pendingSeekMs = (int)(a.pos * 1000.0);
+                    BeginCloseAsync();
+                    g_audioOk = false;
+                    g_audioError = true;
+                    g_audioErrKind = 3;
+                } else if (AudioIsEnded() && g_fadeDir >= 0) {   // a fade-out in progress already leads elsewhere
                     Logf("AUD", "自动连播：ms=%d", ms);
                     bool follower = false;
 #ifndef FLORAL_NO_TOGETHER
@@ -6024,7 +6052,7 @@ static void OnClick(POINT p) {
             g_likesName = std::wstring(SourceTag()) + L"-likes.tsv";
     Logf("APP", "音源=%d 歌单文件=%s", g_source, Narrow(g_likesName).c_str());
             { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }
-            AudioClose();
+            CloseAudioNow();
             g_audioOk = false;
             g_audioError = false;
             g_token.clear();
@@ -6201,7 +6229,7 @@ static void OnClick(POINT p) {
         g_loginAsked = false;
         g_loginRunning = false;                 // cancel the previous poll, which may still be running
         { std::lock_guard<std::mutex> lk(g_lgMx); g_lgState = 0; g_lgMsg.clear(); }
-        AudioClose();
+        CloseAudioNow();
         g_audioOk = false;
         g_audioError = false;
         SettingsToast(T(L"已清空缓存和登录信息", L"Cache and sign-in cleared"));
@@ -6821,7 +6849,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 #ifndef FLORAL_NO_TOGETHER
         TogetherStop();
 #endif
-        AudioClose();                       // stop the device, join the download thread
+        CloseAudioNow();                    // stop the device and join the audio threads
         PostQuitMessage(0);
         return 0;
     }

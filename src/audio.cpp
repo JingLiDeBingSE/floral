@@ -19,8 +19,9 @@
 /*
  * Playback backend: miniaudio (bundles dr_mp3 / dr_flac decoding).
  *
- * A download thread streams the file into an in-memory buffer via WinInet; the decoder
- * callbacks read from that buffer and wait for the download when data runs short.
+ * A download thread streams the file into an in-memory buffer via WinInet and the decoder
+ * reads from that buffer. Seeks wait for the download to reach their target; the device
+ * callback plays silence instead of waiting when the download falls behind.
  * The decoder keeps the source sample rate and the device is opened at that rate.
  */
 
@@ -36,6 +37,7 @@ std::vector<unsigned char> g_buf;            // downloaded bytes so far
 size_t                     g_readPos = 0;    // current decoder read position
 bool                       g_eof = false;
 std::atomic<bool>          g_abort{ false };
+std::atomic<bool>          g_dlFailed{ false };   // the download stopped before the whole file arrived
 
 std::thread g_dl;
 std::thread g_seekThread;
@@ -47,19 +49,21 @@ std::atomic<bool> g_decReady{ false };
 
 std::atomic<float>     g_vol{ 1.0f };
 std::atomic<bool>      g_paused{ true };
-std::atomic<bool>      g_ended{ false };     // the decoder has no frames left
+std::atomic<bool>      g_ended{ false };     // the decoder has played the whole file
+std::atomic<bool>      g_failed{ false };    // the decoder ran out of data because the download broke off
 std::atomic<int>       g_posMs{ 0 };         // decoder position in ms, kept here so the UI thread never reads g_dec
 std::wstring           g_err;
 
 std::atomic<bool> g_seeking{ false };
-std::atomic<int>  g_seekReq{ -1 };
+std::atomic<int>  g_seekReq{ -1 };           // set under g_mx and announced on g_cv
 std::atomic<bool> g_seekStop{ false };
+thread_local bool t_seekWorker = false;      // a newer seek request cuts short the waits of this thread only
 
 /* ── Decoder callbacks: read from the memory buffer ── */
 ma_result OnRead(ma_decoder*, void* out, size_t bytes, size_t* got) {
     std::unique_lock<std::mutex> lk(g_mx);
     g_cv.wait(lk, [&] {
-        return g_abort || g_eof || g_readPos + bytes <= g_buf.size();
+        return g_abort || g_eof || g_readPos + bytes <= g_buf.size() || (t_seekWorker && g_seekReq >= 0);
     });
     if (g_abort) { *got = 0; return MA_SUCCESS; }
     size_t avail = g_buf.size() - g_readPos;
@@ -75,7 +79,9 @@ ma_result OnSeek(ma_decoder*, ma_int64 offset, ma_seek_origin origin) {
     std::unique_lock<std::mutex> lk(g_mx);
     ma_int64 target = (origin == ma_seek_origin_start ? 0 : (ma_int64)g_readPos) + offset;
     if (target < 0) return MA_BAD_SEEK;
-    g_cv.wait(lk, [&] { return g_abort || g_eof || (ma_int64)g_buf.size() >= target; });
+    g_cv.wait(lk, [&] {
+        return g_abort || g_eof || (ma_int64)g_buf.size() >= target || (t_seekWorker && g_seekReq >= 0);
+    });
     // dr_flac probes past the end while searching and narrows its range when this fails
     if (g_abort || target > (ma_int64)g_buf.size()) return MA_BAD_SEEK;
     g_readPos = (size_t)target;
@@ -90,17 +96,26 @@ void PublishPosition() {
     g_posMs = (int)(cur * 1000 / g_dec.outputSampleRate);
 }
 
+/** Whether the download is far enough ahead that a decoder read in the callback will not wait for it */
+bool Buffered() {
+    std::lock_guard<std::mutex> lk(g_mx);
+    return g_eof || g_buf.size() - g_readPos >= 256 * 1024;
+}
+
 /* ── Audio output callback ── */
 void OnData(ma_device* dev, void* out, const void*, ma_uint32 frames) {
     float* p = (float*)out;
     ma_uint32 ch = dev->playback.channels;
     ma_uint64 got = 0;
-    // A seek holds the decoder while it waits for the download; play silence until it finishes
+    // The callback never waits: while a seek is queued or running, or the download lags behind, it plays silence
     std::unique_lock<std::mutex> lk(g_decMx, std::try_to_lock);
-    if (lk.owns_lock() && g_decReady) {
+    if (lk.owns_lock() && g_decReady && g_seekReq < 0 && Buffered()) {
         ma_decoder_read_pcm_frames(&g_dec, out, frames, &got);
         PublishPosition();
-        if (got < frames) g_ended = true;   // reads wait for data, so a short read means the stream is over
+        if (got < frames) {                 // the decoder has used up all the data there will be
+            if (g_dlFailed) g_failed = true;
+            else            g_ended = true;
+        }
     }
 
     float v = g_vol.load();
@@ -131,15 +146,21 @@ void DownloadThread(std::wstring url) {
 
     // Growing the buffer copies it while holding g_mx, which stalls the decoder; reserve the full size instead
     DWORD length = 0, lengthSize = sizeof(length);
-    if (req && HttpQueryInfoW(req, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &length, &lengthSize, nullptr)) {
+    bool knownLength = req && HttpQueryInfoW(req, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+                                             &length, &lengthSize, nullptr);
+    if (knownLength) {
         std::lock_guard<std::mutex> lk(g_mx);
-        g_buf.reserve(length);
+        try { g_buf.reserve(length); } catch (const std::bad_alloc&) {}   // the server's length may be bogus
     }
 
+    bool readOk = req != nullptr;
+    size_t received = 0;
     std::vector<unsigned char> chunk(65536);
-    while (req && !g_abort) {
+    while (readOk && !g_abort) {
         DWORD got = 0;
-        if (!InternetReadFile(req, chunk.data(), (DWORD)chunk.size(), &got) || got == 0) break;
+        readOk = InternetReadFile(req, chunk.data(), (DWORD)chunk.size(), &got);
+        if (!readOk || got == 0) break;
+        received += got;
         {
             std::lock_guard<std::mutex> lk(g_mx);
             g_buf.insert(g_buf.end(), chunk.begin(), chunk.begin() + got);
@@ -151,6 +172,7 @@ void DownloadThread(std::wstring url) {
 
     {
         std::lock_guard<std::mutex> lk(g_mx);
+        g_dlFailed = !readOk || (knownLength && received < length);
         g_eof = true;
     }
     g_cv.notify_all();
@@ -180,17 +202,22 @@ bool LoadLocal(const std::wstring& path) {
 
 /* A streaming seek waits for the download to reach the target, so seeks run here instead of on the UI thread */
 void SeekWorker() {
-    while (!g_seekStop) {
-        int ms = g_seekReq.exchange(-1);
-        if (ms < 0) { Sleep(15); continue; }
-
+    t_seekWorker = true;
+    std::unique_lock<std::mutex> lk(g_mx);
+    for (;;) {
+        g_cv.wait(lk, [] { return g_seekStop || g_seekReq >= 0; });
+        if (g_seekStop) return;
         g_seeking = true;
+        int ms = g_seekReq.exchange(-1);
+        lk.unlock();
         {
-            std::lock_guard<std::mutex> lk(g_decMx);
+            std::lock_guard<std::mutex> dk(g_decMx);
             ma_decoder_seek_to_pcm_frame(&g_dec, (ma_uint64)ms * g_dec.outputSampleRate / 1000);
-            PublishPosition();
+            if (g_seekReq < 0) PublishPosition();   // otherwise AudioSeekMS already shows the newer target
             g_ended = false;
+            g_failed = false;
         }
+        lk.lock();
         g_seeking = false;
     }
 }
@@ -201,6 +228,7 @@ void Teardown() {
     {
         std::lock_guard<std::mutex> lk(g_mx);
         g_abort = true;             // unblocks decoder reads and seeks waiting for data
+        g_seekStop = true;
     }
     g_cv.notify_all();
 
@@ -210,7 +238,6 @@ void Teardown() {
         g_devReady = false;
     }
     if (g_dl.joinable()) g_dl.join();
-    g_seekStop = true;
     if (g_seekThread.joinable()) g_seekThread.join();
 
     if (g_decReady) {
@@ -225,9 +252,11 @@ void Teardown() {
         g_readPos = 0;
         g_eof = false;
         g_abort = false;            // a new download thread exits right away while this is set
+        g_dlFailed = false;
     }
     g_paused = true;
     g_ended = false;
+    g_failed = false;
     g_posMs = 0;
     g_seekReq = -1;
 }
@@ -303,10 +332,15 @@ void AudioClose() {
 
 void AudioSeekMS(int ms) {
     if (ms < 0 || !g_decReady) return;
-    g_seekReq = ms;                                  // just store one atomic and return
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_seekReq = ms;
+    }
+    g_posMs = ms;                                    // report the target until the seek lands
+    g_cv.notify_all();
 }
 
-bool AudioIsSeeking() { return g_seeking.load(); }
+bool AudioIsSeeking() { return g_seeking || g_seekReq >= 0; }
 
 void AudioSetVolume(int v) {
     std::lock_guard<std::recursive_mutex> lk(g_apiMx);
@@ -318,6 +352,7 @@ void AudioSetVolume(int v) {
 int AudioPosMS() { return g_decReady ? g_posMs.load() : -1; }
 
 bool AudioIsEnded() { return g_ended.load(); }
+bool AudioIsFailed() { return g_failed.load(); }
 
 bool AudioIsPlaying() {
     std::lock_guard<std::recursive_mutex> lk(g_apiMx); return g_devReady && !g_paused.load(); }
