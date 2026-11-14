@@ -2419,7 +2419,7 @@ static const wchar_t* kQualName[4] = { T(L"标准", L"Standard"), T(L"高品", L
 static const char*    kQualApi[4]  = { "128", "320", "flac", "high" };   // Kugou's quality parameter per tier
 
 /* Which tiers the current song actually has: bit0=standard bit1=high bit2=lossless bit3=Hi-Res
-   Unknown (0xFF) shows all of them; once resolved it narrows to the tiers up to the one served */
+   Unknown (0xFF) shows all of them; a request served below its tier rules out the tiers above the one served */
 static std::mutex    g_qmMx;
 static int           g_qmIdx = -1;
 static unsigned char g_qmMask = 0xFF;
@@ -2428,10 +2428,10 @@ static unsigned char QualMaskFor(int idx) {
     std::lock_guard<std::mutex> lk(g_qmMx);
     return (idx == g_qmIdx) ? g_qmMask : 0xFF;
 }
-static void SetQualMask(int idx, int gotLevel) {
+static void SetQualMask(int idx, int requested, int gotLevel) {
     std::lock_guard<std::mutex> lk(g_qmMx);
     g_qmIdx = idx;
-    g_qmMask = (unsigned char)((2u << gotLevel) - 1);
+    g_qmMask = (gotLevel < requested) ? (unsigned char)((2u << gotLevel) - 1) : 0xFF;
 }
 
 static std::wstring QualFile() { return LocalDir() + L"\\quality.txt"; }
@@ -3002,7 +3002,7 @@ static void LoadAudioFor(int idx) {
     }
     Logf("AUD", "尝试打开本地缓存 idx=%d", idx);
     if (!cached.url.empty()) {
-        SetQualMask(idx, cached.level);
+        SetQualMask(idx, cached.quality, cached.level);
         g_loadingMin = GetTickCount64() + 300;
         BeginOpenAsync(cached.url);              // network stream: open in the background, don't stall the UI
         PrefetchUrl((idx + 1) % (int)g_app.songs.size());
@@ -3021,7 +3021,7 @@ static void LoadAudioFor(int idx) {
         EnsureSidecar(source);          // the service may still be starting: cached playlists open right after launch
         int got = 0;
         std::wstring u = ResolvePlayUrl(song, quality, got);
-        if (!u.empty()) SetQualMask(idx, got);
+        if (!u.empty()) SetQualMask(idx, quality, got);
         Trace("resolve end   idx=%d ok=%d", idx, u.empty() ? 0 : 1);
         std::lock_guard<std::mutex> lk(g_urlMx);
         g_urlReady = u;
@@ -6143,6 +6143,7 @@ static void OnClick(POINT p) {
         if (h->index >= 0 && h->index < kQualCount && h->index != g_quality) {
             g_quality = h->index;
             SaveQuality();
+            { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }   // old-tier entries would stop PrefetchUrl
             if (g_audioOk && !g_audioLoading && g_fadeDir == 0 && a.current >= 0) {
                 g_pendingSeekMs = (int)(a.pos * 1000.0);   // remember the progress, resume after the reload
                 g_pendingPick = a.current;      // reload with the new quality after the fade-out
