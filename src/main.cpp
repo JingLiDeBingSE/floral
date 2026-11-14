@@ -6,6 +6,7 @@
 #include "lang.h"
 #include "audio.h"
 #include "tiles.h"
+#include "vinyl.h"
 
 #include <d2d1_1.h>
 #include <d2d1effectauthor.h>
@@ -280,6 +281,7 @@ static void Bind(ID2D1RenderTarget* rt) {
     g_coverBmps.clear();
     if (g_blurFx)  { g_blurFx->Release();  g_blurFx = nullptr; }
     if (g_layerRt) { g_layerRt->Release(); g_layerRt = nullptr; }
+    VinylRelease();
     g_coverSeen.clear();
     if (!rt) return;
 
@@ -2204,17 +2206,25 @@ static void StrokeCircle(float cx, float cy, float r, UINT32 c, float a = 1.0f, 
     g_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), g_brush, w);
 }
 
-/** Draw a CD: vinyl base + rotating cover + grooves + center hole */
+/** Radius of a record's label, which shows the cover, as a share of the record's radius */
+static const float LABEL = 0.60f;
+
+/** The vinyl of a record, leaving the label area for the caller */
+static void DrawVinyl(float cx, float cy, float rad, float angleDeg, int seed, float alpha) {
+    if (!VinylDraw(g_rt, cx, cy, rad, LABEL, angleDeg, (unsigned)seed, UI::DISC, g_alpha * g_alphaMul * alpha))
+        FillCircle(cx, cy, rad, UI::DISC, alpha);
+}
+
+/** Draw a record: vinyl + rotating cover as the label + spindle hole */
 static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDeg, float alpha) {
     if (alpha <= 0.01f) return;
     const float rad = (r.right - r.left) * 0.5f;
     if (rad < 4.0f) return;
     const float cx = (r.left + r.right) * 0.5f;
     const float cy = (r.top + r.bottom) * 0.5f;
-    const float artR = rad * 0.66f;
+    const float artR = rad * LABEL;
 
-    // Vinyl base + outer ring
-    FillCircle(cx, cy, rad, UI::DISC, alpha);
+    DrawVinyl(cx, cy, rad, angleDeg, idx, alpha);
 
     // Rotating cover (ellipse fill with a bitmap brush; no Layer)
     // During fade-in, lay the placeholder gradient first, then draw the real art on top
@@ -2252,23 +2262,7 @@ static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDe
         g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), artR, artR), ce->brush);
     }
 
-    // Vinyl grooves
-    for (int i = 1; i <= 3; i++) {
-        float rr = artR + (rad - artR) * (i / 4.0f);
-        StrokeCircle(cx, cy, rr, UI::DISC_GROOVE, 0.55f * alpha, 1.0f);
-    }
-    // Fixed highlight to sell the disc shape
-    if (g_brush) {
-        for (int k = 0; k < 2; k++) {
-            float a0 = -1.9f + k * 0.26f;
-            StrokeCircle(cx, cy, rad * (0.90f - k * 0.05f), UI::DISC_GROOVE, 0.35f * alpha, 1.4f);
-        }
-    }
-    // Center hole
-    FillCircle(cx, cy, rad * 0.05f, UI::BG, alpha);
-    StrokeCircle(cx, cy, rad * 0.05f, UI::DISC_GROOVE, 0.6f * alpha, 1.0f);
-    // Outer edge
-    StrokeCircle(cx, cy, rad - 0.5f, 0x000000, 0.18f * alpha, 1.0f);
+    FillCircle(cx, cy, rad * 0.04f, UI::BG, alpha);
 }
 
 /** Cover inside a small album case */
@@ -3129,14 +3123,15 @@ static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float di
     const float cy = (r.top + r.bottom) * 0.5f;
     const float R  = st * 0.5f;
 
-    const float vr = R * e;                                     // vinyl radius: 0 → R
-    if (vr > 0.5f) FillCircle(cx, cy, vr, 0x2A2026, 1.0f);
-
-    // Cover: starts as the tile's own rectangle, ends as the 1.32R inner square of the disc
-    const float artSide = R * 1.32f;
+    // Cover: starts as the tile's own rectangle, ends as the disc's label
+    const float artSide = R * 2.0f * LABEL;
     const float cw = w0 + (artSide - w0) * e;
     const float ch = h0 + (artSide - h0) * e;
     const float radius = UI::R_TILE + (artSide * 0.5f - UI::R_TILE) * e;
+
+    // The vinyl grows from 0 to R and is skipped while the opaque cover still hides all of it
+    const float vr = R * e;
+    if (vr + 1.0f > 0.5f * (std::min)(cw, ch)) DrawVinyl(cx, cy, vr, 0.0f, idx, 1.0f);
     DrawCoverArt(Rc(cx - cw * 0.5f, cy - ch * 0.5f, cw, ch), s, idx, radius);
 
     // While still close to a tile, the song info fades out with it
@@ -3144,14 +3139,8 @@ static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float di
         float ia = infoK * (1.0f - e / 0.55f);
         if (ia > 0.0f) DrawTileInfo(r, s, ia);
     }
-    // Grooves and center hole: fade in together with the disc
-    if (e > 0.15f) {
-        float k = (e - 0.15f) / 0.85f;
-        StrokeCircle(cx, cy, vr * 0.93f, 0xFFFFFF, 0.05f * k, 1.0f);
-        StrokeCircle(cx, cy, vr * 0.78f, 0xFFFFFF, 0.05f * k, 1.0f);
-        FillCircle(cx, cy, R * 0.05f, UI::BG, 0.9f * k);
-        StrokeCircle(cx, cy, R * 0.05f, 0xFFFFFF, 0.18f * k, 1.0f);
-    }
+    // Spindle hole: fades in with the disc
+    if (e > 0.15f) FillCircle(cx, cy, R * 0.04f, UI::BG, (e - 0.15f) / 0.85f);
 }
 
 static void DrawSpinner(float cx, float cy, float r, float ang, float alpha);
@@ -3645,18 +3634,12 @@ static void DrawPlayerPage() {
         const float cx = dd * 0.10f;
         const float cy = (lineY + H) * 0.5f;
         {
-            // Blank record: vinyl disc + a few grooves + center label (no cover art)
+            // Blank record: the label takes the theme's colors instead of cover art
             float r = dd * 0.5f;
-            // Empty record: base color / grooves / center label all follow the theme
-            FillCircle(cx, cy, r, UI::DISC);
-            for (int i = 1; i <= 4; i++) {
-                float rr = r * (0.50f + 0.11f * (float)i);
-                StrokeRound(Rc(cx - rr, cy - rr, rr * 2.0f, rr * 2.0f), rr,
-                            UI::DISC_GROOVE, 1.0f, 0.5f);
-            }
-            FillCircle(cx, cy, r * 0.33f, MixColor(UI::SELECT, UI::PANEL, 0.35f));
-            StrokeRound(Rc(cx - r * 0.33f, cy - r * 0.33f, r * 0.66f, r * 0.66f),
-                        r * 0.33f, UI::BTN_CLOSE, 1.2f);
+            float lr = r * LABEL;
+            DrawVinyl(cx, cy, r, 0.0f, 0, 1.0f);
+            FillCircle(cx, cy, lr, MixColor(UI::SELECT, UI::PANEL, 0.35f));
+            StrokeRound(Rc(cx - lr, cy - lr, lr * 2.0f, lr * 2.0f), lr, UI::BTN_CLOSE, 1.2f);
             FillCircle(cx, cy, 4.5f, UI::PANEL);           // spindle hole
         }
 
@@ -5725,6 +5708,7 @@ static bool GfxInit() {
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&g_wic)))) return false;
     RegisterMotionBlur();
+    VinylInit(g_d2d);
     return true;
 }
 
@@ -5740,6 +5724,7 @@ static void GfxRelease() {
     g_coverSrcs.clear();
     if (g_blurFx)  { g_blurFx->Release();  g_blurFx = nullptr; }
     if (g_layerRt) { g_layerRt->Release(); g_layerRt = nullptr; }
+    VinylRelease();
     for (int i = 0; i < 8; i++) {
         if (g_covBrush[i]) { g_covBrush[i]->Release(); g_covBrush[i] = nullptr; }
     }
