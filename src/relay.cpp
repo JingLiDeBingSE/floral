@@ -55,11 +55,7 @@ struct Relay::Impl {
     std::thread reader, worker;
 
     void Report(Event::Kind kind, std::string text, unsigned long long atMs) {
-        Event ev;
-        ev.kind = kind;
-        ev.text = std::move(text);
-        ev.atMs = atMs;
-        events.push_back(std::move(ev));
+        events.push_back({ kind, std::move(text), atMs });
     }
 
     void Queue(std::string text, bool message) {
@@ -174,7 +170,7 @@ struct Relay::Impl {
                 process = nullptr;
                 continue;
             }
-            if (quit) break;
+            if (quit && (!running || lines.empty())) break;   // the lines queued by Leave, such as bye, go out first
 
             const unsigned long long now = GetTickCount64();
             const bool rejoinDue = rejoin && now >= retryAt;

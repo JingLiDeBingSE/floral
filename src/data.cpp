@@ -1,4 +1,5 @@
 #include "app.h"
+#include "log.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -39,14 +40,6 @@ static std::wstring FindAsset(const std::wstring& name) {
     return L"";
 }
 
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
-    return w;
-}
-
 static std::wstring Trim(const std::wstring& s) {
     size_t a = s.find_first_not_of(L" \t\r");
     if (a == std::wstring::npos) return L"";
@@ -73,7 +66,7 @@ std::vector<Song> ReadSongs(const std::wstring& name, int source) {
         (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF)
         bytes.erase(0, 3);
 
-    std::wstring text = Utf8ToWide(bytes);
+    std::wstring text = Widen(bytes);
     std::wstringstream ss(text);
     std::wstring line;
 
@@ -114,8 +107,4 @@ std::vector<Song> ReadSongs(const std::wstring& name, int source) {
         songs.push_back(s);
     }
     return songs;
-}
-
-void InitData(int source) {
-    SetGridSongs(ReadSongs(g_likesName, source));
 }

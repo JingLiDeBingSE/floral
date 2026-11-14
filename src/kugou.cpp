@@ -231,11 +231,7 @@ int KgFetchPlaylists(const std::string& token, const std::string& userid,
             kp.gcid = g->str();
             const JVal* nm = p->get("listname");
             if (!nm) nm = p->get("name");
-            if (nm) {
-                int n = MultiByteToWideChar(CP_UTF8, 0, nm->str().data(), (int)nm->str().size(), nullptr, 0);
-                kp.name.resize((size_t)n);
-                MultiByteToWideChar(CP_UTF8, 0, nm->str().data(), (int)nm->str().size(), &kp.name[0], n);
-            }
+            if (nm) kp.name = Widen(nm->str());
             if (kp.name.empty()) kp.name = L"(未命名歌单)";
             const JVal* cnt = p->get("count");
             if (!cnt) cnt = p->get("song_count");
@@ -266,6 +262,16 @@ int KgExportPlaylist(const std::string& token, const std::string& userid, const 
     return KgExportTracksByGcid(token, userid, gcid, countHint, outTsv, err);
 }
 
+/* Names in an array of artist objects, joined with "、" as in the exported track lists */
+static std::string JoinNames(const JVal* artists) {
+    std::string s;
+    for (int i = 0; artists && i < artists->count(); i++) {
+        const JVal* name = artists->at(i)->get("name");
+        if (name && !name->str().empty()) { if (!s.empty()) s += "、"; s += name->str(); }
+    }
+    return s;
+}
+
 /* TSV row for one track of /playlist/track/all; empty when the track has no title */
 static std::string TrackRow(const JVal* t, std::string& hash) {
     if (!t || t->t != JVal::OBJ) return "";
@@ -282,18 +288,7 @@ static std::string TrackRow(const JVal* t, std::string& hash) {
     title = Clean(title);
     if (title.empty()) return "";
 
-    std::string artist;
-    const JVal* si = t->get("singerinfo");
-    if (si && si->t == JVal::ARR) {
-        for (int i = 0; i < si->count(); i++) {
-            const JVal* a = si->at(i);
-            const JVal* an = a ? a->get("name") : nullptr;
-            if (an && !an->str().empty()) {
-                if (!artist.empty()) artist += "、";
-                artist += an->str();
-            }
-        }
-    }
+    const std::string artist = JoinNames(t->get("singerinfo"));
 
     std::string album;
     const JVal* ai = t->get("albuminfo");
@@ -706,14 +701,7 @@ int NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
             std::string title = Clean(nm ? nm->str() : "");
             if (title.empty()) continue;
 
-            std::string artist;
-            const JVal* ar = s->get("ar");
-            if (ar && ar->t == JVal::ARR) {
-                for (int k = 0; k < ar->count(); k++) {
-                    const JVal* a = ar->at(k)->get("name");
-                    if (a && !a->str().empty()) { if (!artist.empty()) artist += "、"; artist += a->str(); }
-                }
-            }
+            const std::string artist = JoinNames(s->get("ar"));
             std::string album;
             const JVal* al = s->get("al");
             const JVal* aln = al ? al->get("name") : nullptr;
@@ -873,14 +861,7 @@ int QqExportLikes(const std::string& cookie, const std::wstring& outTsv, std::ws
             std::string title = Clean(nm ? nm->str() : "");
             if (title.empty()) continue;
 
-            std::string artist;
-            const JVal* sg = s->get("singer");
-            if (sg && sg->t == JVal::ARR) {
-                for (int k2 = 0; k2 < sg->count(); k2++) {
-                    const JVal* a = sg->at(k2)->get("name");
-                    if (a && !a->str().empty()) { if (!artist.empty()) artist += "、"; artist += a->str(); }
-                }
-            }
+            const std::string artist = JoinNames(s->get("singer"));
             std::string album, albumMid;
             const JVal* al = s->get("album");
             if (al) {
@@ -1008,16 +989,6 @@ bool MatchOnPlatform(int source, const std::string& title, const std::string& ar
         return v;
     };
 
-    // Joins the names of an artist array the way the exported track lists do
-    auto names = [](const JVal* artists) {
-        std::string s;
-        for (int i = 0; artists && i < artists->count(); i++) {
-            const JVal* an = artists->at(i)->get("name");
-            if (an && !an->str().empty()) { if (!s.empty()) s += "、"; s += an->str(); }
-        }
-        return s;
-    };
-
     auto tryItem = [&](const JVal* it) {
         if (!it) return;
         const JVal* nm = (source == 0) ? pick(it, "SongName", "name") : pick(it, "name", "title");
@@ -1028,12 +999,12 @@ bool MatchOnPlatform(int source, const std::string& title, const std::string& ar
         long long dur = 0, mixId = 0, albumId = 0;
         const JVal* id = nullptr;
         if (source == 2) {
-            a2 = names(it->get("singer"));
+            a2 = JoinNames(it->get("singer"));
             id = it->get("mid");
             const JVal* iv = it->get("interval");
             if (iv) dur = iv->ll();
         } else if (source == 1) {
-            a2 = names(it->get("ar"));
+            a2 = JoinNames(it->get("ar"));
             id = it->get("id");
             const JVal* dt = it->get("dt");
             if (dt) dur = dt->ll() / 1000;

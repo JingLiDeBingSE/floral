@@ -123,14 +123,10 @@ extern std::wstring g_dataDir;
 
 enum { WB_MIN = 0, WB_MAX = 1, WB_CLOSE = 2 };
 
-/* Loads g_likesName into g_app.songs; source is the SRC_* platform the file was fetched from */
-void InitData(int source);
 /* Songs listed in a track list TSV, found the same way as other data files, with `source` as their platform;
    callable from worker threads */
 std::vector<Song> ReadSongs(const std::wstring& name, int source);
 extern std::wstring g_likesName;
-/* Replaces the list shown in the song grid; implemented by main.cpp */
-void SetGridSongs(std::vector<Song> songs);
 
 /* Embedded resource: default playlist data (used by data.cpp) */
 bool LoadEmbeddedLikes(std::string& out);

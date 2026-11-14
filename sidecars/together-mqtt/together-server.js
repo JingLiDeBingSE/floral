@@ -2,7 +2,7 @@
  * Listen-together relay helper
  *
  * Floral starts this script with stdin and stdout connected to pipes and exchanges one JSON object per line.
- * The script connects to the MQTT broker, encrypts and decrypts, and passes on every message of the room in
+ * The script connects to the MQTT broker, compresses and encrypts, and passes on every message of the room in
  * the order it arrives, the member's own included. Logs go to stderr. The script exits when stdin closes.
  *
  * Commands:
@@ -17,6 +17,7 @@
 'use strict';
 const crypto = require('node:crypto');
 const readline = require('node:readline');
+const zlib = require('node:zlib');
 const mqtt = require('mqtt');
 
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -40,11 +41,11 @@ function newCode() {
   return code;
 }
 
-// Payload: 12-byte IV, 16-byte GCM tag, ciphertext
+// Payload: 12-byte IV, 16-byte GCM tag, ciphertext of the deflated text
 function encrypt(key, text) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const body = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  const body = Buffer.concat([cipher.update(zlib.deflateRawSync(text)), cipher.final()]);
   return Buffer.concat([iv, cipher.getAuthTag(), body]);
 }
 
@@ -52,7 +53,7 @@ function decrypt(key, payload) {
   try {
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, payload.subarray(0, 12), { authTagLength: 16 });
     decipher.setAuthTag(payload.subarray(12, 28));
-    return Buffer.concat([decipher.update(payload.subarray(28)), decipher.final()]).toString('utf8');
+    return zlib.inflateRawSync(Buffer.concat([decipher.update(payload.subarray(28)), decipher.final()])).toString('utf8');
   } catch {
     return null;
   }

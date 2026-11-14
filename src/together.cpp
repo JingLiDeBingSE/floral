@@ -22,11 +22,11 @@
  * ("host" or "guest"), name, seq (increasing per sender) and at (the sender's GetTickCount64).
  *
  *   state   host; every period while a guest is in the room, and at once on a change: list, parts, index,
- *           hash, play ("playing", "paused" or "buffering"), pos, next, members [{id, name, done}]
+ *           hash, play ("playing", "paused" or "buffering"), pos, members [{id, done}]
  *   list    host; one part of its queue: list, part, parts, songs
  *   status  guest; every period, and at once on a change: list (the queue it holds), index, hash, health
  *           ("ok", "loading" or "failed"), want and missing (the list it is collecting and the parts it
- *           lacks), req {op, arg, seq, list}
+ *           lacks), heard (the newest seq received from the host), req {op, arg, seq, list}
  *   bye     either side, on leaving
  *
  * A list id is derived from the songs, so moving to another track of the same queue keeps it. A request
@@ -40,7 +40,6 @@ constexpr unsigned long long kSilentMs = 4 * kTogetherPeriodMs;   // a peer unhe
 constexpr unsigned long long kNotFoundMs = 6000;    // a new guest that hears no host this long gives up
 constexpr unsigned long long kFullMs = 3000;        // a guest left off the member list this long is not admitted
 constexpr unsigned long long kMinGapMs = 100;       // least time between two state or two status messages
-constexpr unsigned long long kResendMs = kTogetherPeriodMs / 2;   // least time between two sends of a part
 constexpr unsigned long long kSeekGapMs = 5000;     // least time between two position corrections
 constexpr unsigned long long kSkewWindowMs = 3 * 60 * 1000;      // older offset samples are dropped to follow drift
 constexpr int kToleranceMs = 1000;                  // positions this close count as in step
@@ -57,7 +56,6 @@ enum class Health { Ok, Loading, Failed };
 const char* const kPlayNames[] = { "paused", "playing", "buffering" };
 const char* const kHealthNames[] = { "ok", "loading", "failed" };
 const char* const kOpNames[] = { "pause", "resume", "seek", "next", "prev", "pick" };   // TogetherOp order
-const char* const kOpLabels[] = { "暂停", "继续播放", "跳转", "下一首", "上一首", "点歌" };
 
 template <size_t N>
 int Lookup(const char* const (&names)[N], const std::string& name) {
@@ -83,18 +81,19 @@ std::string SongJson(const Song& s) {
            ",\"source\":" + std::to_string(s.source) + "}";
 }
 
-bool ReadSong(const JVal& v, Song& s) {
-    s.hash = Str(v, "hash");
-    s.source = (int)Int(v.get("source"), -1);
-    if (s.hash.empty() || s.source < SRC_KUGOU || s.source > SRC_QQ) return false;
+/* Every entry is kept, so that positions match the host's queue; one the player cannot use fails to play */
+Song ReadSong(const JVal& v) {
+    Song s;
     s.title = Widen(Str(v, "title"));
     s.artist = Widen(Str(v, "artist"));
     s.album = Widen(Str(v, "album"));
     s.durationSec = (int)std::clamp(Int(v.get("durationSec")), 0LL, (long long)kMaxTrackSec);
     s.coverUrl = Str(v, "coverUrl");
+    s.hash = Str(v, "hash");
     s.mixId = Int(v.get("mixId"));
     s.albumId = Int(v.get("albumId"));
-    return true;
+    s.source = (int)Int(v.get("source"), -1);
+    return s;
 }
 
 /* Identifies a queue by the platform and id of each song; empty for an empty queue */
@@ -179,22 +178,31 @@ struct Envelope {
     unsigned long long arrivedAt = 0;   // on this machine's clock
 };
 
-/* The host's playback as a state message carries it */
+/* A track and how it plays, as a state message carries them; a status message carries only the track */
 struct Track {
     std::string list;
     int index = -1;
     std::string hash;
     Play play = Play::Paused;
     int posMs = 0;
+
+    std::string Key() const { return list + '/' + std::to_string(index) + '/' + hash; }   // the track alone
 };
+
+/* The list, index and hash that both state and status messages carry */
+Track ReadTrack(const JVal& m) {
+    Track t;
+    t.list = Str(m, "list");
+    t.index = (int)Int(m.get("index"), -1);
+    t.hash = Str(m, "hash");
+    return t;
+}
 
 /* One room from joining until leaving; the role is fixed at creation */
 class Session {
 public:
     Session(TogetherPlayer& player, TogetherLink& link, Notices& notices, bool host, const std::string& code)
         : player_(player), link_(link), notices_(notices), id_(RandomId()), host_(host), code_(code) {
-        TogetherLink::Event stale;
-        while (link_.Poll(stale)) {}            // left over from the previous room
         link_.Join(code);
         if (host) Log("创建房间");
         else Log("加入房间 %s", code.c_str());
@@ -215,9 +223,9 @@ protected:
     virtual void OnMessage(const Envelope& e, const JVal& m) = 0;
     virtual void Update() = 0;                   // every tick once the room is joined
     virtual TogetherPhase Phase() const = 0;     // once the room is joined
-    virtual std::vector<std::string> Peers() const = 0;
+    virtual std::string Peer() const = 0;
 
-    void Send(const char* type, const std::string& fields);   // fields: ,"key":value pairs after the envelope
+    long long Send(const char* type, const std::string& fields);   // fields: ,"key":value pairs; returns the seq
     void Log(const char* fmt, ...) const;
     unsigned long long Since(unsigned long long t) const { return now_ > t ? now_ - t : 0; }
 
@@ -238,7 +246,6 @@ private:
     bool joined_ = false;
     bool linkDown_ = false;
     bool failed_ = false;
-    std::string failure_;
 };
 
 void Session::Tick(unsigned long long now) {
@@ -254,7 +261,6 @@ void Session::Tick(unsigned long long now) {
             break;
         case TogetherLink::Event::Failed:
             failed_ = true;
-            failure_ = ev.text;
             Log("没能进入房间：%s", ev.text.c_str());
             break;
         case TogetherLink::Event::Down:
@@ -292,10 +298,11 @@ void Session::Receive(const TogetherLink::Event& ev) {
     OnMessage(e, m);
 }
 
-void Session::Send(const char* type, const std::string& fields) {
+long long Session::Send(const char* type, const std::string& fields) {
     link_.Send("{\"v\":" + std::to_string(kProtocol) + ",\"type\":\"" + type + "\",\"from\":\"" + id_ +
                "\",\"role\":\"" + (host_ ? "host" : "guest") + "\",\"name\":" + JsonQuote(player_.Name()) +
                ",\"seq\":" + std::to_string(++seq_) + ",\"at\":" + std::to_string(now_) + fields + "}");
+    return seq_;
 }
 
 void Session::Leave() {
@@ -309,15 +316,8 @@ TogetherView Session::View() const {
     v.host = host_;
     v.code = code_;
     v.linkDown = linkDown_;
-    if (failed_) {
-        v.phase = TogetherPhase::Failed;
-        v.noticeText = failure_;
-    } else if (!joined_) {
-        v.phase = TogetherPhase::Starting;
-    } else {
-        v.phase = Phase();
-        v.peers = Peers();
-    }
+    v.phase = failed_ ? TogetherPhase::Failed : joined_ ? Phase() : TogetherPhase::Starting;
+    v.peer = Peer();
     return v;
 }
 
@@ -339,9 +339,10 @@ private:
     struct Guest {
         std::string id, name;
         unsigned long long heardAt = 0;
-        std::string list, want, hash;   // from its latest status
+        Track track;                    // from its latest status, as are the fields below
+        std::string want;
         std::vector<int> missing;
-        int index = -1;
+        long long heard = 0;
         Health health = Health::Ok;
     };
     struct Known { long long seq = 0, done = 0; };   // newest message, newest request handled
@@ -349,7 +350,7 @@ private:
     void OnMessage(const Envelope& e, const JVal& m) override;
     void Update() override;
     TogetherPhase Phase() const override { return guest_ ? TogetherPhase::Together : TogetherPhase::Hosting; }
-    std::vector<std::string> Peers() const override;
+    std::string Peer() const override { return guest_ ? guest_->name : ""; }
 
     void Admit(const Envelope& e);
     void Drop(const char* why);
@@ -366,7 +367,7 @@ private:
     std::set<std::string> skipped_;        // tracks passed over because the guest could not play them
     std::string list_;
     std::vector<std::string> parts_;
-    std::vector<unsigned long long> partSentAt_;
+    std::vector<long long> partSeq_;       // seq of the latest send of each part, 0 before the first
     Track sent_;
     unsigned long long sentAt_ = 0;
     bool dirty_ = false;                   // the member list changed since the latest state
@@ -383,14 +384,14 @@ void HostSession::OnMessage(const Envelope& e, const JVal& m) {
     if (e.type != "status") return;
     if (!guest_) Admit(e);
     if (guest_->id != e.from) return;      // the room holds a single guest
+    RefreshList();                         // the request and the report are checked against the queue as it is now
 
     Guest& g = *guest_;
     g.name = e.name;
     g.heardAt = e.arrivedAt;
-    g.list = Str(m, "list");
+    g.track = ReadTrack(m);
     g.want = Str(m, "want");
-    g.index = (int)Int(m.get("index"), -1);
-    g.hash = Str(m, "hash");
+    g.heard = Int(m.get("heard"));
     g.health = (Health)std::max(0, Lookup(kHealthNames, Str(m, "health")));
     g.missing.clear();
     if (const JVal* missing = m.get("missing"))
@@ -422,6 +423,7 @@ void HostSession::Drop(const char* why) {
 void HostSession::Execute(const JVal& req) {
     const int op = Lookup(kOpNames, Str(req, "op"));
     const long long arg = Int(req.get("arg"), -1);
+    if (op < 0) return;
     switch ((TogetherOp)op) {
     case TogetherOp::Pause:  player_.SetPlaying(false); break;
     case TogetherOp::Resume: player_.SetPlaying(true); break;
@@ -436,15 +438,15 @@ void HostSession::Execute(const JVal& req) {
         player_.Play((int)arg, true);
         break;
     }
-    Log("执行了 %s 的请求：%s，参数 %lld", guest_->name.c_str(), op >= 0 ? kOpLabels[op] : "未知操作", arg);
+    Log("执行了 %s 的请求：%s，参数 %lld", guest_->name.c_str(), kOpNames[op], arg);
 }
 
 /* Moves on once when the guest reports that it cannot play the current track */
 void HostSession::SkipIfUnplayable() {
     const Track t = Current();
     const Guest& g = *guest_;
-    if (g.health != Health::Failed || t.index < 0 || g.list != t.list || g.index != t.index || g.hash != t.hash) return;
-    if (!skipped_.insert(t.list + '/' + std::to_string(t.index) + '/' + t.hash).second) return;
+    if (g.health != Health::Failed || t.index < 0 || g.track.Key() != t.Key()) return;
+    if (!skipped_.insert(t.Key()).second) return;
     Log("%s 放不了第 %d 首，跳到下一首", g.name.c_str(), t.index + 1);
     notices_.Post(TogetherNotice::PeerCantPlay, g.name);
     player_.Step(1);
@@ -466,7 +468,7 @@ void HostSession::RefreshList() {
     if (list == list_) return;
     list_ = std::move(list);
     parts_ = SplitParts(queue, list_);
-    partSentAt_.assign(parts_.size(), 0);
+    partSeq_.assign(parts_.size(), 0);
     Log("歌单 %s 有 %d 首，分成 %d 段", list_.c_str(), (int)queue.size(), (int)parts_.size());
 }
 
@@ -486,38 +488,30 @@ Track HostSession::Current() const {
 
 /* Whether the playback differs from what the guest infers from the latest state */
 bool HostSession::Moved(const Track& t) const {
-    if (t.list != sent_.list || t.index != sent_.index || t.hash != sent_.hash || t.play != sent_.play) return true;
+    if (t.Key() != sent_.Key() || t.play != sent_.play) return true;
     const long long expected = sent_.posMs + (sent_.play == Play::Playing ? (long long)Since(sentAt_) : 0);
     return std::llabs(t.posMs - expected) > kToleranceMs;
 }
 
 void HostSession::SendState(const Track& t) {
-    const int next = t.index >= 0 ? (t.index + 1) % (int)player_.Queue().size() : -1;
     Send("state", ",\"list\":" + JsonQuote(t.list) + ",\"parts\":" + std::to_string(parts_.size()) +
                   ",\"index\":" + std::to_string(t.index) + ",\"hash\":" + JsonQuote(t.hash) +
                   ",\"play\":\"" + kPlayNames[(int)t.play] + "\",\"pos\":" + std::to_string(t.posMs) +
-                  ",\"next\":" + std::to_string(next) + ",\"members\":[{\"id\":" + JsonQuote(guest_->id) +
-                  ",\"name\":" + JsonQuote(guest_->name) + ",\"done\":" + std::to_string(known_[guest_->id].done) + "}]");
+                  ",\"members\":[{\"id\":" + JsonQuote(guest_->id) + ",\"done\":" + std::to_string(known_[guest_->id].done) + "}]");
     sent_ = t;
     sentAt_ = now_;
     dirty_ = false;
 }
 
-/* Sends the parts of the queue that the guest lacks, each at most once per kResendMs */
+/* Sends the parts of the queue that the guest lacks. A part already sent goes again only once the guest has
+   heard a later message, as the part was then lost rather than still on its way */
 void HostSession::SendParts() {
     const Guest& g = *guest_;
-    if (g.list == list_) return;
+    if (g.track.list == list_) return;
     for (int i = 0; i < (int)parts_.size(); i++) {
         const bool lacking = g.want != list_ || std::find(g.missing.begin(), g.missing.end(), i) != g.missing.end();
-        if (!lacking || Since(partSentAt_[i]) < kResendMs) continue;
-        Send("list", parts_[i]);
-        partSentAt_[i] = now_;
+        if (lacking && partSeq_[i] <= g.heard) partSeq_[i] = Send("list", parts_[i]);
     }
-}
-
-std::vector<std::string> HostSession::Peers() const {
-    if (!guest_) return {};
-    return { guest_->name };
 }
 
 class GuestSession : public Session {
@@ -548,7 +542,7 @@ private:
     void OnMessage(const Envelope& e, const JVal& m) override;
     void Update() override;
     TogetherPhase Phase() const override { return phase_; }
-    std::vector<std::string> Peers() const override;
+    std::string Peer() const override { return hostName_; }
 
     void OnState(const Envelope& e, const JVal& m);
     void OnPart(const Envelope& e, const JVal& m);
@@ -575,6 +569,7 @@ private:
     long long wantSeq_ = 0;
     std::vector<std::vector<Song>> wantParts_; // parts collected for wantList_, empty until received
     std::string trackKey_;
+    bool playing_ = false;                     // whether Follow last had the player play or pause
     bool retried_ = false;
     bool cantPlay_ = false;
     unsigned long long seekAt_ = 0;
@@ -614,9 +609,7 @@ void GuestSession::OnState(const Envelope& e, const JVal& m) {
     HostState s;
     s.seq = e.seq;
     s.sentAt = e.sentAt;
-    s.track.list = Str(m, "list");
-    s.track.index = (int)Int(m.get("index"), -1);
-    s.track.hash = Str(m, "hash");
+    s.track = ReadTrack(m);
     const int play = Lookup(kPlayNames, Str(m, "play"));
     const long long parts = Int(m.get("parts"), -1);
     if (play < 0 || parts < 0 || parts > kMaxParts || s.track.list.empty() != (parts == 0)) return;
@@ -644,10 +637,7 @@ void GuestSession::OnPart(const Envelope& e, const JVal& m) {
     if (list.empty() || parts < 1 || parts > kMaxParts || part < 0 || part >= parts || !songs || !songs->count()) return;
     NoteList(list, (int)parts, e.seq);
     if (list != wantList_ || part >= (long long)wantParts_.size() || !wantParts_[part].empty()) return;
-    std::vector<Song> got(songs->a.size());
-    for (size_t i = 0; i < got.size(); i++)
-        if (!ReadSong(songs->a[i], got[i])) return;
-    wantParts_[part] = std::move(got);
+    for (const JVal& song : songs->a) wantParts_[part].push_back(ReadSong(song));
 }
 
 /* Takes the list named by a host message as the host's current one when no newer message named another */
@@ -713,14 +703,13 @@ long long GuestSession::HostPosMs() const {
     return h.posMs + ((long long)now_ - ((long long)state_.sentAt + offset_));
 }
 
-/* Brings the player to the host's track, play state and position; depends only on the latest state */
+/* Brings the player to the host's track, play state and position as the latest state gives them */
 void GuestSession::Follow() {
     const Song* song = HostSong();
     if (!song) return;
     const Track& h = state_.track;
-    const std::string key = h.list + '/' + std::to_string(h.index) + '/' + h.hash;
-    if (key != trackKey_) {
-        trackKey_ = key;
+    if (h.Key() != trackKey_) {
+        trackKey_ = h.Key();
         retried_ = cantPlay_ = false;
     }
     const TogetherPlayer::State p = player_.Now();
@@ -728,6 +717,7 @@ void GuestSession::Follow() {
     if (p.index != h.index) {
         Log("播放第 %d 首", h.index + 1);
         player_.Play(h.index, play);
+        playing_ = play;
         return;
     }
     if (p.failed) {
@@ -743,12 +733,14 @@ void GuestSession::Follow() {
         return;
     }
     const long long hostPos = HostPosMs();
-    const int endMs = song->durationSec * 1000;
-    if (play && !p.playing && endMs > 0 && p.posMs >= endMs - kToleranceMs && p.posMs - hostPos <= kToleranceMs)
-        return;   // reached the end slightly ahead of the host and waits for its next track
+    // The player pauses by itself only at the end of its copy of the track, which may be shorter than the host's;
+    // it then waits there for the host's next track
+    if (play && playing_ && !p.playing && hostPos >= p.posMs - kToleranceMs) return;
     if (p.playing != play) player_.SetPlaying(play);
+    playing_ = play;
     const int target = StartPoint(hostPos, song->durationSec);
-    if (!p.buffering && !p.dragging && Since(seekAt_) > kSeekGapMs && std::abs(p.posMs - target) > kToleranceMs) {
+    // A pending request may already have moved the player, as dragging the progress bar does
+    if (!ask_ && !p.buffering && !p.dragging && Since(seekAt_) > kSeekGapMs && std::abs(p.posMs - target) > kToleranceMs) {
         Log("进度与房主相差 %d 毫秒，跳到 %d 毫秒", p.posMs - target, target);
         seekAt_ = now_;
         player_.Seek(target);
@@ -769,9 +761,10 @@ void GuestSession::SendStatus() {
     if (since < kMinGapMs || (since < kTogetherPeriodMs && fields == statusSent_)) return;
     statusSent_ = fields;
     statusAt_ = now_;
-    std::string missing;   // kept out of the comparison above, so that receiving a part sends no status
+    // heard and missing stay out of the comparison above, so that a message from the host sends no status
+    std::string missing;
     for (int part : Missing()) missing += (missing.empty() ? "" : ",") + std::to_string(part);
-    Send("status", fields + ",\"missing\":[" + missing + "]");
+    Send("status", fields + ",\"heard\":" + std::to_string(hostSeq_) + ",\"missing\":[" + missing + "]");
 }
 
 int GuestSession::StartPosMs(int index) const {
@@ -783,12 +776,7 @@ int GuestSession::StartPosMs(int index) const {
 void GuestSession::Request(TogetherOp op, int arg) {
     if (phase_ != TogetherPhase::Together) return;
     ask_ = Ask{ op, arg, ++askSeq_, queueList_ };
-    Log("请房主%s，参数 %d", kOpLabels[(int)op], arg);
-}
-
-std::vector<std::string> GuestSession::Peers() const {
-    if (!heardAt_) return {};
-    return { hostName_ };
+    Log("请房主执行 %s，参数 %d", kOpNames[(int)op], arg);
 }
 
 /* One program's side of listening together: its player and link, its notices, and the current session */
@@ -799,7 +787,6 @@ struct Client {
     std::unique_ptr<Session> session;
 
     void Start(bool host, const std::string& code) {
-        if (!player || !link) return;
         Leave();
         if (host) session = std::make_unique<HostSession>(*player, *link, notices);
         else session = std::make_unique<GuestSession>(*player, *link, notices, code);

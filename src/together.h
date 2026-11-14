@@ -32,8 +32,9 @@ struct TogetherPlayer {
     virtual const std::vector<Song>& Queue() = 0;
     virtual std::string Name() = 0;            // account nickname in UTF-8, empty when unknown
 
-    // Replaces the queue and leaves no track selected. The song grid switches to the new queue when
-    // showInGrid is set or when it was already showing the queue.
+    // Replaces the queue. The track being played carries on when the new queue holds the same song (hash and
+    // source), and no track is selected otherwise. The song grid switches to the new queue when showInGrid is set
+    // or when it was already showing the queue.
     virtual void SetQueue(std::vector<Song> songs, bool showInGrid) = 0;
     virtual void Play(int index, bool playing) = 0;   // opens the track; asks TogetherStartPosMs where to start
     virtual void SetPlaying(bool playing) = 0;
@@ -57,7 +58,8 @@ struct TogetherLink {
     };
     virtual ~TogetherLink() = default;
 
-    virtual void Join(const std::string& code) = 0;   // an empty code creates a new room
+    // An empty code creates a new room. Events of an earlier room are never polled after Join or Leave
+    virtual void Join(const std::string& code) = 0;
     virtual void Leave() = 0;
     virtual void Send(const std::string& json) = 0;   // returns at once; the message may be dropped
     virtual bool Poll(Event& ev) = 0;                  // takes the next event, false when there is none
@@ -72,7 +74,7 @@ enum class TogetherPhase {
     NotFound,   // guest that has heard no host for a while after joining
     Lost,       // guest whose host has gone silent; following resumes when the host is heard again
     Full,       // guest not admitted because the room already has a guest
-    Failed,     // the link could not join; noticeText holds the reason
+    Failed,     // the link could not join
 };
 
 enum class TogetherNotice {
@@ -90,7 +92,7 @@ struct TogetherView {
     TogetherPhase phase = TogetherPhase::Off;
     bool host = false;
     std::string code;                    // room code
-    std::vector<std::string> peers;      // names of the other members in UTF-8
+    std::string peer;                    // the other member's name in UTF-8, empty while there is none or it has none
     TogetherNotice notice = TogetherNotice::None;
     std::string noticeText;
     int noticeSeq = 0;                   // increases with every new notice
