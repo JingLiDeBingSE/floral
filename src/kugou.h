@@ -32,8 +32,10 @@ int  QqExportLikes(const std::string& cookie, const std::wstring& outTsv, std::w
 std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie, int level,
                            std::wstring& err, int* gotLevel = nullptr);
 
-bool MatchOnPlatform(int source, const std::string& title, const std::string& artist,
-                     int wantDur, std::string& hashOut, long long& mixIdOut, long long& albumIdOut,
+/* Searches platform `source` (SRC_*) for a song by title, artist and length in seconds (0 when unknown) and
+   fills in its ids there. The platform's service must be running; cookie is the account's session on it */
+bool MatchOnPlatform(int source, const std::string& title, const std::string& artist, int wantDur,
+                     const std::string& cookie, std::string& hashOut, long long& mixIdOut, long long& albumIdOut,
                      std::wstring& err);
 
 /* ── Playlists ── */

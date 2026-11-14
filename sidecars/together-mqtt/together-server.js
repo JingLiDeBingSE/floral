@@ -1,156 +1,152 @@
 /*
- * Floral 一起听：EMQX 中继（本地辅助进程）
+ * Listen-together relay helper
  *
- * 为什么不直接在 C++ 里讲 MQTT：
- *   TLS + MQTT 帧解析在 Win32 下要自己写 SChannel 握手，几百行且容易错。
- *   而 exe 里本来就带着 Node 运行时（网易云/QQ 的 sidecar 在用），
- *   直接让 Node 讲 MQTT，C++ 只跟本地 127.0.0.1 说 HTTP，简单得多。
+ * Floral starts this script with stdin and stdout connected to pipes and exchanges one JSON object per line.
+ * The script connects to the MQTT broker, compresses and encrypts, and passes on every message of the room in
+ * the order it arrives, the member's own included. Logs go to stderr. The script exits when stdin closes.
  *
- * 用法：node together-server.js
- *   env: FLORAL_MQTT_HOST / FLORAL_MQTT_PORT / FLORAL_MQTT_USER / FLORAL_MQTT_PASS
- *
- * HTTP：
- *   POST /open                 开房 → { code }
- *   POST /join?code=XXXX       加入 → { ok }
- *   GET  /state                取对方状态 → { peer, song, src, ti, ar, pos, play, t }
- *   POST /push?data=<json>     推送自己的状态
- *   POST /close                断开
- *   GET  /health               存活探测
+ * Commands:
+ *   {"cmd":"join","id":1,"code":"...","host":"...","port":8883,"user":"...","pass":"..."}  empty code: new room
+ *   {"cmd":"leave"}
+ *   {"cmd":"send","text":"..."}
+ * Events, each with the id of the join it belongs to:
+ *   {"ev":"joined","id":1,"text":"<room code>"}   {"ev":"failed","id":1,"text":"<reason>"}
+ *   {"ev":"down","id":1}   {"ev":"up","id":1}      {"ev":"message","id":1,"text":"..."}
+ * A failure after joined means the connection could not be restored and has been closed.
  */
-const http = require('node:http');
+'use strict';
 const crypto = require('node:crypto');
+const readline = require('node:readline');
+const zlib = require('node:zlib');
 const mqtt = require('mqtt');
 
-const HOST = process.env.FLORAL_MQTT_HOST || 'k9bf6e3a.ala.cn-shenzhen.emqxsl.cn';
-const PORT = Number(process.env.FLORAL_MQTT_PORT || 8883);
-const USER = process.env.FLORAL_MQTT_USER || '';
-const PASS = process.env.FLORAL_MQTT_PASS || '';
-const LISTEN = Number(process.env.FLORAL_LISTEN_PORT || 4100);
+const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+const CODE_LENGTH = 12;
+const JOIN_TIMEOUT_MS = 15000;
 
-let client = null;
-let roomCode = '';
-let peer = null;            // { nick, song, src, ti, ar, pos, play, t }
-let peerNick = '';
-let skipFlag = false;      // 对方请求跳过
+// A member receives its own messages back from the broker, so those not back yet are still being uploaded.
+// New messages are dropped while they exceed BACKLOG_BYTES, which bounds the delay at BACKLOG_BYTES / bandwidth
+const BACKLOG_BYTES = 128 * 1024;
+const ECHO_LOST_MS = 30000;   // an own message not back after this long counts as lost
 
+let room = null;
 
-/* 房间码 → 密钥：AES-256-GCM，broker 只看得到密文 */
-const keyOf = (code) => crypto.createHash('sha256').update('floral-together|' + code).digest();
-
-function encrypt(code, text) {
-  const iv = crypto.randomBytes(12);
-  const c = crypto.createCipheriv('aes-256-gcm', keyOf(code), iv);
-  const enc = Buffer.concat([c.update(text, 'utf8'), c.final()]);
-  return iv.toString('base64') + '.' + c.getAuthTag().toString('base64') + '.' + enc.toString('base64');
-}
-
-function decrypt(code, blob) {
-  try {
-    const [a, b, c2] = blob.split('.');
-    if (!a || !b || !c2) return null;
-    const d = crypto.createDecipheriv('aes-256-gcm', keyOf(code), Buffer.from(a, 'base64'));
-    d.setAuthTag(Buffer.from(b, 'base64'));
-    return Buffer.concat([d.update(Buffer.from(c2, 'base64')), d.final()]).toString('utf8');
-  } catch { return null; }       // 拿错房间码 / 别人灌的垃圾 → 直接丢
-}
-
-const topicOf = (code) => 'floral/' + code;
+const log = (...args) => console.error('[together]', ...args);
+const emit = (event) => process.stdout.write(JSON.stringify(event) + '\n');
+const sha256 = (text) => crypto.createHash('sha256').update(text).digest();
 
 function newCode() {
-  const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
-  let s = '';
-  for (const b of crypto.randomBytes(12)) s += abc[b % abc.length];
-  return s;
+  let code = '';
+  for (let i = 0; i < CODE_LENGTH; i++) code += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
+  return code;
 }
 
-function connectBroker(code, nick) {
-  return new Promise((resolve, reject) => {
-    if (client) { try { client.end(true); } catch {} client = null; }
-    peer = null;
-    skipFlag = false;
-    roomCode = code;
-    const c = mqtt.connect(`mqtts://${HOST}:${PORT}`, {
-      username: USER, password: PASS,
-      clientId: 'floral_' + crypto.randomBytes(6).toString('hex'),
-      connectTimeout: 8000, reconnectPeriod: 3000, clean: true,
-    });
-    let done = false;
-    c.on('connect', () => {
-      c.subscribe(topicOf(code), { qos: 0 }, (err) => {
-        if (err) { if (!done) { done = true; reject(err); } return; }
-        client = c;
-        if (!done) { done = true; resolve(); }
-      });
-    });
-    c.on('message', (_t, buf) => {
-      const obj = decrypt(code, buf.toString());
-      if (!obj) return;
-      try {
-        const m = JSON.parse(obj);
-        if (m.n === nick) return;              // 自己发的不要
-        if (m.skip) { skipFlag = true; return; }  // 跳过请求
-        peer = m;
-        peerNick = m.n || '朋友';
-      } catch {}
-    });
-    c.on('error', (e) => { if (!done) { done = true; reject(e); } });
-    setTimeout(() => { if (!done) { done = true; reject(new Error('连接 broker 超时')); } }, 12000);
+// Payload: 12-byte IV, 16-byte GCM tag, ciphertext of the deflated text
+function encrypt(key, text) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const body = Buffer.concat([cipher.update(zlib.deflateRawSync(text)), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), body]);
+}
+
+function decrypt(key, payload) {
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, payload.subarray(0, 12), { authTagLength: 16 });
+    decipher.setAuthTag(payload.subarray(12, 28));
+    return zlib.inflateRawSync(Buffer.concat([decipher.update(payload.subarray(28)), decipher.final()])).toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+function join(cmd) {
+  leave();
+  const code = String(cmd.code).trim().toLowerCase() || newCode();
+  const conn = {
+    id: cmd.id,
+    topic: 'floral/' + sha256('floral-topic|' + code).toString('hex').slice(0, 32),
+    key: sha256('floral-key|' + code),
+    joined: false,
+    subscribed: false,   // the current connection holds the subscription
+    unconfirmed: [],     // { iv, bytes, at } of own messages not back yet, oldest first
+  };
+  conn.client = mqtt.connect({
+    host: cmd.host, port: cmd.port, protocol: 'mqtts',
+    username: cmd.user, password: cmd.pass,
+    clientId: 'floral_' + crypto.randomBytes(8).toString('hex'),
+    clean: true, keepalive: 15, reconnectPeriod: 2000,
+    queueQoSZero: false, resubscribe: false,
   });
-}
+  room = conn;
 
-function json(res, obj, code = 200) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(body);
-}
+  const report = (ev, text) => { if (room === conn) emit({ ev, id: conn.id, text }); };
+  const fail = (reason) => {
+    if (room !== conn) return;
+    log('failed:', reason);
+    report('failed', reason);
+    room = null;
+    conn.client.end(true);
+  };
+  setTimeout(() => { if (!conn.joined) fail('timed out'); }, JOIN_TIMEOUT_MS).unref();
 
-const server = http.createServer((req, res) => {
-  const u = new URL(req.url, 'http://127.0.0.1');
-  const q = u.searchParams;
-  let body = '';
-  req.on('data', (d) => (body += d));
-  req.on('end', async () => {
-    try {
-      if (u.pathname === '/health') return json(res, { ok: true });
-      if (u.pathname === '/open') {
-        const nick = q.get('nick') || '房主';
-        const code = newCode();
-        await connectBroker(code, nick);
-        console.log('[open] code=' + code);
-        return json(res, { code, ok: true });
-      }
-      if (u.pathname === '/join') {
-        const code = (q.get('code') || '').trim().toLowerCase();
-        const nick = q.get('nick') || '朋友';
-        if (!code || code.length < 6) return json(res, { ok: false, err: '房间码不对' }, 400);
-        await connectBroker(code, nick);
-        console.log('[join] code=' + code);
-        return json(res, { ok: true });
-      }
-      if (u.pathname === '/state') {
-        const skip = skipFlag;
-        skipFlag = false;
-        return json(res, { peer: peer ? peerNick : '', skip, data: peer });
-      }
-      if (u.pathname === '/push') {
-        if (!client) return json(res, { ok: false }, 400);
-        const payload = q.get('data') || '{}';
-        client.publish(topicOf(roomCode), encrypt(roomCode, payload), { qos: 0 });
-        return json(res, { ok: true });
-      }
-      if (u.pathname === '/close') {
-        if (client) { try { client.end(true); } catch {} client = null; }
-        roomCode = ''; peer = null; peerNick = '';
-        return json(res, { ok: true });
-      }
-      json(res, { ok: false, err: 'unknown' }, 404);
-    } catch (e) {
-      console.log('[err]', e.message);
-      json(res, { ok: false, err: e.message }, 500);
+  conn.client.on('connect', () => {
+    conn.client.subscribe(conn.topic, { qos: 0 }, (err) => {
+      if (err) return fail(err.message);
+      conn.subscribed = true;
+      if (conn.joined) return report('up');
+      conn.joined = true;
+      report('joined', code);
+    });
+  });
+  conn.client.on('close', () => {
+    conn.unconfirmed = [];
+    if (conn.subscribed) {
+      conn.subscribed = false;
+      report('down');
+    } else if (!conn.joined) {
+      fail('connection closed');
     }
   });
-});
+  conn.client.on('error', (err) => {
+    log('error:', err.message);
+    if (!conn.joined) fail(err.message);
+  });
+  conn.client.on('message', (_topic, payload) => {
+    if (room !== conn) return;
+    // Messages come back in order, so the ones before this were delivered or lost
+    const own = conn.unconfirmed.findIndex((m) => m.iv.equals(payload.subarray(0, 12)));
+    if (own >= 0) conn.unconfirmed.splice(0, own + 1);
+    const text = decrypt(conn.key, payload);
+    if (text !== null) report('message', text);
+  });
+}
 
-server.listen(LISTEN, '127.0.0.1', () => {
-  console.log('together-server ready on 127.0.0.1:' + LISTEN + ' broker=' + HOST + ':' + PORT);
+function leave() {
+  if (!room) return;
+  // A connection that is up closes after the messages already handed to it
+  room.client.end(!room.client.connected);
+  room = null;
+}
+
+function send(text) {
+  if (!room || !room.subscribed) return;
+  const now = Date.now();
+  const unconfirmed = room.unconfirmed;
+  while (unconfirmed.length && now - unconfirmed[0].at > ECHO_LOST_MS) unconfirmed.shift();
+  if (unconfirmed.reduce((sum, m) => sum + m.bytes, 0) > BACKLOG_BYTES) {
+    log('upload backed up, message dropped');
+    return;
+  }
+  const payload = encrypt(room.key, text);
+  unconfirmed.push({ iv: payload.subarray(0, 12), bytes: payload.length, at: now });
+  room.client.publish(room.topic, payload, { qos: 0 });
+}
+
+const input = readline.createInterface({ input: process.stdin });
+input.on('line', (line) => {
+  const cmd = JSON.parse(line);
+  if (cmd.cmd === 'join') join(cmd);
+  else if (cmd.cmd === 'leave') leave();
+  else if (cmd.cmd === 'send') send(cmd.text);
 });
+input.on('close', leave);

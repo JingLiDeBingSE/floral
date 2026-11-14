@@ -2,6 +2,8 @@
 #include "resource.h"
 #include "kugou.h"
 #include "together.h"
+#include "relay.h"
+#include "json.h"
 #include "log.h"
 #include "lang.h"
 #include "audio.h"
@@ -38,6 +40,7 @@
 #include <algorithm>
 #include <exception>
 #include <optional>
+#include <tuple>
 
 App g_app;
 static HWND g_hwnd = nullptr;      // main window (drives explicit redraws)
@@ -377,7 +380,7 @@ static void Text(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F&
     g_rt->DrawTextW(s.c_str(), (UINT32)s.size(), f, r, g_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
-/* Single line of text, ellipsized when it overflows (used in playlist cards) */
+/* Single line of left-aligned text, ellipsized when it overflows */
 static void TextEllipsis(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F& r,
                          UINT32 c, float a = 1.0f) {
     if (!f || !g_brush || !g_dw || s.empty()) return;
@@ -385,6 +388,7 @@ static void TextEllipsis(const std::wstring& s, IDWriteTextFormat* f, const D2D1
     if (FAILED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f,
                                       r.right - r.left, r.bottom - r.top, &layout)) || !layout)
         return;
+    layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);   // the shared format keeps whatever Text() set last
     D2D1_POINT_2F origin = D2D1::Point2F(r.left, r.top);
     g_brush->SetColor(Col(c, a));
 
@@ -401,6 +405,16 @@ static void TextEllipsis(const std::wstring& s, IDWriteTextFormat* f, const D2D1
     }
     g_rt->DrawTextLayout(origin, layout, g_brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
     layout->Release();
+}
+
+static float TextWidth(const std::wstring& s, IDWriteTextFormat* f) {
+    IDWriteTextLayout* layout = nullptr;
+    if (!f || !g_dw || FAILED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, 4096.0f, 256.0f, &layout)) || !layout)
+        return 0.0f;
+    DWRITE_TEXT_METRICS tm{};
+    layout->GetMetrics(&tm);
+    layout->Release();
+    return tm.widthIncludingTrailingWhitespace;
 }
 
 static std::wstring FormatTime(int sec) {
@@ -867,13 +881,11 @@ static void QueueDecode(const std::wstring& path) {
     g_decQueue.push_back(path);
 }
 
-/* ── On-demand cover download: songs whose cover is not local are fetched when scrolled into view ── */
+/* ── On-demand cover download: songs whose cover is not local are fetched when they are about to be shown ── */
 static std::string  HttpGet(const std::wstring& url);
-static std::wstring Widen(const std::string& s);
 
 /* The queue carries copies of url/hash; worker threads never touch g_app (avoids racing cache clears/reloads) */
 struct CovJob {
-    int         idx;
     std::string url;
     std::string hash;
 };
@@ -888,7 +900,7 @@ static std::atomic<bool>   g_plReady{ false };
 static std::mutex        g_covMx;
 static std::vector<CovJob> g_covQueue;
 static std::vector<CovJob> g_covDone;
-static std::vector<char> g_covFlag;      // 0 pending / 1 queued / 2 processed
+static std::unordered_set<std::string> g_covAsked;   // hashes queued since the grid list was replaced; UI thread only
 
 std::wstring g_dataDir;            // %USERPROFILE%\Documents\Floral
 
@@ -965,23 +977,21 @@ static std::wstring AssetDir() {
 
 static void CoverWorkerMain() {
     for (;;) {
-        CovJob job{ -1, "", "" };
+        CovJob job;
         {
             std::lock_guard<std::mutex> lk(g_covMx);
             if (!g_covQueue.empty()) { job = g_covQueue.back(); g_covQueue.pop_back(); }
         }
-        if (job.idx < 0) { Sleep(50); continue; }
+        if (job.hash.empty()) { Sleep(50); continue; }
 
-        if (!job.url.empty() && !job.hash.empty()) {
-            std::string bytes = HttpGet(Widen(job.url));
-            if (bytes.size() > 1000) {
-                std::wstring dir = AssetDir() + L"\\covers";
-                CreateDirectoryW(dir.c_str(), nullptr);
-                std::wstring path = dir + L"\\" + std::wstring(job.hash.begin(), job.hash.end()) + L".jpg";
-                FILE* f = nullptr;
-                _wfopen_s(&f, path.c_str(), L"wb");
-                if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
-            }
+        std::string bytes = HttpGet(Widen(job.url));
+        if (bytes.size() > 1000) {
+            std::wstring dir = AssetDir() + L"\\covers";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::wstring path = dir + L"\\" + std::wstring(job.hash.begin(), job.hash.end()) + L".jpg";
+            FILE* f = nullptr;
+            _wfopen_s(&f, path.c_str(), L"wb");
+            if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
         }
         {
             std::lock_guard<std::mutex> lk(g_covMx);
@@ -1146,34 +1156,38 @@ static void DrainCovers() {
     { std::lock_guard<std::mutex> lk(g_covMx); done.swap(g_covDone); }
     if (done.empty()) return;
 
+    std::unordered_map<std::string, std::wstring> files;   // hash -> downloaded cover
     for (const CovJob& job : done) {
-        const int i = job.idx;
-        if (i < 0 || i >= (int)g_app.songs.size()) continue;
-        Song& s = g_app.songs[(size_t)i];
-        if (s.hash != job.hash) continue;   // queued for a song list that has since been replaced
         std::wstring path = AssetDir() + L"\\covers\\" +
-            std::wstring(s.hash.begin(), s.hash.end()) + L".jpg";
-        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES && s.cover.empty()) {
-            s.cover = path;
-            QueueDecode(path);
+            std::wstring(job.hash.begin(), job.hash.end()) + L".jpg";
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) files.emplace(job.hash, path);
+    }
+    if (files.empty()) return;
+
+    // The grid and the queue each hold their own copy of a song
+    for (std::vector<Song>* list : { &g_app.songs, &g_app.queue }) {
+        for (Song& s : *list) {
+            if (!s.cover.empty()) continue;
+            auto it = files.find(s.hash);
+            if (it == files.end()) continue;
+            s.cover = it->second;
+            QueueDecode(s.cover);
         }
-        if (i < (int)g_covFlag.size()) g_covFlag[(size_t)i] = 2;
     }
     g_coverDirty = true;                // a new cover entered the decode queue
 }
 
-/** Queue a download for viewport songs without a cover (g_app is read only here; workers get copies) */
-static void RequestVisibleCovers() {
+/** Queue a download for a song without a cover (g_app is read only here; workers get copies) */
+static void RequestCover(const Song& s) {
+    if (!s.cover.empty() || s.coverUrl.empty() || s.hash.empty()) return;
+    if (!g_covAsked.insert(s.hash).second) return;
     std::lock_guard<std::mutex> lk(g_covMx);
-    if (g_covFlag.size() != g_app.songs.size()) return;
-    for (int i : g_vis) {
-        if (i < 0 || i >= (int)g_app.songs.size()) continue;
-        if (g_covFlag[(size_t)i]) continue;
-        const Song& s = g_app.songs[(size_t)i];
-        if (!s.cover.empty() || s.coverUrl.empty() || s.hash.empty()) continue;
-        g_covFlag[(size_t)i] = 1;
-        g_covQueue.push_back({ i, s.coverUrl, s.hash });
-    }
+    g_covQueue.push_back({ s.coverUrl, s.hash });
+}
+
+static void RequestVisibleCovers() {
+    for (int i : g_vis)
+        if (i >= 0 && i < (int)g_app.songs.size()) RequestCover(g_app.songs[(size_t)i]);
 }
 
 static void StartDecoder() {
@@ -1357,6 +1371,7 @@ static float g_playIconMix = 0.0f;    // 0 = play triangle, 1 = pause bars (geom
 static float g_textT = 0.0f;          // time elapsed in the current phase
 static int   g_textPhase = 0;         // 0 idle / 1 slide out left / 2 slide in from right
 static int   g_textDir = 1;           // +1 next track (moves left) / -1 previous track (moves right)
+static int   g_textCur = -1;          // queue index of the track whose text the previous frame showed
 static std::wstring g_outTitle, g_outArtist, g_outAlbum;   // old text that is leaving
 static std::wstring g_curTitle, g_curArtist, g_curAlbum;   // the previous frame's three lines (used to grab a snapshot)
 static float g_setT  = 0.0f;
@@ -1366,17 +1381,10 @@ static float g_togT  = 0.0f;
 static std::wstring g_qrPath;            // QR code file for this login (renamed each time to avoid an old bitmap)
 static bool         g_togOpen = false;      // listen-together panel
 static bool         g_togInput = false;     // input field focused
-static std::wstring g_togInputText;         // connection code being typed
-static std::wstring g_togMyCode;            // my connection code
-static bool         g_togBusy    = false;   // opening a room / joining
-static bool         g_togHosting = false;   // room open but nobody has joined yet
-static bool         g_togForcePush = false; // force the next PushLocalState (seek/loading change)
-static bool         g_togIsHost  = false;   // I am the host (can control playback)
-static int          g_togAddrIdx = -1;      // selected local address index (-1 = auto)
-static std::wstring g_togPeer;              // peer nickname
-static bool         g_togLost = false;      // disconnect notice
-static std::wstring g_togMsg;               // in-panel message
+static std::wstring g_togInputText;         // room code being typed
+static std::wstring g_togMsg;               // listen-together toast, shown on every page
 static ULONGLONG    g_togMsgAt = 0;
+static const float  kTogToastSec = 6.0f;
 /* Toast fade: 180ms in, 300ms out, moves up 6px while fading in
    Returns opacity, dy carries the vertical offset; 0 means already expired */
 static float g_toastOverride = -1.0f;   // screenshot mode: fixed toast opacity
@@ -1411,8 +1419,13 @@ static ULONGLONG    g_tsvBefore = 0;
 
 /* ── Login state: ask the API once at startup so an expired token is caught early instead of waiting for playback to fail ── */
 static int          g_loginState = 0;    // 0 checking / 1 valid / 2 expired or not signed in
-static std::wstring g_nickname;
 static int          g_vipType = 0;
+
+/* Account nickname; the sign-in check writes it on a worker thread */
+static std::mutex   g_nicknameMx;
+static std::wstring g_nickname;
+static std::wstring Nickname() { std::lock_guard<std::mutex> lk(g_nicknameMx); return g_nickname; }
+static void SetNickname(const std::wstring& s) { std::lock_guard<std::mutex> lk(g_nicknameMx); g_nickname = s; }
 
 
 static void SettingsToast(const wchar_t* msg) {
@@ -1460,7 +1473,8 @@ static void ClearCache() {
     g_decRequested.clear();
     g_plCovAsked.clear();
     for (auto& s : g_app.songs) s.cover.clear();
-    std::fill(g_covFlag.begin(), g_covFlag.end(), 0);
+    for (auto& s : g_app.queue) s.cover.clear();
+    g_covAsked.clear();
 
     // 2) rename the whole directory, then delete — renaming is unaffected by files in use
     const wchar_t* subs[2] = { L"covers", L"audio" };
@@ -1544,7 +1558,7 @@ static void StartExport(const std::string& uid, const std::string& tok) {
 static std::wstring SidecarRoot() { return LocalDir() + L"\\sidecars"; }
 
 /* Sidecars version: bump it whenever the content changes to trigger re-extraction */
-#define SIDECARS_VERSION L"2026-11-07-1"
+#define SIDECARS_VERSION L"2026-11-14-2"
 
 static bool ExtractSidecars() {
     // The listen-together helper and the NetEase/QQ services may start on different threads at once
@@ -1756,7 +1770,7 @@ static void DrawSettings(float W, float H) {
         std::wstring who;
         UINT32 col = UI::TEXT2;
         if (g_loginState == 1) {
-            who = std::wstring(T(L"已登录：", L"Signed in: ")) + g_nickname;
+            who = std::wstring(T(L"已登录：", L"Signed in: ")) + Nickname();
             if (g_vipType > 0) who += L" · VIP" + std::to_wstring(g_vipType);
             col = UI::ACCENT_TEXT;
         } else if (g_loginState == 2) {
@@ -2172,11 +2186,14 @@ static void DrawGrid() {
 /* ══════════════════════════════════════════
    Player page: spinning CD on the left + album cases above/below, song info on the right
    ══════════════════════════════════════════ */
-static int   g_switchFrom = -1, g_switchTo = -1, g_switchDir = 1;
+/* Whether two entries are the same song: the same id on the same platform */
+static bool SameSong(const Song& x, const Song& y) { return x.hash == y.hash && x.source == y.source; }
+
+static int   g_switchFrom = -1, g_switchDir = 1;
 static float g_switchT = 1.0f;          // 0..1; 1 means no track switch in progress
 static float g_discAngle = 0.0f;        // disc rotation angle (degrees)
 static float g_lineT = 0.0f;            // divider unfold progress 0..1
-static int   g_casePrev0 = -1, g_caseNext0 = -1;   // at switch time, which two songs the cases held before
+static int   g_casePrev0 = -1, g_caseNext0 = -1;   // corner discs before the switch, for the one pushed off
 
 /* Leaving the player page: full-screen fade out → grid flies in from the right like the intro */
 static bool  g_exitOn = false;
@@ -2265,76 +2282,6 @@ static void DrawDisc(const D2D1_RECT_F& r, const Song& s, int idx, float angleDe
     FillCircle(cx, cy, rad * 0.04f, UI::BG, alpha);
 }
 
-/** Cover inside a small album case */
-static void DrawBoxCover(float cx, float cy, float size, int idx, float alpha) {
-    App& a = g_app;
-    if (idx < 0 || idx >= (int)a.songs.size() || alpha <= 0.01f) return;
-
-    g_alphaMul = alpha;
-    FillRound(Rc(cx - size * 0.5f - 3, cy - size * 0.5f - 3, size + 6, size + 6),
-              10.0f, 0xFFFFFF, 0.55f);
-    DrawCoverArt(Rc(cx - size * 0.5f, cy - size * 0.5f, size, size),
-                 a.songs[idx], idx, 7.0f);
-    g_alphaMul = 1.0f;
-}
-
-/** CD jewel case (modeled on the real thing): clear plastic shell → dark gray tray → booklet cover */
-static void DrawCase(const D2D1_RECT_F& r, int idx, float alpha) {
-    App& a = g_app;
-    if (idx < 0 || idx >= (int)a.songs.size() || alpha <= 0.01f) return;
-
-    g_alphaMul = alpha;
-
-    const float w = r.right - r.left;
-    const float h = r.bottom - r.top;
-    const float rad  = (std::max)(3.0f, w * 0.012f);     // hard-edged box
-    const float rim  = (std::max)(4.0f, w * 0.026f);     // clear plastic rim
-    const float tray = (std::max)(5.0f, w * 0.030f);     // dark tray
-
-    // 1) Clear plastic shell
-    FillRoundGrad(r, rad, 0xFDFBFC, 0xDED3D8);
-
-    // 2) Dark gray tray
-    D2D1_RECT_F tr = Rc(r.left + rim, r.top + rim, w - rim * 2.0f, h - rim * 2.0f);
-    FillRoundGrad(tr, rad, 0x4C464A, 0x312B2F);
-
-    // 3) Booklet cover
-    D2D1_RECT_F inner = Rc(tr.left + tray, tr.top + tray,
-                           w - (rim + tray) * 2.0f, h - (rim + tray) * 2.0f);
-    DrawCoverArt(inner, a.songs[idx], idx, rad);
-
-    // 4) Gloss along the top of the booklet
-    FillRound(Rc(inner.left, inner.top, inner.right - inner.left,
-                 (std::max)(6.0f, h * 0.04f)), rad, 0xFFFFFF, 0.14f);
-
-    // 5) Plastic rim highlight + outer outline
-    StrokeRound(Rc(r.left + 1, r.top + 1, w - 2, h - 2), rad, 0xFFFFFF, 0.55f, 1.0f);
-    StrokeRound(r, rad, 0x000000, 0.18f, 1.0f);
-
-    g_alphaMul = 1.0f;
-}
-
-/** Record sleeve: as big as the CD, exposing only a strip at the top/bottom; can be tilted as a whole */
-static void DrawSleeve(const D2D1_RECT_F& full, const D2D1_RECT_F& strip,
-                       int idx, float alpha, float angleDeg) {
-    if (idx < 0 || idx >= (int)g_app.songs.size() || alpha <= 0.01f) return;
-
-    D2D1::Matrix3x2F saved;
-    g_rt->GetTransform(&saved);
-
-    // Set the clip first (identity transform, so it stays horizontal), then rotate for drawing
-    g_rt->PushAxisAlignedClip(strip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-
-    float pcx = (full.left + full.right) * 0.5f;
-    float pcy = (full.top + full.bottom) * 0.5f;
-    g_rt->SetTransform(D2D1::Matrix3x2F::Rotation(angleDeg, D2D1::Point2F(pcx, pcy)));
-
-    DrawCase(full, idx, alpha);
-
-    g_rt->SetTransform(saved);
-    g_rt->PopAxisAlignedClip();
-}
-
 /* ── Audio ── */
 static bool g_audioOk = false;      // whether the current track is really playing
 
@@ -2348,10 +2295,18 @@ static int       g_audioRetry = 0;        // allow one automatic retry when open
 static float     g_spinAngle = 0.0f;      // radians
 
 
-/* Play URL resolution runs on a worker thread; the UI thread picks up the result from g_urlReady */
-static std::mutex    g_urlMx;
-static std::wstring  g_urlReady;
-static int           g_urlState = 0;   // 0 idle, 1 resolving, 2 ready, 3 failed
+/* Play URL resolution runs on a worker thread; the UI thread picks up the result from g_urlResult.
+   Only the latest request stores its result, so the URL from a slow resolution is never opened for a newer track */
+static std::mutex                  g_urlMx;
+static std::optional<std::wstring> g_urlResult;   // an empty URL when the resolution failed
+static int                         g_urlSeq = 0;  // number of the latest request
+
+/* Drops the request in progress and any result it left; returns the number the next request carries */
+static int DropUrlRequest() {
+    std::lock_guard<std::mutex> lk(g_urlMx);
+    g_urlResult.reset();
+    return ++g_urlSeq;
+}
 
 /* Audio open runs on a worker thread: prebuffering waits on the network and would visibly stall the UI thread */
 static std::mutex       g_openMx;
@@ -2393,10 +2348,6 @@ static void CloseAudioNow() {
     AudioClose();
 }
 
-static int           g_urlIdx = -1;
-
-static std::string   g_token2_unused;
-
 /* Fade in/out */
 static float g_vol = 1.0f;              // fade factor
 static float g_userVol = 0.8f;          // user volume 0..1
@@ -2420,22 +2371,22 @@ static const int      kQualCount = 4;
 static const wchar_t* kQualName[4] = { T(L"标准", L"Standard"), T(L"高品", L"High"), T(L"无损", L"Lossless"), L"Hi-Res" };
 static const char*    kQualApi[4]  = { "128", "320", "flac", "high" };   // Kugou's quality parameter per tier
 
-/* Which tiers the current song actually has: bit0=standard bit1=high bit2=lossless bit3=Hi-Res
+/* Which tiers g_qmSong actually has: bit0=standard bit1=high bit2=lossless bit3=Hi-Res
    Unknown (0xFF) shows all of them; a request served below its tier rules out the tiers above the one served */
 static std::mutex    g_qmMx;
-static int           g_qmIdx = -1;
+static Song          g_qmSong;
 static unsigned char g_qmMask = 0xFF;
 
-static unsigned char QualMaskFor(int idx) {
+static unsigned char QualMaskFor(const Song& s) {
     std::lock_guard<std::mutex> lk(g_qmMx);
-    return (idx == g_qmIdx) ? g_qmMask : 0xFF;
+    return SameSong(s, g_qmSong) ? g_qmMask : 0xFF;
 }
-static void SetQualMask(int idx, int requested, int gotLevel) {
+static void SetQualMask(const Song& s, int requested, int gotLevel) {
     std::lock_guard<std::mutex> lk(g_qmMx);
     const unsigned char upToServed = (unsigned char)((2u << gotLevel) - 1);
     if (gotLevel < requested) g_qmMask = upToServed;
-    else g_qmMask = (idx == g_qmIdx) ? (unsigned char)(g_qmMask | upToServed) : 0xFF;   // keep tiers ruled out before
-    g_qmIdx = idx;
+    else g_qmMask = SameSong(s, g_qmSong) ? (unsigned char)(g_qmMask | upToServed) : 0xFF;   // keep tiers ruled out before
+    g_qmSong = s;
 }
 
 static std::wstring QualFile() { return LocalDir() + L"\\quality.txt"; }
@@ -2481,7 +2432,7 @@ static void LoadVolume() {
 static void DrawVolume(float px, float by, float cy);
 static int   g_fadeDir = 0;            // +1 fade in, -1 fade out
 static int   g_pendingDir = 0;         // track to switch to after fade-out finishes
-static int   g_pendingPick = -1;       // another song was picked in the list: load it after the old one fades out
+static bool  g_pendingLoad = false;    // load the current track after the fade-out: another song was picked, or the quality changed
 static int   g_pendingSeekMs = -1;     // position to seek to after reload (used when changing quality)
 
 /* Progress bar dragging */
@@ -2525,8 +2476,8 @@ static bool FindRes(int id, const void*& data, DWORD& size) {
 
 
 
-/* Start a hidden service process inside a job that the system kills when Floral exits, crashes included */
-static bool LaunchSidecar(std::wstring cmd, const std::wstring& dir) {
+/* Let a process created suspended run inside the job that the system kills when Floral exits, crashes included */
+static void RunInSidecarJob(const PROCESS_INFORMATION& pi) {
     static HANDLE job = [] {
         HANDLE j = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl = {};
@@ -2534,7 +2485,13 @@ static bool LaunchSidecar(std::wstring cmd, const std::wstring& dir) {
         SetInformationJobObject(j, JobObjectExtendedLimitInformation, &jl, sizeof(jl));
         return j;
     }();
+    AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+}
 
+/* Start a hidden service process inside a job that the system kills when Floral exits, crashes included */
+static bool LaunchSidecar(std::wstring cmd, const std::wstring& dir) {
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
@@ -2543,9 +2500,7 @@ static bool LaunchSidecar(std::wstring cmd, const std::wstring& dir) {
     if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
                         nullptr, dir.c_str(), &si, &pi))
         return false;
-    AssignProcessToJobObject(job, pi.hProcess);
-    ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
+    RunInSidecarJob(pi);
     CloseHandle(pi.hProcess);
     return true;
 }
@@ -2610,14 +2565,60 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
 }
 
 #ifndef FLORAL_NO_TOGETHER
-/* Listen-together helper: MQTT credentials are passed via environment variables */
-static void StartTogetherHelper() {
-    SetEnvironmentVariableW(L"FLORAL_MQTT_HOST", L"k9bf6e3a.ala.cn-shenzhen.emqxsl.cn");
-    SetEnvironmentVariableW(L"FLORAL_MQTT_PORT", L"8883");
-    SetEnvironmentVariableW(L"FLORAL_MQTT_USER", L"Floral");
-    SetEnvironmentVariableW(L"FLORAL_MQTT_PASS", L"qwertyuiop!@#$%^&*()");
-    SetEnvironmentVariableW(L"FLORAL_LISTEN_PORT", L"4100");
-    StartNodeSidecar(L"together", L"together-server.js", 4100, "一起听助手");
+static const RelayBroker kRelayBroker = {
+    "k9bf6e3a.ala.cn-shenzhen.emqxsl.cn", 8883, "Floral", "qwertyuiop!@#$%^&*()"
+};
+
+/* RelayLaunch for the listen-together helper */
+static bool LaunchRelayHelper(HANDLE* toHelper, HANDLE* fromHelper, HANDLE* process) {
+    if (!ExtractSidecars()) {
+        Logf("ERR", "一起听助手：sidecars 解压失败");
+        return false;
+    }
+    HANDLE childIn = nullptr, childOut = nullptr;
+    if (!CreatePipe(&childIn, toHelper, nullptr, 0)) return false;
+    if (!CreatePipe(fromHelper, &childOut, nullptr, 0)) {
+        CloseHandle(childIn);
+        CloseHandle(*toHelper);
+        return false;
+    }
+    // Only the helper's own pipe ends are passed on, so its output pipe closes as soon as it exits
+    SetHandleInformation(childIn, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(childOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    HANDLE inherited[] = { childIn, childOut };
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<char> attributes(size);
+    auto list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    InitializeProcThreadAttributeList(list, 1, 0, &size);
+    UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited),
+                              nullptr, nullptr);
+
+    STARTUPINFOEXW si = {};
+    si.StartupInfo.cb         = sizeof(si);
+    si.StartupInfo.dwFlags    = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput  = childIn;
+    si.StartupInfo.hStdOutput = childOut;
+    si.lpAttributeList        = list;
+    const std::wstring root = SidecarRoot();
+    std::wstring cmd = L"\"" + root + L"\\node.exe\" together-server.js";
+    PROCESS_INFORMATION pi = {};
+    const bool started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+                                        CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                                        nullptr, (root + L"\\together").c_str(), &si.StartupInfo, &pi);
+    const DWORD error = GetLastError();
+    DeleteProcThreadAttributeList(list);
+    CloseHandle(childIn);
+    CloseHandle(childOut);
+    if (!started) {
+        Logf("ERR", "一起听助手启动失败 code=%lu", error);
+        CloseHandle(*toHelper);
+        CloseHandle(*fromHelper);
+        return false;
+    }
+    RunInSidecarJob(pi);
+    *process = pi.hProcess;
+    return true;
 }
 #endif
 
@@ -2711,14 +2712,6 @@ static std::string UrlEnc(const std::string& s) {
     return o;
 }
 
-static std::wstring Widen(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
-    return w;
-}
-
 /** Read token / userid from the current source's session file */
 static void LoadSession() {
     FILE* f = nullptr;
@@ -2804,6 +2797,11 @@ static void CheckLoginAsync() {
             if (raw.empty()) { g_loginState = 3; return; }
             if (raw.find("qqmusic_session") == std::string::npos &&
                 raw.find("\"code\":200") == std::string::npos) { g_loginState = 2; return; }
+            JVal r;
+            const JVal* data = Json(raw, r) ? r.get("data") : nullptr;
+            const JVal* profile = data ? data->get("profile") : nullptr;
+            const JVal* nick = profile ? profile->get("nickname") : nullptr;
+            SetNickname(Widen(nick ? nick->str() : ""));
             g_loginState = 1;
             return;
         }
@@ -2816,7 +2814,7 @@ static void CheckLoginAsync() {
                 g_loginState = 2;
                 return;
             }
-            g_nickname = Widen(JsonStr(raw, "nickname"));
+            SetNickname(Widen(JsonStr(raw, "nickname")));
             g_loginState = 1;
             return;
         }
@@ -2832,7 +2830,7 @@ static void CheckLoginAsync() {
             return;
         }
         if (JsonInt(r, "status") == 1) {
-            g_nickname = Widen(JsonStr(r, "nickname"));
+            SetNickname(Widen(JsonStr(r, "nickname")));
             g_vipType  = JsonInt(r, "vip_type");
             g_loginState = 1;
         } else {
@@ -2841,16 +2839,71 @@ static void CheckLoginAsync() {
     }).detach();
 }
 
-/** Resolve a song's play URL at a quality tier (blocking; only call from worker threads). The song is a copy
-    made on the UI thread, since g_app.songs may be replaced meanwhile; gotLevel receives the tier served */
-static std::wstring ResolvePlayUrl(const Song& s, int quality, int& gotLevel) {
-    const std::string& hash = s.hash;
-    if (hash.empty()) return L"";
+/* Platform and account that play URLs are resolved with. A request copies them when it is made, since the UI
+   thread changes them on sign-in and on platform switches */
+struct Account {
+    int         platform;
+    std::string token, userid;
+};
+static Account CurrentAccount() { return { g_source, g_token, g_userid }; }
 
-    if (g_source == 2) {                       // QQ Music
+/* Ids that songs of other platforms were matched to, keyed by (platform searched, the song's own platform, the
+   song's id). Failed searches are not kept, so a retry searches again */
+struct MatchedIds {
+    std::string hash;
+    long long   mixId = 0;
+    long long   albumId = 0;
+};
+static std::mutex g_matchMx;
+static std::map<std::tuple<int, int, std::string>, MatchedIds> g_matched;
+
+/* Gives a song of another platform the ids of the same song on the account's platform; false when that platform
+   has no version close enough. Blocking */
+static bool MatchOn(const Account& account, Song& s) {
+    const int platform = account.platform;
+    const auto key = std::make_tuple(platform, s.source, s.hash);
+    MatchedIds ids;
+    bool known = false;
+    {
+        std::lock_guard<std::mutex> lk(g_matchMx);
+        auto it = g_matched.find(key);
+        if (it != g_matched.end()) { ids = it->second; known = true; }
+    }
+    if (!known) {
+        const std::string title = Narrow(s.title), artist = Narrow(s.artist);
+        std::wstring err;
+        if (!MatchOnPlatform(platform, title, artist, s.durationSec, account.token, ids.hash, ids.mixId, ids.albumId,
+                             err)) {
+            Logf("ERR", "跨平台匹配失败 %d→%d %s - %s %ds: %s", s.source, platform, title.c_str(), artist.c_str(),
+                 s.durationSec, Narrow(err).c_str());
+            return false;
+        }
+        Logf("SRC", "跨平台匹配 %d→%d %s - %s: %s → %s", s.source, platform, title.c_str(), artist.c_str(),
+             s.hash.c_str(), ids.hash.c_str());
+        std::lock_guard<std::mutex> lk(g_matchMx);
+        g_matched[key] = ids;
+    }
+    s.source = platform;
+    s.hash = ids.hash;
+    s.mixId = ids.mixId;
+    s.albumId = ids.albumId;
+    return true;
+}
+
+/** Play URL of a song at a quality tier on the account's platform; gotLevel receives the tier served. A song of
+    another platform is matched there first. Blocking, so only worker threads call it, each with its own copy */
+static std::wstring ResolvePlayUrl(const Song& song, const Account& account, int quality, int& gotLevel) {
+    if (song.hash.empty()) return L"";
+    const int platform = account.platform;
+    EnsureSidecar(platform);                   // the service may still be starting right after launch
+    Song s = song;
+    if (s.source != platform && !MatchOn(account, s)) return L"";
+    const std::string& hash = s.hash;
+
+    if (platform == 2) {                       // QQ Music
         Logf("SRC", "解析 qq id=%s 档位=%d", hash.c_str(), quality);
         std::wstring e;
-        std::wstring u = QqResolveUrl(hash, g_token, quality, e, &gotLevel);
+        std::wstring u = QqResolveUrl(hash, account.token, quality, e, &gotLevel);
         if (u.empty()) {
             Logf("ERR", "QQ 解析失败: %s", Narrow(e).c_str());
             Trace("qq resolve fail");
@@ -2860,10 +2913,10 @@ static std::wstring ResolvePlayUrl(const Song& s, int quality, int& gotLevel) {
         }
         return u;
     }
-    if (g_source == 1) {                       // NetEase
+    if (platform == 1) {                       // NetEase
         Logf("SRC", "解析 netease id=%s 档位=%d", hash.c_str(), quality);
         std::wstring e;
-        std::wstring u = NgResolveUrl(hash, quality, g_token, e, &gotLevel);
+        std::wstring u = NgResolveUrl(hash, quality, account.token, e, &gotLevel);
         if (u.empty()) Logf("ERR", "网易云解析失败: %s", Narrow(e).c_str());
         else Logf("SRC", "网易云解析成功 档位=%d", gotLevel);
         return u;
@@ -2871,7 +2924,7 @@ static std::wstring ResolvePlayUrl(const Song& s, int quality, int& gotLevel) {
 
     Logf("SRC", "解析 kugou hash=%s 档位=%d", hash.c_str(), quality);
     std::string dfid = GetDfid();
-    std::string cookie = "dfid=" + dfid + ";userid=" + g_userid + ";token=" + g_token;
+    std::string cookie = "dfid=" + dfid + ";userid=" + account.userid + ";token=" + account.token;
     char url[2048] = "";
     std::string lastResp;
     std::wstring best;
@@ -2918,8 +2971,8 @@ static std::wstring ResolvePlayUrl(const Song& s, int quality, int& gotLevel) {
 /** Local copy of this song at audio\<hash>.flac or .mp3 in the data directory; empty when absent, so it is streamed */
 static std::wstring FindAudio(int idx) {
     App& a = g_app;
-    if (idx < 0 || idx >= (int)a.songs.size()) return L"";
-    const std::string& h = a.songs[(size_t)idx].hash;
+    if (idx < 0 || idx >= (int)a.queue.size()) return L"";
+    const std::string& h = a.queue[(size_t)idx].hash;
     if (h.empty()) return L"";
     std::wstring base = AssetDir() + L"\\audio\\" + std::wstring(h.begin(), h.end());
     for (const wchar_t* ext : { L".flac", L".mp3" })
@@ -2964,16 +3017,18 @@ static std::mutex g_preMx;
 static std::map<std::string, CachedUrl> g_urlCache;
 static std::set<std::string> g_preFetching;
 
-static void PrefetchUrl(int idx) {
-    if (idx < 0 || idx >= (int)g_app.songs.size()) return;
-    const Song song = g_app.songs[(size_t)idx];
+/* Resolves the URL of the queue's track after idx in the background */
+static void PrefetchAfter(int idx) {
+    const int n = (int)g_app.queue.size();
+    if (n == 0) return;
+    const Song song = g_app.queue[(size_t)((idx + 1) % n)];
     {
         std::lock_guard<std::mutex> lk(g_preMx);
         if (song.hash.empty() || g_urlCache.count(song.hash) || !g_preFetching.insert(song.hash).second) return;
     }
-    std::thread([song, quality = g_quality]() {
+    std::thread([song, account = CurrentAccount(), quality = g_quality]() {
         int got = 0;
-        std::wstring u = ResolvePlayUrl(song, quality, got);
+        std::wstring u = ResolvePlayUrl(song, account, quality, got);
         std::lock_guard<std::mutex> lk(g_preMx);
         if (!u.empty()) g_urlCache[song.hash] = { u, quality, got };
         g_preFetching.erase(song.hash);
@@ -2984,9 +3039,11 @@ static void PrefetchUrl(int idx) {
 static void LoadAudioFor(int idx, bool useLocal = true) {
     Trace("LoadAudioFor idx=%d", idx);
     BeginCloseAsync();
+    const int seq = DropUrlRequest();
     g_audioOk = false;
     g_fadeDir = 0;
     g_pendingDir = 0;
+    g_pendingLoad = false;
     g_audioError = false;
     g_audioErrKind = 0;
     g_audioLoading = true;              // raise "loading" first; clear it once there's a position
@@ -3000,7 +3057,7 @@ static void LoadAudioFor(int idx, bool useLocal = true) {
     }
 
     // Reuse a prefetched URL to save a round trip
-    const Song song = (idx >= 0 && idx < (int)g_app.songs.size()) ? g_app.songs[(size_t)idx] : Song{};
+    const Song song = (idx >= 0 && idx < (int)g_app.queue.size()) ? g_app.queue[(size_t)idx] : Song{};
     CachedUrl cached;
     {
         std::lock_guard<std::mutex> lk(g_preMx);
@@ -3012,30 +3069,22 @@ static void LoadAudioFor(int idx, bool useLocal = true) {
     }
     Logf("AUD", "尝试打开本地缓存 idx=%d", idx);
     if (!cached.url.empty()) {
-        SetQualMask(idx, cached.quality, cached.level);
+        SetQualMask(song, cached.quality, cached.level);
         g_loadingMin = GetTickCount64() + 300;
         BeginOpenAsync(cached.url);              // network stream: open in the background, don't stall the UI
-        PrefetchUrl((idx + 1) % (int)g_app.songs.size());
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lk(g_urlMx);
-        g_urlState = 1;
-        g_urlReady.clear();
-        g_urlIdx = idx;
-    }
     g_loadingMin = GetTickCount64() + 600;   // keep the spinner up at least 0.6s when streaming
-    std::thread([idx, song, source = g_source, quality = g_quality]() {
+    std::thread([idx, seq, song, account = CurrentAccount(), quality = g_quality]() {
         Trace("resolve start idx=%d", idx);
-        EnsureSidecar(source);          // the service may still be starting: cached playlists open right after launch
         int got = 0;
-        std::wstring u = ResolvePlayUrl(song, quality, got);
-        if (!u.empty()) SetQualMask(idx, quality, got);
+        std::wstring u = ResolvePlayUrl(song, account, quality, got);
         Trace("resolve end   idx=%d ok=%d", idx, u.empty() ? 0 : 1);
         std::lock_guard<std::mutex> lk(g_urlMx);
-        g_urlReady = u;
-        g_urlState = u.empty() ? 3 : 2;
+        if (seq != g_urlSeq) return;
+        if (!u.empty()) SetQualMask(song, quality, got);
+        g_urlResult = u;
     }).detach();
 }
 
@@ -3043,19 +3092,18 @@ static void SwitchTrack(int dir);
 
 static void SwitchTrackNow(int dir) {
     App& a = g_app;
-    int n = (int)a.songs.size();
+    int n = (int)a.queue.size();
     if (n <= 0) return;
     if (a.current < 0) a.current = 0;
 
     int from = a.current;
     int to = (from + dir % n + n) % n;
 
-    // Remember which two songs the cases held before switching so they show during the animation
+    // The corner disc that the animation pushes off keeps the song it showed before the switch
     g_casePrev0 = (from - 1 + n) % n;
     g_caseNext0 = (from + 1) % n;
 
     g_switchFrom = from;
-    g_switchTo = to;
     g_switchDir = (dir >= 0) ? 1 : -1;
     g_switchT = 0.0f;
     g_textDir = (dir >= 0) ? 1 : -1;
@@ -3076,7 +3124,72 @@ static void SwitchTrack(int dir) {
         g_fadeDir = -1;
         return;
     }
-    SwitchTrackNow(dir);
+    SwitchTrackNow(g_pendingDir + dir);   // a switch still fading out counts as well
+}
+
+/* Stops playback: an open track fades out and is closed, a track still loading is dropped */
+static void StopPlayback() {
+    App& a = g_app;
+    a.playing = false;
+    a.pos = 0.0;
+    DropUrlRequest();
+    g_pendingLoad = false;
+    g_pendingDir = 0;
+    g_pendingSeekMs = -1;
+    g_audioLoading = false;
+    g_audioError = false;
+    if (g_audioOk) g_fadeDir = -1;
+    else BeginCloseAsync();
+}
+
+/* Replaces the play queue. selected is the index in the new queue of the track being played, which carries on;
+   -1 selects nothing and stops playback */
+static void SetPlayQueue(std::vector<Song> songs, int selected) {
+    App& a = g_app;
+    a.queue = std::move(songs);
+    a.current = selected;
+    g_textCur = selected;
+    g_switchT = 1.0f;                   // the switch animation draws discs of the old queue
+    { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }
+    if (selected < 0) StopPlayback();
+}
+
+static void SetPlaying(bool playing) {
+    g_app.playing = playing;
+    if (g_audioOk) { if (playing) AudioPlay(); else AudioPause(); }
+}
+
+/* Makes queue[idx] the current track. The track already playing carries on; any other track is loaded once the
+   playing one has faded out, and starts from its beginning unless TogetherStartPosMs gives a position */
+static void OpenTrack(int idx, bool playing) {
+    App& a = g_app;
+    const bool sameTrack = (idx == a.current) && (g_audioOk || g_audioLoading) && !g_audioError;
+    g_textDir = (idx >= a.current) ? 1 : -1;   // the text slide direction follows the position in the queue
+    a.current = idx;
+    if (sameTrack) {
+        if (g_pendingDir != 0) { g_pendingDir = 0; g_fadeDir = 1; }   // call off a switch that is still fading out
+        SetPlaying(playing);
+        return;
+    }
+    a.playing = playing;
+    a.pos = 0.0;
+    g_discAngle = 0.0f;
+    g_audioRetry = 0;
+    g_pendingSeekMs = -1;
+    if (g_audioOk && !g_audioLoading && g_fadeDir <= 0) {
+        // The previous track is still playing: fade out first, then start the new one once volume reaches zero
+        g_pendingLoad = true;
+        g_fadeDir = -1;
+    } else {
+        LoadAudioFor(idx);
+    }
+}
+
+/* Moves the current track to ms; a track that is not open yet starts there once it opens */
+static void SeekTo(int ms) {
+    g_app.pos = ms / 1000.0;
+    if (g_audioOk && !g_pendingLoad) AudioSeekMS(ms);
+    else g_pendingSeekMs = ms;
 }
 
 /** Song info on a tile (scrim + title + artist) */
@@ -3370,6 +3483,197 @@ static void FillTri(float x1, float y1, float x2, float y2, float x3, float y3,
     geo->Release();
 }
 
+/* ── Listen together: the button, panel and toasts show only what TogetherStatus() reports ── */
+
+/* A member's display name; without a nickname, the role of the other member as seen from this side */
+static std::wstring TogMemberName(const TogetherView& v, const std::string& name) {
+    if (!name.empty()) return Widen(name);
+    return v.host ? T(L"朋友", L"Friend") : T(L"房主", L"Host");
+}
+
+static std::wstring TogNoticeText(const TogetherView& v) {
+    const std::wstring who = TogMemberName(v, v.noticeText);
+    switch (v.notice) {
+    case TogetherNotice::PeerJoined:   return who + T(L"加入了房间", L" joined the room");
+    case TogetherNotice::PeerLeft:     return who + T(L"离开了房间", L" left the room");
+    case TogetherNotice::HostEnded:    return T(L"房主结束了一起听", L"The host ended the session");
+    case TogetherNotice::PeerCantPlay: return who + T(L"放不了这首歌，已跳到下一首", L" can't play this song, skipped to the next");
+    case TogetherNotice::PeerCantPlayAny: return who + T(L"连续几首都放不了，不再自动跳过", L" can't play several songs in a row; no longer skipping");
+    case TogetherNotice::CantPlay:     return T(L"这首歌在你这边放不了，已告诉房主", L"This song can't play here; the host has been told");
+    case TogetherNotice::LinkDown:     return T(L"连接断开，正在重新连接…", L"Connection lost, reconnecting…");
+    case TogetherNotice::LinkUp:       return T(L"连接已恢复", L"Connection restored");
+    case TogetherNotice::None:         break;
+    }
+    return L"";
+}
+
+/* Shows a toast for each new notice; true when the room has changed since the previous call */
+static bool TogetherStatusChanged() {
+    static TogetherView last;
+    const TogetherView v = TogetherStatus();
+    if (v.noticeSeq != last.noticeSeq && v.notice != TogetherNotice::None) TogToast(TogNoticeText(v));
+    const bool changed = v.phase != last.phase || v.host != last.host || v.code != last.code ||
+                         v.peer != last.peer || v.linkDown != last.linkDown || v.noticeSeq != last.noticeSeq;
+    last = v;
+    return changed;
+}
+
+/* Appends the room-code characters of s to the input box, lowercased; anything else is dropped */
+static void TogType(const wchar_t* s) {
+    for (; *s; s++) {
+        const wchar_t c = towlower(*s);
+        if (wcschr(L"abcdefghjkmnpqrstuvwxyz23456789", c) && g_togInputText.size() < 12) g_togInputText += c;
+    }
+}
+
+/* Joins the room typed in the input box; an empty code is ignored, since it would create a room */
+static void TogJoinTyped() {
+    if (g_togInputText.empty()) return;
+    g_togInput = false;
+    TogetherJoin(Narrow(g_togInputText));
+}
+
+/* The listen-together toast, centered near the bottom of the window on every page */
+static void DrawTogToast(float W, float H) {
+    float dy = 0.0f;
+    const float a = ToastFade(g_togMsgAt, kTogToastSec, dy);
+    if (a <= 0.01f || g_togMsg.empty()) return;
+    IDWriteTextFormat* f = Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    const float h = 34.0f, w = (std::min)(TextWidth(g_togMsg, f) + 40.0f, W - 48.0f);
+    const D2D1_RECT_F r = Rc((W - w) * 0.5f, H - 76.0f + dy, w, h);
+    FillRound(Rc(r.left + 2.0f, r.top + 6.0f, w, h), h * 0.5f, UI::SHADOW, 0.14f * a);
+    FillRound(r, h * 0.5f, UI::PANEL, a);
+    TextEllipsis(g_togMsg, f, Rc(r.left + 20.0f, r.top, w - 40.0f, h), UI::TEXT, a);
+}
+
+#ifndef FLORAL_NO_TOGETHER
+static bool GridShowsQueue();
+
+/* Opens above the headset button so that it does not overlap the toast at the bottom; the content follows the phase */
+static void DrawTogetherPanel(const TogetherView& v, const D2D1_RECT_F& anchor) {
+    std::wstring head, detail;
+    const wchar_t* action = T(L"退出", L"Leave");
+    int actionKind = HK_TOG_LEAVE;
+    bool showCode = false, showInput = false;
+    const std::wstring peer = TogMemberName(v, v.peer);
+    switch (v.phase) {
+    case TogetherPhase::Off:
+        head = T(L"一起听", L"Listen together");
+        detail = T(L"开个房间，或者输入朋友的房间码加入", L"Open a room, or join with a friend's room code");
+        action = T(L"开房间", L"Open room");
+        actionKind = HK_TOG_HOST;
+        showInput = true;
+        break;
+    case TogetherPhase::Starting:
+        head = v.host ? T(L"正在开房间…", L"Opening a room…") : T(L"正在加入房间…", L"Joining the room…");
+        break;
+    case TogetherPhase::Hosting:
+        head = T(L"房间开好了", L"Your room is open");
+        detail = T(L"把房间码发给朋友，等朋友加入", L"Send the code to a friend and wait for them to join");
+        showCode = true;
+        break;
+    case TogetherPhase::Together:
+        head = T(L"正在和", L"Listening with ") + peer + T(L"一起听", L"");
+        if (!v.host) detail = T(L"你的播放操作会交给房主执行", L"Your playback controls go to the host");
+        showCode = true;
+        break;
+    case TogetherPhase::Waiting:
+        head = T(L"已加入房间", L"In the room");
+        detail = T(L"正在等待房主的消息…", L"Waiting to hear from the host…");
+        break;
+    case TogetherPhase::NotFound:
+        head = T(L"没有找到房主", L"No host found");
+        detail = T(L"房间码可能有误，或者房主已经离开", L"The code may be wrong, or the host has left");
+        break;
+    case TogetherPhase::Lost:
+        head = T(L"和", L"Lost contact with ") + peer + T(L"失去了联系", L"");
+        detail = T(L"房主重新连上后会接着一起听", L"Listening resumes when the host is back");
+        break;
+    case TogetherPhase::Full:
+        head = T(L"房间已满", L"The room is full");
+        detail = T(L"一起听只能两个人参加，有人离开后会自动加入", L"Only two can listen together; you'll join when a place frees up");
+        break;
+    case TogetherPhase::Failed:
+        head = T(L"没能连上一起听的服务器", L"Couldn't reach the server");
+        detail = T(L"请检查网络后重试", L"Check your network and try again");
+        action = T(L"返回", L"Back");
+        break;
+    }
+    if (v.linkDown) detail = T(L"连接断开，正在重新连接…", L"Connection lost, reconnecting…");
+    const bool showQueue = !v.host && (v.phase == TogetherPhase::Together || v.phase == TogetherPhase::Lost) &&
+                           !GridShowsQueue();
+
+    IDWriteTextFormat* headF = Fmt(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    IDWriteTextFormat* bodyF = Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* btnF  = Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL);
+    IDWriteTextFormat* codeF = Fmt(13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    const wchar_t* codeLabel = T(L"房间码", L"Room code");
+    const wchar_t* copy = T(L"复制", L"Copy");
+    const wchar_t* join = T(L"加入", L"Join");
+    auto buttonW = [&](const wchar_t* s) { return (std::max)(56.0f, TextWidth(s, btnF) + 28.0f); };
+    const float pad = 16.0f, gap = 8.0f, actionW = buttonW(action);
+    const float w = (std::min)((std::min)(420.0f, g_app.width - 24.0f),
+                               (std::max)({ 300.0f, TextWidth(head, headF) + gap + actionW + pad * 2.0f,
+                                            TextWidth(detail, bodyF) + pad * 2.0f }));
+
+    // Offsets of the rows below the headline; a row that is not shown takes no space
+    float y = 14.0f + 28.0f;
+    const float detailY = y + 2.0f;   if (!detail.empty()) y = detailY + 18.0f;
+    const float codeY   = y + 10.0f;  if (showCode)        y = codeY + 30.0f;
+    const float inputY  = y + 12.0f;  if (showInput)       y = inputY + 32.0f;
+    const float queueY  = y + 12.0f;  if (showQueue)       y = queueY + 32.0f;
+    const float h = y + 16.0f;
+
+    D2D1_RECT_F card = Rc((std::max)(12.0f, anchor.right - w), anchor.top - 8.0f - h, w, h);
+    const bool below = card.top < UI::TITLE_H + 8.0f;
+    if (below) card = Rc(card.left, anchor.bottom + 8.0f, w, h);
+    PanelFx fx(g_togT, (anchor.left + anchor.right) * 0.5f, below ? anchor.bottom : anchor.top);
+    FillRound(Rc(card.left + 3.0f, card.top + 8.0f, w, h), 12.0f, UI::SHADOW, 0.14f);
+    FillRound(card, 12.0f, UI::PANEL);
+    Hit hc; hc.r = card; hc.kind = HK_TOG_CARD;
+    if (g_alpha > 0.5f) g_app.hits.push_back(hc);
+
+    auto button = [&](const D2D1_RECT_F& r, const wchar_t* label, int kind, bool enabled) {
+        const bool hot = enabled && Inside(r, g_app.mouse);
+        FillRound(r, 8.0f, hot ? UI::SELECT : UI::GHOST);
+        Text(label, btnF, r, enabled ? (hot ? UI::ACCENT_TEXT : UI::TEXT2) : UI::TEXT3, DWRITE_TEXT_ALIGNMENT_CENTER);
+        Hit hb; hb.r = r; hb.kind = kind;
+        if (enabled && g_alpha > 0.5f) g_app.hits.push_back(hb);
+    };
+    const float x = card.left + pad, inner = w - pad * 2.0f;
+    TextEllipsis(head, headF, Rc(x, card.top + 14.0f, inner - gap - actionW, 28.0f), UI::TEXT);
+    button(Rc(card.right - pad - actionW, card.top + 14.0f, actionW, 28.0f), action, actionKind, true);
+    if (!detail.empty()) TextEllipsis(detail, bodyF, Rc(x, card.top + detailY, inner, 18.0f), UI::TEXT3);
+
+    if (showCode) {
+        const float labelW = TextWidth(codeLabel, bodyF), copyW = buttonW(copy);
+        Text(codeLabel, bodyF, Rc(x, card.top + codeY, labelW + 4.0f, 30.0f), UI::TEXT3);
+        Text(Widen(v.code), codeF, Rc(x + labelW + 12.0f, card.top + codeY, inner - labelW - 12.0f - copyW - gap, 30.0f), UI::TEXT);
+        button(Rc(card.right - pad - copyW, card.top + codeY + 1.0f, copyW, 28.0f), copy, HK_TOG_COPY, true);
+    }
+
+    if (showInput) {
+        const float joinW = buttonW(join);
+        const D2D1_RECT_F box = Rc(x, card.top + inputY, inner - gap - joinW, 32.0f);
+        FillRound(box, 8.0f, g_togInput ? UI::BG : UI::GHOST);
+        if (g_togInput) StrokeRound(box, 8.0f, UI::ACCENT, 1.2f);
+        const D2D1_RECT_F field = Rc(box.left + 12.0f, box.top, box.right - box.left - 24.0f, 32.0f);
+        if (g_togInputText.empty()) Text(codeLabel, Fmt(13.0f, DWRITE_FONT_WEIGHT_NORMAL), field, UI::TEXT3);
+        else Text(g_togInputText, codeF, field, UI::TEXT);
+        if (g_togInput) {
+            const float cx = field.left + TextWidth(g_togInputText, codeF) + 1.0f;
+            Line(cx, box.top + 8.0f, cx, box.bottom - 8.0f, UI::ACCENT, 1.4f);
+        }
+        Hit hi; hi.r = box; hi.kind = HK_TOG_INPUT;
+        if (g_alpha > 0.5f) g_app.hits.push_back(hi);
+        button(Rc(box.right + gap, box.top, joinW, 32.0f), join, HK_TOG_JOIN, !g_togInputText.empty());
+    }
+
+    if (showQueue)
+        button(Rc(x, card.top + queueY, inner, 32.0f), T(L"回到房主的歌单", L"Back to the host's list"), HK_TOG_QUEUE, true);
+}
+#endif  // FLORAL_NO_TOGETHER
+
 /** Volume button + pop-up slider */
 static void DrawVolume(float px, float by, float cy) {
     D2D1_RECT_F vb = Rc(px + 186, by, 40, 40);
@@ -3399,7 +3703,7 @@ static void DrawVolume(float px, float by, float cy) {
     if (qp.bottom > g_app.height - 8.0f) qp = Rc(qb.left - 6.0f, by - qh2 - 6.0f, qw, qh2);
     FillRound(Rc(qp.left + 3, qp.top + 8, qw, qh2), 12.0f, UI::SHADOW, 0.14f);
     FillRound(qp, 12.0f, UI::PANEL);
-    const unsigned char mask = QualMaskFor(g_app.current);
+    const unsigned char mask = QualMaskFor(g_app.queue[(size_t)g_app.current]);
     for (int i = 0; i < kQualCount; i++) {
         const bool avail = (mask & (1u << i)) != 0;
         D2D1_RECT_F row = Rc(qp.left + 6, qp.top + 5 + rh * (float)i, qw - 12, rh);
@@ -3423,9 +3727,10 @@ static void DrawVolume(float px, float by, float cy) {
 #ifndef FLORAL_NO_TOGETHER
     // ── Together Listening button (right of quality) ──
     {
+        const TogetherView tv = TogetherStatus();
         D2D1_RECT_F tb2 = Rc(qb.right + 10.0f, by, 40.0f, 40.0f);
         bool th2 = Inside(tb2, g_app.mouse);
-        bool on = TogetherActive();
+        bool on = tv.phase != TogetherPhase::Off;
         if (th2 || g_togOpen) FillRound(tb2, 20.0f, UI::HOVER);
         UINT32 icol = on ? UI::ACCENT : UI::TEXT2;
         const float ccx = tb2.left + 20.0f, ccy = by + 22.0f;
@@ -3441,108 +3746,19 @@ static void DrawVolume(float px, float by, float cy) {
             FillRound(Rc(ccx - rr - 3.0f, ccy - 1.0f, 5.0f, 9.0f), 2.5f, icol);
             FillRound(Rc(ccx + rr - 2.0f, ccy - 1.0f, 5.0f, 9.0f), 2.5f, icol);
         }
-        if (on) FillCircle(tb2.left + 31.0f, tb2.top + 9.0f, 3.0f, 0x6FBF73);
+        // status dot: accent while listening together, an accent ring while waiting, text color when the link or room has a problem
+        if (on) {
+            const float dx = tb2.left + 31.0f, dy = tb2.top + 9.0f;
+            const TogetherPhase ph = tv.phase;
+            if (tv.linkDown || ph == TogetherPhase::Lost || ph == TogetherPhase::NotFound ||
+                ph == TogetherPhase::Full || ph == TogetherPhase::Failed)
+                FillCircle(dx, dy, 3.0f, UI::TEXT);
+            else if (ph == TogetherPhase::Together) FillCircle(dx, dy, 3.0f, UI::ACCENT);
+            else StrokeCircle(dx, dy, 2.6f, UI::ACCENT, 1.0f, 1.5f);
+        }
         Hit ht2; ht2.r = tb2; ht2.kind = HK_TOG;
         if (g_alpha > 0.5f) g_app.hits.push_back(ht2);
-
-        if (g_togT > 0.01f) {
-            PanelFx fxt(g_togT, tb2.left + 20.0f, by + 46.0f);
-            const float pw2 = 430.0f, ph2 = on ? 96.0f : 176.0f;
-            D2D1_RECT_F tp = Rc(tb2.left - pw2 + 40.0f, by + 46.0f, pw2, ph2);
-            if (tp.left < 12.0f) tp = Rc(12.0f, by + 46.0f, pw2, ph2);
-            FillRound(Rc(tp.left + 3, tp.top + 8, pw2, ph2), 12.0f, UI::SHADOW, 0.14f);
-            FillRound(tp, 12.0f, UI::PANEL);
-            {   // swallow clicks on the card's empty area so it doesn't close on any touch
-                Hit hcard; hcard.r = tp; hcard.kind = HK_TOG_CARD;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hcard);
-            }
-
-            if (on) {
-                std::wstring who = g_togPeer.empty()
-                    ? (g_togHosting ? T(L"房间已开，等待对方加入…", L"Room open, waiting…") : T(L"已连接", L"Connected"))
-                    : (std::wstring(T(L"正在与 ", L"Listening with ")) + g_togPeer);
-                Text(who, Fmt(12.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 16, pw2 - 120, 22), UI::TEXT);
-                std::wstring code = Widen(TogetherMyCode());
-                if (!code.empty())
-                    Text(std::wstring(T(L"你的房间码：", L"Your room code: ")) + code, Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                         Rc(tp.left + 16, tp.top + 44, pw2 - 32, 18), UI::TEXT3);
-                D2D1_RECT_F cp = Rc(tp.right - 152, tp.top + 16, 60, 26);
-                {
-                    bool ch2 = Inside(cp, g_app.mouse);
-                    FillRound(cp, 8.0f, ch2 ? UI::SELECT : UI::GHOST);
-                    Text(T(L"复制", L"Copy"), Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL), cp,
-                         ch2 ? UI::ACCENT_TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-                    Hit hcp; hcp.r = cp; hcp.kind = HK_TOG_COPY;
-                    if (g_alpha > 0.5f) g_app.hits.push_back(hcp);
-                }
-                D2D1_RECT_F lv = Rc(tp.right - 84, tp.top + 16, 68, 26);
-                bool lh = Inside(lv, g_app.mouse);
-                if (lh) FillRound(lv, 8.0f, UI::SELECT);
-                Text(T(L"退出", L"Leave"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), lv,
-                     lh ? UI::ACCENT_TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-                Hit hl; hl.r = lv; hl.kind = HK_TOG_LEAVE;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hl);
-            } else {
-                // first row: my connection code
-                Text(T(L"我的房间码", L"My room code"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 12, 100, 16), UI::TEXT3);
-
-                std::wstring code = g_togMyCode;
-                Text(code.empty() ? T(L"未开房", L"No room") : code,
-                     Fmt(9.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 30, pw2 - 130, 18),
-                     code.empty() ? UI::TEXT3 : UI::TEXT);
-                D2D1_RECT_F hb = Rc(tp.right - 96, tp.top + 12, 80, 26);
-                bool hh = Inside(hb, g_app.mouse);
-                if (hh) FillRound(hb, 8.0f, UI::SELECT);
-                Text(code.empty() ? T(L"开房", L"Open room") : T(L"复制", L"Copy"),
-                     Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), hb,
-                     hh ? UI::ACCENT_TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
-                Hit hb2; hb2.r = hb;
-                hb2.kind = code.empty() ? HK_TOG_HOST : HK_TOG_COPY;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hb2);
-
-                // second row: enter the peer's connection code
-                Text(T(L"输入房间码，回车加入", L"Enter room code, press Enter"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(tp.left + 16, tp.top + 92, pw2 - 32, 16), UI::TEXT3);
-                D2D1_RECT_F ib = Rc(tp.left + 16, tp.top + 112, pw2 - 116, 30);
-                FillRound(ib, 8.0f, g_togInput ? UI::BG : UI::GHOST);
-                if (g_togInput) FillRound(ib, 8.0f, 0xFFFFFF);
-                std::wstring shown = g_togInputText;
-                if (shown.empty() && !g_togInput) shown = L"";
-                Text(shown, Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL),
-                     Rc(ib.left + 10, ib.top, ib.right - ib.left - 20, 30),
-                     UI::TEXT, DWRITE_TEXT_ALIGNMENT_LEADING);
-                if (g_togInput) {
-                    float cx2 = ib.left + 10 + (float)shown.size() * 6.2f;
-                    Line(cx2, ib.top + 7, cx2, ib.bottom - 7, UI::ACCENT, 1.4f);
-                }
-                Hit hi; hi.r = ib; hi.kind = HK_TOG_INPUT;
-                if (g_alpha > 0.5f) g_app.hits.push_back(hi);
-
-                D2D1_RECT_F jb = Rc(tp.right - 88, tp.top + 112, 72, 30);
-                const bool hasTxt = !g_togInputText.empty();
-                bool jh = Inside(jb, g_app.mouse) && hasTxt;
-                FillRound(jb, 8.0f, jh ? UI::SELECT : (hasTxt ? UI::BG : UI::GHOST));
-                Text(T(L"加入", L"Join"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), jb,
-                     hasTxt ? (jh ? UI::ACCENT_TEXT : UI::TEXT2) : 0xB9A6AD,
-                     DWRITE_TEXT_ALIGNMENT_CENTER);
-                if (!g_togInputText.empty()) {
-                    Hit hj; hj.r = jb; hj.kind = HK_TOG_JOIN;
-                    if (g_alpha > 0.5f) g_app.hits.push_back(hj);
-                }
-                if (!g_togMsg.empty()) {
-                    float dy = 0.0f;
-                    float ta = ToastFade(g_togMsgAt, 6.0f, dy);
-                    if (ta > 0.01f) {
-                        Text(g_togMsg, Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL),
-                             Rc(tp.left + 16, tp.top + 148 + dy, pw2 - 32, 18), 0xB04A63,
-                             DWRITE_TEXT_ALIGNMENT_LEADING, ta);
-                    }
-                }
-            }
-        }
+        if (g_togT > 0.01f) DrawTogetherPanel(tv, tb2);
     }
 #endif  // FLORAL_NO_TOGETHER
 
@@ -3626,7 +3842,7 @@ static void DrawExiting() {
 static void DrawPlayerPage() {
     App& a = g_app;
     const float W = a.width, H = a.height;
-    const int n = (int)a.songs.size();
+    const int n = (int)a.queue.size();
     if (a.current < 0 || a.current >= n) {
         // ── No song selected: blank record + hint ──
         const float lineY = UI::TITLE_H + 4.0f;
@@ -3657,7 +3873,7 @@ static void DrawPlayerPage() {
              Rc(px, cy + 12, W - px - 40, 22), UI::TEXT3);
         return;
     }
-    const Song& s = a.songs[(size_t)a.current];
+    const Song& s = a.queue[(size_t)a.current];
 
     // Back button (above the info column on the right; top-left is kept for the album box)
     D2D1_RECT_F back = Rc(W * 0.46f - 6.0f, UI::TITLE_H + 18.0f, 96, 28);
@@ -3692,6 +3908,7 @@ static void DrawPlayerPage() {
 
     int prevIdx = (a.current - 1 + n) % n;
     int nextIdx = (a.current + 1) % n;
+    for (int i : { prevIdx, a.current, nextIdx }) RequestCover(a.queue[(size_t)i]);
 
     D2D1_RECT_F discRect = Rc(cx - dd * 0.5f, cy - dd * 0.5f, dd, dd);
 
@@ -3715,15 +3932,11 @@ static void DrawPlayerPage() {
         discNext = shrink(discNext);
     }
 
-    // The two small corner discs (clipped below the divider so they don't cover the title)
-    // Top corner: keep the "old disc" while switching, swap after the outgoing disc lands on it — exactly when it's hidden, so no flicker
-    int cornerPrev = prevIdx;
-    if (switching && g_casePrev0 >= 0 && g_casePrev0 < n) cornerPrev = g_casePrev0;
-
     // Flight start/end points: fully off-screen, so discs "spin in from / out to nowhere"
     D2D1_RECT_F offPrev = Rc(-sr * 2.2f, lineY - sr * 2.2f, sr * 2, sr * 2);
     D2D1_RECT_F offNext = Rc(-sr * 2.2f, H + sr * 1.2f,    sr * 2, sr * 2);
 
+    // The discs are clipped below the divider so that the corner ones don't cover the title
     g_rt->PushAxisAlignedClip(Rc(0, lineY, W, H - lineY), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     if (switching) {
@@ -3750,19 +3963,19 @@ static void DrawPlayerPage() {
         float angIn  = g_discAngle + 360.0f * (1.0f - e);
 
         // 1) Oldest corner disc: yields, spins off-screen
-        DrawDisc(LerpRect(pushOut, outOff, e), a.songs[(size_t)pushedIdx], pushedIdx, angOut, 1.0f);
+        DrawDisc(LerpRect(pushOut, outOff, e), a.queue[(size_t)pushedIdx], pushedIdx, angOut, 1.0f);
         // 2) New disc: comes in from off-screen to the corner
-        DrawDisc(LerpRect(inOff, slideIn, e), a.songs[(size_t)slideIdx], slideIdx, angIn, 1.0f);
+        DrawDisc(LerpRect(inOff, slideIn, e), a.queue[(size_t)slideIdx], slideIdx, angIn, 1.0f);
         // 3) Centered disc: shrinks into the corner
-        DrawDisc(LerpRect(discRect, toCorner, e), a.songs[(size_t)g_switchFrom],
+        DrawDisc(LerpRect(discRect, toCorner, e), a.queue[(size_t)g_switchFrom],
                  g_switchFrom, angOut, 1.0f);
         // 4) Corner disc: grows and spins into the center (topmost)
         DrawDisc(LerpRect(fromCorner, discRect, e), s, a.current, angIn, 1.0f);
     } else {
         if (cornerK > 0.01f) {
             // Corner mini discs stay still; click one to switch to that song
-            DrawDisc(discPrev, a.songs[(size_t)prevIdx], prevIdx, 0.0f, 1.0f);
-            DrawDisc(discNext, a.songs[(size_t)nextIdx], nextIdx, 0.0f, 1.0f);
+            DrawDisc(discPrev, a.queue[(size_t)prevIdx], prevIdx, 0.0f, 1.0f);
+            DrawDisc(discNext, a.queue[(size_t)nextIdx], nextIdx, 0.0f, 1.0f);
             if (g_alpha > 0.5f && !switching) {
                 Hit hp; hp.r = discPrev; hp.kind = HK_PREV;
                 a.hits.push_back(hp);
@@ -4006,13 +4219,13 @@ static void LoadPlaylistAsync(int idx, int seq) {
         // Version 0 means unknown, so no cached copy counts as current
         const std::wstring file = PlTracksFile(gcid, ver);
         if (seq > 0) {
-            std::vector<Song> songs = (ver > 0) ? ReadSongs(file) : std::vector<Song>();
+            std::vector<Song> songs = (ver > 0) ? ReadSongs(file, SRC_KUGOU) : std::vector<Song>();
             if (!songs.empty()) {
                 deliver(ver, file, std::move(songs), L"");
                 return;
             }
             const auto [oldVer, old] = PlNewestCopy(gcid);
-            if (!old.empty()) songs = ReadSongs(old);
+            if (!old.empty()) songs = ReadSongs(old, SRC_KUGOU);
             if (!songs.empty()) {
                 deliver(oldVer, old, std::move(songs), L"");
                 seq = 0;                // the fetched tracks below replace this copy
@@ -4022,7 +4235,7 @@ static void LoadPlaylistAsync(int idx, int seq) {
         std::lock_guard<std::mutex> lk(g_plFetchMx);
         const auto [newestVer, newest] = PlNewestCopy(gcid);   // another load may have fetched it while this one waited
         if (ver > 0 && newestVer >= ver) {
-            std::vector<Song> songs = ReadSongs(newest);
+            std::vector<Song> songs = ReadSongs(newest, SRC_KUGOU);
             if (!songs.empty()) {
                 deliver(newestVer, newest, std::move(songs), L"");
                 return;
@@ -4032,7 +4245,7 @@ static void LoadPlaylistAsync(int idx, int seq) {
         std::wstring err;
         const ULONGLONG start = GetTickCount64();
         const int n = KgExportPlaylist(token, userid, gcid, count, AssetDir() + L"\\" + file, err);
-        std::vector<Song> songs = (n > 0) ? ReadSongs(file) : std::vector<Song>();
+        std::vector<Song> songs = (n > 0) ? ReadSongs(file, SRC_KUGOU) : std::vector<Song>();
         if (songs.empty()) {
             if (err.empty()) err = L"读不出刚拉取的歌单";
             Logf("ERR", "拉取歌单失败: %s", Narrow(err).c_str());
@@ -4065,7 +4278,7 @@ static void CancelPlaylistOpen() {
     g_plWantVer = g_plShownVer;
 }
 
-/* g_app.songs was reloaded from a file that belongs to no playlist, such as the likes of another source */
+/* The grid now shows a list that belongs to no playlist, such as the likes of another source or the play queue */
 static void ForgetShownPlaylist() {
     g_plShownGcid.clear();
     g_plWantGcid.clear();
@@ -4085,21 +4298,63 @@ static void CheckShownPlaylist() {
     }
 }
 
-/* Replaces g_app.songs with a loaded track list and resets the state that indexes into the old list */
-static void ShowTracks(PlaylistTracks& t) {
+/* Replaces the list in the song grid and resets the state that indexes into the old list */
+static void SetGridSongs(std::vector<Song> songs) {
     App& a = g_app;
-    g_likesName = t.file;
-    a.songs = std::move(t.songs);
+    a.songs = std::move(songs);
     a.tileAnim.assign(a.songs.size(), 0.0f);
-    g_covFlag.assign(a.songs.size(), 0);
-    g_prewarmIdx = 0;
-    { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }
-    a.current = -1;
     a.hoverTile = -1;
-    g_plShownGcid = t.gcid;
-    g_plShownVer = t.ver;
+    g_covAsked.clear();
+    g_prewarmIdx = 0;
+    g_enterIdx = -1;
     EnsureBase(a.width, (int)a.songs.size());
     EnsureTarget(a.width, (int)a.songs.size(), -1);
+}
+
+/* Shows a loaded playlist in the grid and records it as the playlist on screen */
+static void ShowTracks(PlaylistTracks& t) {
+    g_likesName = t.file;
+    g_plShownGcid = t.gcid;
+    g_plShownVer = t.ver;
+    SetGridSongs(std::move(t.songs));
+}
+
+/* Whether the song grid shows the play queue's list, so that grid positions are queue positions */
+static bool GridShowsQueue() {
+    const App& a = g_app;
+    return std::equal(a.songs.begin(), a.songs.end(), a.queue.begin(), a.queue.end(), SameSong);
+}
+
+/* Shows the play queue's list in the song grid */
+static void ShowQueueInGrid() {
+    SetGridSongs(g_app.queue);
+    ForgetShownPlaylist();
+}
+
+/* Loads the track list file g_likesName into the song grid, and the playlist list of the current platform */
+static void LoadLists() {
+    std::vector<Song> songs = ReadSongs(g_likesName, g_source);
+    AdoptLocalCovers(songs);            // only fills in paths; covers are decoded when they are drawn
+    SetGridSongs(std::move(songs));
+    ForgetShownPlaylist();
+    LoadPlaylists();
+    Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
+}
+
+/* Switches to another platform, whose sign-in, likes and playlists replace those of the current one */
+static void SwitchSource(int source) {
+    TogetherLeave();
+    g_source = source;
+    SaveSource();
+    g_likesName = std::wstring(SourceTag()) + L"-likes.tsv";
+    Logf("APP", "音源=%d 歌单文件=%s", g_source, Narrow(g_likesName).c_str());
+    SetPlayQueue({}, -1);
+    g_token.clear();
+    g_userid.clear();
+    SetNickname(L"");
+    g_loginState = 0;
+    LoadSession();
+    LoadLists();
 }
 
 /* Main thread: swap in the loaded playlist */
@@ -4137,8 +4392,6 @@ static void DrainPlaylistSwap() {
             return;
         }
         ShowTracks(t);
-        a.playing = false;
-        a.pos = 0.0;
         a.scroll = 0.0f;
         a.scrollTarget = 0.0f;
         a.pageAnim = 0.0f;
@@ -4156,12 +4409,12 @@ static void DrainPlaylistSwap() {
         PlaylistTracks& t = *g_plUpdated;
         // Updates with an unknown version (0) come straight from a fetch, so they are the newest too
         if (t.gcid == g_plShownGcid && (t.ver > g_plShownVer || t.ver == 0)) {
-            // Once a song is picked, its index must stay valid; the next open reads the new tracks from the cache
-            if (a.page == Page::Grid && a.current < 0) {
+            // Only the grid on screen is swapped; on other pages the next open reads the new tracks from the cache
+            if (a.page == Page::Grid) {
                 ShowTracks(t);
                 Logf("APP", "歌单已更新：%d 首", (int)a.songs.size());
             } else {
-                g_likesName = t.file;           // older copies are deleted, so a reload by InitData reads this one
+                g_likesName = t.file;           // older copies are deleted, so a reload by LoadLists reads this one
             }
         }
         g_plUpdated.reset();
@@ -4712,8 +4965,9 @@ static void DrawUI(ID2D1RenderTarget* rt) {
             float p = g_plT;
             DrawPlLoader(W, H, powf(1.0f - p, 1.6f));      // eased tail: no hard edge at the end
         }
-        
+
         DrawTitleBar(W);
+        DrawTogToast(W, H);
         if (g_setT > 0.01f) {
             a.mouse = realMouse;
             // The panel is modal: the scrim's and card's hit areas must be registered outside PanelFx,
@@ -4789,6 +5043,7 @@ static void DrawUI(ID2D1RenderTarget* rt) {
     // Title bar: always opaque, drawn every frame. No enter fade —
     // the old "hide for 1.4s" made buttons unclickable and the whole bar look translucent.
     DrawTitleBar(W);
+    DrawTogToast(W, H);
     if (g_setT > 0.01f) {
         a.mouse = realMouse;         // The panel needs the real mouse for hover
         // Scrim and card are always clickable (modal); only buttons are clipped by the animation
@@ -4835,218 +5090,9 @@ static bool SpringStep(float& value, float& velocity, float target, float dt) {
     return false;
 }
 
-static void GoPlayer(int idx);  // Defined later
-static void SwitchTrack(int delta);
-
-/* ── Listen Together: cross-platform matching (async, don't block the UI) ── */
-struct PendPlay {
-    bool has = false;
-    bool failed = false;
-    std::string hash;
-    long long mixId = 0, albumId = 0;
-    std::wstring title, artist, err;
-    int posMs = 0;
-    bool playing = true;
-};
-static std::mutex g_ppMx;
-static PendPlay     g_pp;
-static std::string  g_matchKey;
-
-static void TryMatchAsync(const TogetherEvent& ev) {
-    std::string key = ev.song + "|" + ev.title;
-    {
-        std::lock_guard<std::mutex> lk(g_ppMx);
-        if (key == g_matchKey) return;          // Don't re-match the same song
-        g_matchKey = key;
-        g_pp = PendPlay{};
-    }
-    Logf("TOG", "跨平台匹配: %s - %s", ev.title.c_str(), ev.artist.c_str());
-    std::string title = ev.title, artist = ev.artist;
-    int pos = ev.posMs;
-    bool play = ev.playing;
-    std::thread([title, artist, pos, play]() {
-        std::string h; std::wstring err;
-        long long mix = 0, alb = 0;
-        bool ok = MatchOnPlatform(g_source, title, artist, 0, h, mix, alb, err);
-        std::lock_guard<std::mutex> lk(g_ppMx);
-        g_pp.has = true;
-        g_pp.failed = !ok;
-        g_pp.hash = h;
-        g_pp.mixId = mix;
-        g_pp.albumId = alb;
-        g_pp.err = err;
-        g_pp.title = Widen(title);
-        g_pp.artist = Widen(artist);
-        g_pp.posMs = pos;
-        g_pp.playing = play;
-        Logf(ok ? "TOG" : "ERR", "匹配%s %s", ok ? "成功" : "失败", ok ? h.c_str() : Narrow(err).c_str());
-    }).detach();
-}
-/* ── Listen Together: receive and apply the peer's state ── */
-static void ApplyRemoteState(const TogetherEvent& ev) {
-    App& a = g_app;
-    if (ev.song.empty()) { Logf("TOG", "收到状态但没有曲目 id，忽略"); return; }
-    Logf("TOG", "收到状态 song=%.20s pos=%d play=%d", ev.song.c_str(), ev.posMs, ev.playing ? 1 : 0);
-
-    int idx = -1;
-    for (int i = 0; i < (int)a.songs.size(); i++) {
-        if (a.songs[i].hash == ev.song) { idx = i; break; }   // hash is a std::string
-    }
-    if (idx < 0) {
-        Logf("TOG", "本地没有该曲目，开始跨平台匹配");
-        TryMatchAsync(ev);
-        return;
-    }
-    Logf("TOG", "本地命中 idx=%d 当前=%d", idx, a.current);
-
-    // Expected position: peer's position + elapsed time (UTC ms, comparable across machines)
-    long long now = (long long)TogetherNowMs();
-    long long elapsed = (now > ev.stampMs) ? (now - ev.stampMs) : 0;
-    if (elapsed > 60000) elapsed = 0;                 // If clock skew is too large, just use the received position
-    long long expectedLL = (long long)ev.posMs + (ev.playing ? elapsed : 0);
-    int dur = (idx >= 0 && idx < (int)a.songs.size()) ? a.songs[(size_t)idx].durationSec : 0;
-    if (dur > 0 && expectedLL > (long long)dur * 1000 - 1000) expectedLL = (long long)dur * 1000 - 1000;
-    if (expectedLL < 0) expectedLL = 0;
-    int expected = (int)expectedLL;
-
-    if (idx != a.current) {
-        Logf("TOG", "跟随切歌 %d -> %d", a.current, idx);
-        GoPlayer(idx);
-        g_pendingSeekMs = expected;                 // Jump straight to the peer's position once opened
-        if (!ev.playing) a.playing = false;
-        return;
-    }
-    if (ev.playing != a.playing) {                  // Play/pause follows the peer
-        a.playing = ev.playing;
-        if (ev.playing) AudioPlay(); else AudioPause();
-    }
-    if (ev.playing) {
-        int mine = (int)(a.pos * 1000.0);
-        if (abs(mine - expected) > 800) {           // Correct only when the event point is off by more than 0.8s
-            AudioSeekMS(expected);
-            a.pos = expected / 1000.0;
-        }
-    }
-}
-
-/* ── Listen Together: push out our own state ── */
-static void PushLocalState(bool force) {
-    if (!TogetherActive()) return;
-    // Both push: the host pushes authoritative state; a follower's push only lets the host know someone is listening
-    App& a = g_app;
-    if (a.current < 0 || a.current >= (int)a.songs.size()) return;
-
-    static std::string  lastHash;
-    static bool         lastPlaying = false;
-    static ULONGLONG    lastPush = 0;
-    static int          lastSeekMs = -1;
-
-    const Song& s = a.songs[a.current];
-    ULONGLONG now = GetTickCount64();
-    int posMs = (int)(a.pos * 1000.0);
-
-    // Sync only on key actions: song change, play/pause, seek, loading-state change
-    bool changed = force || g_togForcePush ||
-                   s.hash != lastHash || a.playing != lastPlaying;
-    if (!changed) return;
-    g_togForcePush = false;
-
-    lastHash = s.hash;
-    lastPlaying = a.playing;
-    lastPush = now;
-    lastSeekMs = posMs;
-    TogetherPushState(s.hash,
-                      g_source == 2 ? "qq" : (g_source == 1 ? "netease" : "kugou"),
-                      posMs, a.playing,
-                      Narrow(s.title), Narrow(s.artist));
-}
 static void RefreshPlaylistsAsync();
 static bool Animate() {
-#ifndef FLORAL_NO_TOGETHER
-    // ── Listen Together: consume events, push state ──
-    {
-        TogetherEvent ev;
-        while (TogetherPoll(ev)) {
-            if (ev.kind == 1) {
-                Logf("TOG", "检测到对端：%s", ev.nick.c_str());
-                g_togHosting = false;
-                g_togForcePush = true;          // Just joined: push the current state right away
-                TogetherSayHello();            // Send a hello back so the peer sees me too
-                g_togPeer = Widen(ev.nick);
-                g_togMyCode = Widen(TogetherMyCode());
-                std::wstring hello = std::wstring(T(L"已和 ", L"Connected with ")) + g_togPeer + T(L" 连接成功，一起听", L"");
-                TogToast(hello);
-            } else if (ev.kind == 3) {
-                g_togPeer.clear();
-                TogToast(T(L"对方已断开", L"Peer disconnected"));
-            } else if (ev.kind == 4) {
-                TogToast(ev.err.empty() ? T(L"连接失败", L"Connection failed") : ev.err);
-                TogetherStop();
-            } else if (ev.kind == 5) {
-                if (g_togIsHost) {
-                    Logf("TOG", "对方播放失败，房主跳过");
-                    TogToast(T(L"对方无该曲目，已跳到下一首", L"Peer lacks this track, skipped to next"));
-                    SwitchTrack(1);
-                }
-            } else if (ev.kind == 2) {
-                if (g_togIsHost) {
-                    // The host is authoritative; don't follow a visitor's state
-                } else {
-                    ApplyRemoteState(ev);
-                }
-            }
-        }
-        {   // Presence heartbeat: report the nickname every 15s so each side sees the other
-            static ULONGLONG lastHello = 0;
-            ULONGLONG nowH = GetTickCount64();
-            if (nowH - lastHello > 15000) {
-                lastHello = nowH;
-                TogetherSayHello();
-            }
-        }
-        {   // Loading state changed (buffering / recovered): sync once
-            static bool lastLoading = false;
-            if (g_audioLoading != lastLoading) {
-                lastLoading = g_audioLoading;
-                g_togForcePush = true;
-            }
-        }
-        PushLocalState(false);
-
-        // Cross-platform match result
-        {
-            PendPlay pp;
-            {
-                std::lock_guard<std::mutex> lk(g_ppMx);
-                if (!g_pp.has) { /* no result */ }
-                pp = g_pp;
-                if (g_pp.has) g_pp.has = false;     // Consume only once
-            }
-            if (pp.has) {
-                if (pp.failed) {
-                    TogToast(T(L"该曲目没有对应版本，已通知房主跳过", L"No matching version, asked the host to skip"));
-                    if (g_audioOk) { AudioPause(); g_app.playing = false; }
-                    if (!g_togIsHost) TogetherRequestSkip();
-                } else {
-                    Logf("TOG", "注入匹配结果 hash=%.20s 并播放", pp.hash.c_str());
-                    // Inject into the local list and play
-                    Song s;
-                    s.title = pp.title;
-                    s.artist = pp.artist;
-                    s.hash = pp.hash;
-                    s.mixId = pp.mixId;
-                    s.albumId = pp.albumId;
-                    g_app.songs.push_back(s);
-                    g_covFlag.push_back(0);
-                    g_layoutCount = -1;
-                    int i2 = (int)g_app.songs.size() - 1;
-                    GoPlayer(i2);
-                    g_pendingSeekMs = pp.posMs;
-                }
-            }
-        }
-    }
-#endif  // FLORAL_NO_TOGETHER
+    TogetherTick(GetTickCount64());
     App& a = g_app;
     bool need = false;
     const float dt = DeltaSeconds();
@@ -5069,14 +5115,11 @@ static bool Animate() {
             WriteSession(tgUid, tgTok);
             g_userid = tgUid;
             g_token = tgTok;
-            g_nickname.clear();
+            SetNickname(L"");
             g_vipType = 0;
             g_loginState = 1;                     // Login succeeded, valid
             g_loginAsked = false;
             ClearCache();                         // Cache isn't shared across platforms
-            g_covFlag.assign(g_app.songs.size(), 0);
-            g_layoutCount = -1;
-            g_layoutWidth = -1;
             SettingsToast(changed ? T(L"已切换账号，正在拉取歌单…", L"Account switched, fetching playlist…") : T(L"登录成功，正在拉取歌单…", L"Signed in, fetching playlist…"));
             StartExport(tgUid, tgTok);
             RefreshPlaylistsAsync();
@@ -5092,14 +5135,7 @@ static bool Animate() {
             std::lock_guard<std::mutex> lk(g_lgMx);
             g_expState = 0;
             g_bootRefreshPending = false;
-            InitData();
-            ForgetShownPlaylist();
-    Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
-    LoadPlaylists();
-    AdoptLocalCovers(g_app.songs);
-            g_covFlag.assign(g_app.songs.size(), 0);
-            g_layoutCount = -1;
-            g_layoutWidth = -1;
+            LoadLists();
             wchar_t buf[64];
             swprintf(buf, 64, T(L"歌单已更新（%d 首）", L"Playlist updated (%d songs)"), expCount);
             SettingsToast(buf);
@@ -5122,11 +5158,11 @@ static bool Animate() {
         ULONGLONG nowN = GetTickCount64();
         if (nowN - lastNeighbor > 150) {
             lastNeighbor = nowN;
-            int cnt = (int)a.songs.size();
+            int cnt = (int)a.queue.size();
             if (cnt > 1) {
                 int delta = (turn++ % 2) ? 1 : -1;
                 int ni = (a.current + delta + cnt) % cnt;
-                const Song& ns = a.songs[(size_t)ni];
+                const Song& ns = a.queue[(size_t)ni];
                 if (!ns.cover.empty() && !CoverEntry(ns.cover)) {
                     // Not decoded yet; retry next round
                 }
@@ -5149,13 +5185,12 @@ static bool Animate() {
 
     // Player text: on song change, slide the old text out, then the new text in
     {
-        static int  lastCur   = -1;
         static Page lastPage2 = Page::Grid;
 
-        const bool changed = (a.current != lastCur) || (a.page != lastPage2);
+        const bool changed = (a.current != g_textCur) || (a.page != lastPage2);
         if (changed) {
-            const bool songChanged = (a.current != lastCur);
-            lastCur = a.current;
+            const bool songChanged = (a.current != g_textCur);
+            g_textCur = a.current;
             lastPage2 = a.page;
 
             if (a.page != Page::Player || g_exitOn) {
@@ -5184,8 +5219,8 @@ static bool Animate() {
 
 
         // Save the current three rows as a snapshot for the next song change
-        if (a.current >= 0 && a.current < (int)a.songs.size()) {
-            const Song& cs = a.songs[(size_t)a.current];
+        if (a.current >= 0 && a.current < (int)a.queue.size()) {
+            const Song& cs = a.queue[(size_t)a.current];
             g_curTitle = cs.title; g_curArtist = cs.artist; g_curAlbum = cs.album;
         } else {
             g_curTitle.clear(); g_curArtist.clear(); g_curAlbum.clear();
@@ -5194,9 +5229,10 @@ static bool Animate() {
 
     // Keep redrawing while a toast is alive, or its fade won't animate
     {
+        if (TogetherStatusChanged()) need = true;   // the room changes with network events, not with input
         ULONGLONG nowT2 = NowMs();
         if (g_settingsMsgAt && nowT2 - g_settingsMsgAt < 5500) need = true;
-        if (g_togMsgAt      && nowT2 - g_togMsgAt      < 6500) need = true;
+        if (g_togMsgAt      && nowT2 - g_togMsgAt      < kTogToastSec * 1000.0f) need = true;
     }
 
     if (g_gridEnter < 1.0f) {
@@ -5471,23 +5507,18 @@ static bool Animate() {
         g_lineT = 0.0f;
     }
 
-    // A URL resolved for the current song is opened in the background
+    // A URL resolved for the current song is opened in the background; only the latest request leaves a result
     {
-        int st = 0, ui = -1;
-        std::wstring u;
-        {
-            std::lock_guard<std::mutex> lk(g_urlMx);
-            st = g_urlState; u = g_urlReady; ui = g_urlIdx;
-        }
-        if (st == 2 && ui == a.current && !g_audioOk && !g_audioError) {
-            {
-                // Clear state first so each URL is opened at most once; never retry every frame
-                std::lock_guard<std::mutex> lk(g_urlMx);
-                g_urlState = 0;
-                g_urlReady.clear();
-            }
-            Trace("open  idx=%d url_ok=1", ui);
-            BeginOpenAsync(u);                   // Open in the background; the UI keeps animating
+        std::optional<std::wstring> url;
+        { std::lock_guard<std::mutex> lk(g_urlMx); url.swap(g_urlResult); }   // each result is taken once
+        if (url && !url->empty()) {
+            Trace("open  idx=%d url_ok=1", a.current);
+            BeginOpenAsync(*url);                // Open in the background; the UI keeps animating
+        } else if (url) {
+            g_audioError = true;
+            g_audioErrKind = 1;
+            g_audioLoading = false;
+            RecheckLoginOnFailure();
         }
         // Result of the background open: finish on the UI thread (playback state is only changed here)
         {
@@ -5495,7 +5526,9 @@ static bool Animate() {
             if (r > 0) {
                 g_audioOk = true;
                 g_audioLoading = false;
-                if (g_pendingSeekMs >= 0) {          // Quality switch / Listen Together: resume mid-track with a fade-in
+                const int roomStartMs = TogetherStartPosMs(a.current);
+                if (roomStartMs >= 0) g_pendingSeekMs = roomStartMs;
+                if (g_pendingSeekMs >= 0) {          // quality switch, resume or listen together: start mid-track with a fade-in
                     AudioSeekMS(g_pendingSeekMs);
                     a.pos = g_pendingSeekMs / 1000.0;
                     g_pendingSeekMs = -1;
@@ -5506,7 +5539,7 @@ static bool Animate() {
                 }
                 if (a.playing) AudioPlay();          // stays paused if the user paused while it loaded
                 Trace("open  ok idx=%d", a.current);
-                PrefetchUrl((a.current + 1) % (int)a.songs.size());
+                PrefetchAfter(a.current);
             } else if (r < 0 && g_openUrl.rfind(L"http", 0) != 0) {   // a local file that won't open: stream instead
                 LoadAudioFor(a.current, false);
             } else if (r < 0) {
@@ -5514,38 +5547,16 @@ static bool Animate() {
                 g_audioErrKind = 2;
                 g_audioLoading = false;
                 RecheckLoginOnFailure();
-                std::string u8, err8;
-                {
-                    std::wstring u2 = g_openUrl;
-                    int n = WideCharToMultiByte(CP_UTF8, 0, u2.c_str(), (int)u2.size(),
-                                                nullptr, 0, nullptr, nullptr);
-                    u8.resize((size_t)n);
-                    WideCharToMultiByte(CP_UTF8, 0, u2.c_str(), (int)u2.size(),
-                                        &u8[0], n, nullptr, nullptr);
-                    std::wstring e = AudioLastError();
-                    n = WideCharToMultiByte(CP_UTF8, 0, e.c_str(), (int)e.size(),
-                                            nullptr, 0, nullptr, nullptr);
-                    err8.resize((size_t)n);
-                    WideCharToMultiByte(CP_UTF8, 0, e.c_str(), (int)e.size(),
-                                        &err8[0], n, nullptr, nullptr);
-                }
                 FILE* lf = nullptr;
                 _wfopen_s(&lf, (AssetDir() + L"\\url_debug.txt").c_str(), L"wb");
                 if (lf) {
-                    std::string d = "OPEN FAIL\nURL: " + u8 + "\nERR: " + err8 + "\n";
+                    std::string d = "OPEN FAIL\nURL: " + Narrow(g_openUrl) +
+                                    "\nERR: " + Narrow(AudioLastError()) + "\n";
                     fwrite(d.data(), 1, d.size(), lf);
                     fclose(lf);
                 }
                 Trace("openFAIL");
             }
-        }
-        if (st == 3 && ui == a.current && !g_audioOk) {   // Only honor failures for our own song
-            g_audioError = true;
-            g_audioErrKind = 1;
-            g_audioLoading = false;
-            RecheckLoginOnFailure();
-            std::lock_guard<std::mutex> lk(g_urlMx);
-            g_urlState = 0;
         }
     }
 
@@ -5561,13 +5572,11 @@ static bool Animate() {
         need = true;
     }
 
-    // Watchdog: resolution never returns (the sidecar died) — can't wait forever either
+    // Watchdog: resolving or opening never finishes (the sidecar died) — can't wait forever either
     if (g_audioLoading && !g_audioOk &&
         GetTickCount64() - g_loadingSince > 12000) {
-        {
-            std::lock_guard<std::mutex> lk(g_urlMx);
-            g_urlState = 0;
-        }
+        DropUrlRequest();
+        BeginCloseAsync();                       // a late result must not start the track after the failure shows
         g_audioError = true;
         g_audioLoading = false;
         RecheckLoginOnFailure();
@@ -5605,21 +5614,21 @@ static bool Animate() {
             g_fadeDir = 0;
         } else if (g_fadeDir < 0 && g_vol <= 0.0f) {
             g_fadeDir = 0;
-            if (g_pendingPick >= 0) {        // switching to one specific track
-                int i = g_pendingPick;
-                g_pendingPick = -1;
-                LoadAudioFor(i);
-            } else {
-                int d = g_pendingDir;
-                g_pendingDir = 0;
-                if (d != 0) SwitchTrackNow(d);   // only really switch once the fade-out is clean
+            if (g_pendingLoad) {
+                LoadAudioFor(a.current);
+            } else if (g_pendingDir != 0) {
+                SwitchTrackNow(g_pendingDir);    // only really switch once the fade-out is clean
+            } else {                             // playback was stopped
+                BeginCloseAsync();
+                g_audioOk = false;
             }
         }
         need = true;
     }
 
-    if (a.page == Page::Player && a.playing && a.current >= 0 &&
-        a.current < (int)a.songs.size()) {
+    // Playback advances on every page; only the player page shows it. While a picked track waits for the
+    // playing one to fade out, the engine's position is not the current track's
+    if (a.playing && a.current >= 0 && a.current < (int)a.queue.size() && !g_pendingLoad) {
         if (g_audioOk) {
             if (!g_seekDrag) {                 // don't let the engine position fight back while dragging
                 int ms = AudioPosMS();
@@ -5634,36 +5643,12 @@ static bool Animate() {
                     g_audioErrKind = 3;
                 } else if (AudioIsEnded() && g_fadeDir >= 0) {   // a fade-out in progress already leads elsewhere
                     Logf("AUD", "自动连播：ms=%d", ms);
-                    bool follower = false;
-#ifndef FLORAL_NO_TOGETHER
-                    follower = TogetherActive() && !g_togIsHost;
-#endif
-                    if (follower) {
-                        a.playing = false;         // wait for the host to push the next track, don't switch on our own
-                        AudioPause();
-                    } else {
-                        SwitchTrackNow(1);         // the track is over, so there is nothing to fade out
-                    }
-                }
-            }
-        } else if (g_urlState != 1 && !g_audioError) {   // while resolving/failed, don't pretend it's playing
-            a.pos += dt;
-            if (a.pos >= a.songs[a.current].durationSec) {
-                // In Together only the host may switch tracks; guests stop and wait for the host's next track
-                bool follower = false;
-#ifndef FLORAL_NO_TOGETHER
-                follower = TogetherActive() && !g_togIsHost;
-#endif
-                if (follower) {
-                    a.pos = (float)a.songs[a.current].durationSec;   // park at the end, don't run past it
-                    a.playing = false;
-                    AudioPause();
-                } else {
-                    SwitchTrack(1);            // auto-advance to the next track when finished (with the disc animation)
+                    if (TogetherHoldsTrackEnd()) SetPlaying(false);
+                    else SwitchTrackNow(1);        // the track is over, so there is nothing to fade out
                 }
             }
         }
-        need = true;
+        if (a.page == Page::Player) need = true;
     }
 
     // Grid tiles follow their targets on springs; only the tiles near the viewport animate, the rest snap into place
@@ -5787,7 +5772,7 @@ static void GoPlayerPageNow(bool fromPicker) {
     if (a.page == Page::Player) return;
 
     const int n = (int)a.songs.size();
-    const bool hasSong = (a.current >= 0 && a.current < n);
+    const bool hasSong = a.current >= 0 && GridShowsQueue();   // only then does the current song have a tile
 
     if (hasSong) {
         // Take off from the tile of "the current song", at the same spot as clicking it with the mouse
@@ -5801,7 +5786,7 @@ static void GoPlayerPageNow(bool fromPicker) {
         }
         g_enterIdx = a.current;
     } else {
-        g_enterIdx = -1;                // no song selected yet: just spread the other tiles, an empty disc in the middle
+        g_enterIdx = -1;                // no tile to take off from: just spread the other tiles while the player fades in
     }
 
     a.page = Page::Player;
@@ -5823,9 +5808,16 @@ static void GoPlayerPageNow(bool fromPicker) {
     g_alpha = 1.0f;
 }
 
+/* Plays a song of the grid on the player page; the grid's list becomes the queue unless it already is */
 static void GoPlayer(int idx) {
     App& a = g_app;
     if (idx < 0 || idx >= (int)a.songs.size()) return;
+
+    if (!GridShowsQueue()) {
+        // The song already playing keeps playing from its place in the new queue
+        const bool same = a.current >= 0 && SameSong(a.queue[(size_t)a.current], a.songs[(size_t)idx]);
+        SetPlayQueue(a.songs, same ? idx : -1);
+    }
 
     // Record where this tile is "currently drawn on screen" (including hover zoom); the transition starts there so nothing shrinks first
     EnsureBase(a.width, (int)a.songs.size());
@@ -5837,12 +5829,6 @@ static void GoPlayer(int idx) {
         g_enterFrom = Rc(a.width * 0.5f - 80, a.height * 0.5f - 80, 160, 160);
     }
 
-    // Clicking the track that's already playing: just go back to the player page, don't restart from the top
-    const bool sameTrack = (idx == a.current) && (g_audioOk || g_audioLoading) && !g_audioError;
-
-    g_textDir = (idx >= a.current) ? 1 : -1;   // the text slide direction follows the tile that was clicked
-    a.current = idx;
-    a.playing = true;
     a.page = Page::Player;
     a.pageAnim = 1.0f;         // no fade in/out, that's left to the transition
     a.hoverTile = -1;
@@ -5852,23 +5838,7 @@ static void GoPlayer(int idx) {
     g_enterIdx = idx;
     g_enterT = 0.0f;
     g_enterOn = true;
-    g_audioRetry = 0;
-    g_pendingSeekMs = -1;               // switching to another track: start from the beginning
-
-    if (sameTrack) {
-        // Keep progress and angle; if it was paused before, keep playing
-        if (g_audioOk) AudioPlay();
-    } else {
-        a.pos = 0.0;
-        g_discAngle = 0.0f;
-        if (g_audioOk && !g_audioLoading && g_fadeDir == 0) {
-            // The previous track is still playing: fade out first, then start the new one once volume reaches zero
-            g_pendingPick = idx;
-            g_fadeDir = -1;
-        } else {
-            LoadAudioFor(idx);
-        }
-    }
+    OpenTrack(idx, true);      // the track already playing keeps its progress, and resumes if it was paused
 }
 
 /* Back to the playlist selection page */
@@ -5966,14 +5936,51 @@ static void ProgressGeom(float& px, float& barY, float& barW) {
 /** Map an x coordinate to a point in time in the current song */
 static void SeekToX(float x) {
     App& a = g_app;
-    if (a.current < 0 || a.current >= (int)a.songs.size()) return;
+    if (a.current < 0 || a.current >= (int)a.queue.size()) return;
     float px, barY, barW;
     ProgressGeom(px, barY, barW);
     float r = (barW > 1.0f) ? (x - px) / barW : 0.0f;
     r = (std::max)(0.0f, (std::min)(1.0f, r));
-    a.pos = a.songs[(size_t)a.current].durationSec * r;
-    if (g_audioOk) AudioSeekMS((int)(a.pos * 1000.0));
+    SeekTo((int)(a.queue[(size_t)a.current].durationSec * r * 1000.0f));
 }
+
+/* The player as seen by the listen-together session */
+class PlayerSide : public TogetherPlayer {
+public:
+    State Now() override {
+        const App& a = g_app;
+        // The engine's position is the current track's only once that track is open and not being replaced
+        const bool ready = g_audioOk && !g_audioLoading && !g_pendingLoad && !AudioIsSeeking();
+        const int ms = AudioPosMS();
+        State s;
+        s.index = a.current;
+        s.playing = a.playing;
+        s.buffering = a.current >= 0 && !ready;
+        s.failed = g_audioError;
+        s.dragging = g_seekDrag;
+        s.posMs = (ready && ms >= 0) ? ms : (int)(a.pos * 1000.0);
+        return s;
+    }
+    const std::vector<Song>& Queue() override { return g_app.queue; }
+    std::string Name() override { return Narrow(Nickname()); }
+    void SetQueue(std::vector<Song> songs, bool showInGrid) override {
+        const App& a = g_app;
+        const bool shown = GridShowsQueue();
+        const auto same = a.current < 0 ? songs.end() : std::find_if(songs.begin(), songs.end(), [&](const Song& s) {
+            return SameSong(s, a.queue[(size_t)a.current]);
+        });
+        const int keep = same == songs.end() ? -1 : (int)(same - songs.begin());
+        AdoptLocalCovers(songs);
+        SetPlayQueue(std::move(songs), keep);
+        if (showInGrid || shown) ShowQueueInGrid();
+    }
+    void Play(int index, bool playing) override { OpenTrack(index, playing); }
+    void SetPlaying(bool playing) override { ::SetPlaying(playing); }
+    void Seek(int ms) override { SeekTo(ms); }
+    void Step(int dir) override { SwitchTrack(dir); }
+    void Retry() override { LoadAudioFor(g_app.current); }
+};
+static PlayerSide g_playerSide;
 
 static void OnClick(POINT p) {
     App& a = g_app;
@@ -6010,7 +6017,14 @@ static void OnClick(POINT p) {
     if (!h) return;
 
     switch (h->kind) {
-    case HK_TILE:  GoPlayer(h->index); break;
+    case HK_TILE:
+        if (TogetherRoutesControls()) {
+            if (GridShowsQueue()) TogetherRequest(TogetherOp::Pick, h->index);
+            else TogToast(T(L"正在一起听，退出房间后才能播放这里的歌", L"Leave the room to play from this list"));
+            break;
+        }
+        GoPlayer(h->index);
+        break;
     case HK_BACK:  ExitPlayer(); break;
     case HK_PICKER:
     case HK_PL_PICK:
@@ -6034,72 +6048,33 @@ static void OnClick(POINT p) {
         break;
     case HK_SRC:
         if (h->index != g_source) {
-            g_source = h->index;
-            SaveSource();
-            g_likesName = std::wstring(SourceTag()) + L"-likes.tsv";
-    Logf("APP", "音源=%d 歌单文件=%s", g_source, Narrow(g_likesName).c_str());
-            { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }
-            CloseAudioNow();
-            g_audioOk = false;
-            g_audioError = false;
-            g_token.clear();
-            g_userid.clear();
-            g_nickname.clear();
-            g_loginState = 0;
-            LoadSession();
-            InitData();
-            ForgetShownPlaylist();
-    Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
-    LoadPlaylists();
-    AdoptLocalCovers(g_app.songs);
-            g_covFlag.assign(g_app.songs.size(), 0);
-            g_layoutCount = -1;
-            g_layoutWidth = -1;
-            SettingsToast(g_source ? T(L"已切到网易云", L"Switched to NetEase") : T(L"已切到酷狗", L"Switched to Kugou"));
+            SwitchSource(h->index);
+            SettingsToast(g_source == 2 ? T(L"已切到 QQ 音乐", L"Switched to QQ Music")
+                          : g_source == 1 ? T(L"已切到网易云", L"Switched to NetEase") : T(L"已切到酷狗", L"Switched to Kugou"));
             CheckLoginAsync();
         }
         break;
 #ifndef FLORAL_NO_TOGETHER
     case HK_TOG:
         g_togOpen = !g_togOpen;
-        if (!g_togOpen) g_togInput = false;
+        g_togInput = false;
         break;
     case HK_TOG_INPUT:
         g_togInput = true;
         break;
-        Logf("TOG", "点击创建房间");
-    case HK_TOG_HOST: {
-        Logf("TOG", "点击创建房间");
-        if (g_togBusy) break;
-        g_togBusy = true;
-        g_togPeer.clear();
-        TogToast(T(L"正在连接服务器…", L"Connecting…"));
-        std::thread([]() {
-            std::string code; std::wstring err;
-            bool ok = TogetherHost(TogetherDefaultNick(true), code, err, -1);
-            if (ok) {
-                g_togMyCode = Widen(code);
-                g_togHosting = true;
-                g_togIsHost = true;
-                Logf("TOG", "房间创建成功 code=%s", code.c_str());
-                TogToast(T(L"房间已开，分享房间码给朋友吧", L"Room open, share the code"));
-            } else {
-                g_togHosting = false;
-                Logf("ERR", "创建房间失败: %s", Narrow(err).c_str());
-                TogToast(err);
-            }
-            g_togBusy = false;
-        }).detach();
+    case HK_TOG_HOST:
+        g_togInput = false;
+        TogetherHost();
         break;
-    }
     case HK_TOG_COPY: {
+        const std::wstring code = Widen(TogetherStatus().code);
         if (OpenClipboard(nullptr)) {
             EmptyClipboard();
-            size_t n2 = (g_togMyCode.size() + 1) * sizeof(wchar_t);
+            size_t n2 = (code.size() + 1) * sizeof(wchar_t);
             HGLOBAL g2 = GlobalAlloc(GMEM_MOVEABLE, n2);
             if (g2) {
                 void* p2 = GlobalLock(g2);
-                memcpy(p2, g_togMyCode.c_str(), n2);
+                memcpy(p2, code.c_str(), n2);
                 GlobalUnlock(g2);
                 SetClipboardData(CF_UNICODETEXT, g2);
             }
@@ -6108,30 +6083,21 @@ static void OnClick(POINT p) {
         TogToast(T(L"房间码已复制", L"Room code copied"));
         break;
     }
-    case HK_TOG_JOIN: {
-        if (!g_togMyCode.empty() && g_togInputText == g_togMyCode) {
-            TogToast(T(L"房间码，发给朋友以邀请加入", L"Send this code to invite"));
-            break;
-        }
-        std::wstring err;
-        std::string code(g_togInputText.begin(), g_togInputText.end());
-        Logf("TOG", "尝试加入 code=%s", code.c_str());
-        if (TogetherJoin(code, TogetherDefaultNick(false), err)) {
-            g_togInput = false;
-            TogToast(T(L"正在连接…", L"Connecting…"));
-        } else {
-            TogToast(err);
+    case HK_TOG_JOIN:
+        TogJoinTyped();
+        break;
+    case HK_TOG_QUEUE:
+        ShowQueueInGrid();
+        if (a.page == Page::Player) {   // GoGrid, not ExitPlayer: that one returns to the playlist picker when the player was opened from it
+            g_togOpen = false;
+            GoGrid();
         }
         break;
-    }
-    case HK_TOG_CARD: break;
+    case HK_TOG_CARD:
+        g_togInput = false;
+        break;
     case HK_TOG_LEAVE:
-        TogetherStop();
-        g_togPeer.clear();
-        g_togMyCode.clear();
-        g_togHosting = false;
-        g_togOpen = false;
-        TogToast(T(L"已退出一起听", L"Left the room"));
+        TogetherLeave();          // the panel stays open on the empty room form, with the typed code kept
         break;
 #endif  // FLORAL_NO_TOGETHER
     case HK_SCROLL: {
@@ -6158,11 +6124,16 @@ static void OnClick(POINT p) {
         if (h->index >= 0 && h->index < kQualCount && h->index != g_quality) {
             g_quality = h->index;
             SaveQuality();
-            { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }   // old-tier entries would stop PrefetchUrl
-            if (g_audioOk && !g_audioLoading && g_fadeDir == 0 && a.current >= 0) {
-                g_pendingSeekMs = (int)(a.pos * 1000.0);   // remember the progress, resume after the reload
-                g_pendingPick = a.current;      // reload with the new quality after the fade-out
-                g_fadeDir = -1;
+            { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }   // old-tier entries would stop PrefetchAfter
+            // A pending load or switch picks up the new tier by itself; an open or opening track is reloaded
+            if (a.current >= 0 && !g_pendingLoad && g_pendingDir == 0) {
+                if (g_audioOk) {
+                    g_pendingSeekMs = (int)(a.pos * 1000.0);   // remember the progress, resume after the reload
+                    g_pendingLoad = true;       // reload with the new quality after the fade-out
+                    g_fadeDir = -1;
+                } else if (g_audioLoading) {
+                    LoadAudioFor(a.current);
+                }
             }
         }
         g_qualOpen = false;
@@ -6204,46 +6175,27 @@ static void OnClick(POINT p) {
     }
     case HK_SET_LOGIN: {
         // Sign in again: clear the cache and every platform's sign-in data, then pick a platform
+        TogetherLeave();
         ClearCache();
         DeleteFileW((AssetDir() + L"\\kugou-session.json").c_str());
         DeleteFileW((AssetDir() + L"\\netease-session.json").c_str());
         DeleteFileW((AssetDir() + L"\\qq-session.json").c_str());
         g_token.clear();
         g_userid.clear();
-        g_nickname.clear();
+        SetNickname(L"");
         g_vipType = 0;
         g_loginState = 0;
         g_loginAsked = false;
         g_loginRunning = false;                 // cancel the previous poll, which may still be running
         { std::lock_guard<std::mutex> lk(g_lgMx); g_lgState = 0; g_lgMsg.clear(); }
-        CloseAudioNow();
-        g_audioOk = false;
-        g_audioError = false;
+        SetPlayQueue({}, -1);
         SettingsToast(T(L"已清空缓存和登录信息", L"Cache and sign-in cleared"));
         g_loginChoose = !g_loginChoose;
         break;
     }
     case HK_LOGIN_PICK: {
         g_loginChoose = false;
-        if (h->index != g_source) {              // switching platform: switch the data source along with it
-            g_source = h->index;
-            SaveSource();
-            g_likesName = std::wstring(SourceTag()) + L"-likes.tsv";
-    Logf("APP", "音源=%d 歌单文件=%s", g_source, Narrow(g_likesName).c_str());
-            g_token.clear();
-            g_userid.clear();
-            g_nickname.clear();
-            g_loginState = 0;
-            LoadSession();
-            InitData();
-            ForgetShownPlaylist();
-    Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
-    LoadPlaylists();
-    AdoptLocalCovers(g_app.songs);
-            g_covFlag.assign(g_app.songs.size(), 0);
-            g_layoutCount = -1;
-            g_layoutWidth = -1;
-        }
+        if (h->index != g_source) SwitchSource(h->index);   // the data source follows the platform signed in to
         StartRelogin();
         break;
     }
@@ -6252,11 +6204,20 @@ static void OnClick(POINT p) {
             LoadAudioFor(a.current);
             break;
         }
-        a.playing = !a.playing;
-        if (g_audioOk) { if (a.playing) AudioPlay(); else AudioPause(); }
+        if (TogetherRoutesControls()) {
+            TogetherRequest(a.playing ? TogetherOp::Pause : TogetherOp::Resume);
+            break;
+        }
+        SetPlaying(!a.playing);
         break;
-    case HK_PREV:  SwitchTrack(-1); break;
-    case HK_NEXT:  SwitchTrack(1); break;
+    case HK_PREV:
+        if (TogetherRoutesControls()) TogetherRequest(TogetherOp::Prev);
+        else SwitchTrack(-1);
+        break;
+    case HK_NEXT:
+        if (TogetherRoutesControls()) TogetherRequest(TogetherOp::Next);
+        else SwitchTrack(1);
+        break;
     case HK_PROGRESS: {
         if (a.current < 0) break;
         g_seekDrag = true;          // start dragging as soon as it's pressed
@@ -6694,7 +6655,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        if (g_seekDrag) g_togForcePush = true;      // finished dragging the progress bar: sync the position once
+        if (g_seekDrag && TogetherRoutesControls())
+            TogetherRequest(TogetherOp::Seek, (int)(g_app.pos * 1000.0));
         g_seekDrag = false;
         g_volDrag = false;
         g_scrollDrag = false;
@@ -6747,7 +6709,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
-        // Together input box: Ctrl+V to paste (a custom-drawn box has no system editor, so read the clipboard ourselves)
+        // Room code box: Ctrl+V replaces the code with the clipboard text (a custom-drawn box has no system editor, so read the clipboard ourselves)
         if (g_togOpen && g_togInput && wp == 'V' &&
             (GetKeyState(VK_CONTROL) & 0x8000)) {
             if (OpenClipboard(hwnd)) {
@@ -6755,10 +6717,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (hd) {
                     const wchar_t* src = (const wchar_t*)GlobalLock(hd);
                     if (src) {
-                        for (const wchar_t* q = src; *q; q++) {
-                            if (*q >= 32 && *q < 127 && g_togInputText.size() < 96)
-                                g_togInputText += *q;
-                        }
+                        g_togInputText.clear();
+                        TogType(src);
                         GlobalUnlock(hd);
                     }
                 }
@@ -6778,24 +6738,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CHAR: {
         if (g_togOpen && g_togInput) {
-            wchar_t c = (wchar_t)wp;
-            if (c == 8) {                                  // backspace
+            const wchar_t c[2] = { (wchar_t)wp, 0 };
+            if (c[0] == 8) {                               // backspace
                 if (!g_togInputText.empty()) g_togInputText.pop_back();
-            } else if (c == 13) {                          // Enter to join
-                if (!g_togMyCode.empty() && g_togInputText == g_togMyCode) {
-                    TogToast(T(L"这是你自己的房间码，发给朋友让他加入", L"That is your own room code"));
-                    return 0;
-                }
-                std::string code(g_togInputText.begin(), g_togInputText.end());
-                std::wstring err;
-                if (TogetherJoin(code, TogetherDefaultNick(false), err)) {
-                    g_togInput = false;
-                    TogToast(T(L"正在连接…", L"Connecting…"));
-                } else {
-                    TogToast(err);
-                }
-            } else if (c >= 32 && c < 127) {
-                g_togInputText += c;
+            } else if (c[0] == 13) {                       // Enter to join
+                TogJoinTyped();
+            } else {
+                TogType(c);
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -6833,9 +6782,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         RemoveTrayIcon();
         SaveWindowRect(hwnd);
-#ifndef FLORAL_NO_TOGETHER
-        TogetherStop();
-#endif
+        TogetherLeave();
         CloseAudioNow();                    // stop the device and join the audio threads
         PostQuitMessage(0);
         return 0;
@@ -7005,10 +6952,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     Logf("APP", "音源=%d 歌单文件=%s", g_source, Narrow(g_likesName).c_str());
     LoadSession();
     LoadLang();
-    InitData();
-    Logf("APP", "歌单载入 %d 首", (int)g_app.songs.size());
-    LoadPlaylists();
-    AdoptLocalCovers(g_app.songs);   // only fills in paths, no decoding: startup no longer loads song covers
+    LoadLists();
     // The first screen waits for the playlist list only when none is cached; a cached list shows at once
     // and the refresh below replaces it if it changed
     if (!g_token.empty() && g_app.playlists.empty()) g_bootRefreshPending = true;
@@ -7021,7 +6965,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }).detach();
 #ifndef FLORAL_NO_TOGETHER
-    std::thread(StartTogetherHelper).detach();   // login and playlists do not depend on it, so it starts separately
+    static Relay relay(LaunchRelayHelper, kRelayBroker);
+    TogetherInit(&g_playerSide, &relay);
 #endif
     if (!GfxInit()) {
         MessageBoxW(nullptr, T(L"图形初始化失败", L"Graphics init failed"), T(L"错误", L"Error"), MB_ICONERROR);
@@ -7032,7 +6977,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     StartDecoder();
 
     // Download covers for songs that lack one, on demand
-    g_covFlag.assign(g_app.songs.size(), 0);
     std::thread(CoverWorkerMain).detach();
 
     // Command line
@@ -7086,6 +7030,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             g_volOpen = true; g_volT = 1.0f;   // for screenshots
         } else if (a == L"--qualopen") {
             g_qualOpen = true; g_qualT = 1.0f;
+        } else if (a == L"--togopen") {
+            g_togOpen = true; g_togT = 1.0f;   // for screenshots: the listen-together panel, shown on the player page
+        } else if (a == L"--theme" && i + 1 < argc) {
+            ThemeApply(_wtoi(argv[++i]));      // for screenshots: another palette, without saving it
         } else if (a == L"--enter" && i + 1 < argc) {
             enterT = (float)_wtof(argv[++i]);   // for screenshots: freeze the enter animation at one moment
         } else if (a == L"--loginstate" && i + 1 < argc) {
@@ -7155,7 +7103,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
             g_app.page = Page::Player;
             g_app.pageAnim = 1.0f;
         } else if (page == L"player" && !g_app.songs.empty()) {
-            g_app.current = 0;
+            SetPlayQueue(g_app.songs, 0);
             g_app.playing = true;
             g_app.pos = 62.0;
             g_app.page = Page::Player;
@@ -7194,13 +7142,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         g_toastOverride = toastT;
         g_settingsMsg = L"歌单已更新";     // fabricate a toast for the screenshot
         g_settingsMsgAt = NowMs();
-        g_togMsg = std::wstring(T(L"已和 ", L"Connected with ")) + L"朋友的电脑";
-        g_togMsgAt = NowMs();
+#ifndef FLORAL_NO_TOGETHER
+        TogetherView joined;
+        joined.host = true;
+        joined.notice = TogetherNotice::PeerJoined;
+        TogToast(TogNoticeText(joined));
+#endif
     }
     if (textT >= 0.0f) {
         g_textT = textT;
         if (textPhase >= 0) g_textPhase = textPhase;
-        if (g_textPhase == 1 && g_outTitle.empty() && !g_app.songs.empty()) {
+        if (g_textPhase == 1 && g_outTitle.empty() && !g_app.queue.empty()) {
             // No real track switch during screenshots, so fabricate the old text by hand
             g_outTitle = L"上一首歌的名字";
             g_outArtist = L"上一位歌手";

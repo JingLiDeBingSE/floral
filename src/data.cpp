@@ -1,4 +1,5 @@
 #include "app.h"
+#include "log.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -39,14 +40,6 @@ static std::wstring FindAsset(const std::wstring& name) {
     return L"";
 }
 
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
-    return w;
-}
-
 static std::wstring Trim(const std::wstring& s) {
     size_t a = s.find_first_not_of(L" \t\r");
     if (a == std::wstring::npos) return L"";
@@ -56,7 +49,7 @@ static std::wstring Trim(const std::wstring& s) {
 
 std::wstring g_likesName = L"kugou-likes.tsv";
 
-std::vector<Song> ReadSongs(const std::wstring& name) {
+std::vector<Song> ReadSongs(const std::wstring& name, int source) {
     std::vector<Song> songs;
 
     std::string bytes;
@@ -73,7 +66,7 @@ std::vector<Song> ReadSongs(const std::wstring& name) {
         (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF)
         bytes.erase(0, 3);
 
-    std::wstring text = Utf8ToWide(bytes);
+    std::wstring text = Widen(bytes);
     std::wstringstream ss(text);
     std::wstring line;
 
@@ -93,6 +86,7 @@ std::vector<Song> ReadSongs(const std::wstring& name) {
         if (col.size() < 4) continue;
 
         Song s;
+        s.source = source;
         s.title = Trim(col[0]);
         s.artist = Trim(col[1]);
         s.album = col.size() > 2 ? Trim(col[2]) : L"";
@@ -113,9 +107,4 @@ std::vector<Song> ReadSongs(const std::wstring& name) {
         songs.push_back(s);
     }
     return songs;
-}
-
-void InitData() {
-    g_app.songs = ReadSongs(g_likesName);
-    g_app.tileAnim.assign(g_app.songs.size(), 0.0f);
 }
