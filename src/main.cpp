@@ -7109,6 +7109,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         FILE* f = nullptr;
         _wfopen_s(&f, p.c_str(), L"wb");
         if (f) { fwrite(log.c_str(), 2, log.size(), f); fclose(f); }
+        StopDecoder();
         CoUninitialize();
         return 0;
     }
