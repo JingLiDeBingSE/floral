@@ -12,7 +12,7 @@ struct ThemeDef {
     const wchar_t* name;
     UINT32 BG, PANEL, HOVER, SELECT, BORDER, TEXT, TEXT2, TEXT3, BTN_HOVER, BTN_CLOSE;
     UINT32 SHADOW, ACCENT, ACCENT_TEXT, GHOST, CARD;   // shadow / accent / accent text / subtle fill / card
-    UINT32 DISC, DISC_GROOVE;                          // disc base / grooves
+    UINT32 DISC;                                       // vinyl of the records
 };
 
 namespace UI {
@@ -31,7 +31,7 @@ namespace UI {
     extern UINT32 BG, PANEL, HOVER, SELECT, BORDER;
     extern UINT32 TEXT, TEXT2, TEXT3, BTN_HOVER, BTN_CLOSE;
     extern UINT32 SHADOW, ACCENT, ACCENT_TEXT, GHOST, CARD;
-    extern UINT32 DISC, DISC_GROOVE;
+    extern UINT32 DISC;
 }
 
 int            ThemeCount();
