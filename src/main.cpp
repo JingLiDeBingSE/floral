@@ -4524,7 +4524,9 @@ static void DrawPlaylistPicker() {
             if (g_covBrush[ci]) {
                 g_covBrush[ci]->SetStartPoint(D2D1::Point2F(cx - rad, cy - rad));
                 g_covBrush[ci]->SetEndPoint(D2D1::Point2F(cx + rad, cy + rad));
+                g_covBrush[ci]->SetOpacity(g_alpha * g_alphaMul * alpha);
                 g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rad, rad), g_covBrush[ci]);
+                g_covBrush[ci]->SetOpacity(1.0f);   // song tiles and the disc draw with these brushes without setting opacity
             } else {
                 FillCircle(cx, cy, rad, UI::SELECT, 0.8f * alpha);
             }
