@@ -6934,8 +6934,10 @@ static bool RenderToPng(const std::wstring& out) {
 static std::wstring WindowFile() { return LocalDir() + L"\\window.txt"; }
 
 static void SaveWindowRect(HWND hwnd) {
-    RECT r{};
-    if (!GetWindowRect(hwnd, &r)) return;
+    // rcNormalPosition is the restored rect, also while the window is minimized or maximized
+    WINDOWPLACEMENT wpl = { sizeof(wpl) };
+    if (!GetWindowPlacement(hwnd, &wpl)) return;
+    const RECT& r = wpl.rcNormalPosition;
     FILE* f = nullptr;
     _wfopen_s(&f, WindowFile().c_str(), L"wb");
     if (!f) return;
@@ -7285,7 +7287,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     {
         int wx, wy, ww, wh;
         if (LoadWindowRect(wx, wy, ww, wh)) {
-            SetWindowPos(hwnd, nullptr, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+            // The saved rect is in workspace coordinates, which SetWindowPlacement expects and SetWindowPos does not.
+            // SW_HIDE keeps the window hidden until ShowWindow below
+            WINDOWPLACEMENT wpl = { sizeof(wpl) };
+            wpl.showCmd = SW_HIDE;
+            wpl.rcNormalPosition = { wx, wy, wx + ww, wy + wh };
+            SetWindowPlacement(hwnd, &wpl);
             Logf("APP", "恢复窗口位置 %d,%d %dx%d", wx, wy, ww, wh);
         }
     }
