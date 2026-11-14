@@ -20,7 +20,10 @@ bool NgLoginStart(const std::wstring& qrPath, std::wstring& err);
 int  NgLoginPoll(std::string& cookie, std::wstring& err);   // 2 = success, cookie filled in
 int  NgExportLikes(const std::string& cookie, const std::wstring& outTsv, std::wstring& err);
 std::string  NgTrimCookie(const std::string& full);   // keep only MUSIC_U / __csrf
-std::wstring NgResolveUrl(const std::string& songId, const char* level, std::wstring& err, int* gotLevel = nullptr);
+
+/* level for NgResolveUrl and QqResolveUrl: 0 standard / 1 320k / 2 lossless / 3 Hi-Res; gotLevel receives the tier served */
+std::wstring NgResolveUrl(const std::string& songId, int level, const std::string& cookie,
+                          std::wstring& err, int* gotLevel = nullptr);   // anonymous when cookie is empty
 
 /* ── QQ Music (port 3200) ── */
 bool QqLoginStart(const std::wstring& qrPath, std::wstring& err);

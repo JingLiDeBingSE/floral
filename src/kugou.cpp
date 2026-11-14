@@ -721,26 +721,33 @@ static std::string GetAnonCookie() {
     return g_anonCookie;
 }
 
-std::wstring NgResolveUrl(const std::string& songId, const char* level, std::wstring& err, int* gotLevel) {
-    if (songId.empty()) { err = L"没有歌曲 id"; return L""; }
-    // Not every track has lossless/high quality: step down the requested levels
-    const char* chain[3] = { "standard", "exhigh", "lossless" };
-    int want = 1;
-    if (level && !strcmp(level, "standard")) want = 0;
-    if (level && !strcmp(level, "lossless")) want = 2;
+/* NetEase serves the best level the account may play up to the one requested and names it in "level" */
+static int NgTier(const JVal* level, int requested) {
+    const std::string s = level ? level->str() : "";
+    if (s.empty()) return requested;
+    if (s == "standard" || s == "higher") return 0;
+    if (s == "exhigh") return 1;
+    if (s == "lossless") return 2;
+    return 3;                                   // hires and the levels above it
+}
 
-    std::string anon = GetAnonCookie();
-    for (int q = want; q >= 0; q--) {
+std::wstring NgResolveUrl(const std::string& songId, int level, const std::string& cookie,
+                          std::wstring& err, int* gotLevel) {
+    if (songId.empty()) { err = L"没有歌曲 id"; return L""; }
+    static const char* kLevels[4] = { "standard", "exhigh", "lossless", "hires" };
+
+    std::string session = cookie.empty() ? GetAnonCookie() : cookie;
+    for (int q = level; q >= 0; q--) {
         std::string u = "http://127.0.0.1:4000/song/url/v1?id=" + UriEnc(songId) +
-                        "&level=" + chain[q];
-        if (!anon.empty()) u += "&cookie=" + UriEnc(NgTrimCookie(anon));
+                        "&level=" + kLevels[q];
+        if (!session.empty()) u += "&cookie=" + UriEnc(NgTrimCookie(session));
         JVal r;
         if (!Json(NgHttp(Wide(u)), r)) continue;
         const JVal* d = r.get("data");
         const JVal* first = d ? d->at(0) : nullptr;
         const JVal* url = first ? first->get("url") : nullptr;
         if (url && !url->str().empty()) {
-            if (gotLevel) *gotLevel = q;
+            if (gotLevel) *gotLevel = NgTier(first->get("level"), q);
             return Wide(url->str());
         }
     }
@@ -949,21 +956,11 @@ std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie,
                           int level, std::wstring& err, int* gotLevel) {
     if (mid.empty()) { err = L"没有歌曲 mid"; return L""; }
 
-    std::string tail = QqSessionParam(cookie);          // "" or "&cookie=xxx"
-    if (!tail.empty() && tail[0] == '&') tail = tail.substr(1);
-
-    // Not logged in: M500 only (~128k); higher tiers may be available after login
-    const char* lv[3] = { "", "level=exhigh", "level=lossless" };
-    int want = level < 0 ? 0 : (level > 2 ? 2 : level);
-
-    for (int q = want; q >= 0; q--) {
-        std::string query = lv[q] ? std::string(lv[q]) : "";
-        if (!query.empty() && !tail.empty()) query = tail + "&" + query;
-        else if (query.empty()) query = tail;
-
-        std::string u = "http://127.0.0.1:3200/getMusicPlay/" + UriEnc(mid);
-        if (!query.empty()) u += "?" + query;
-
+    // "best" tries FLAC, 320 and 128 in turn and names the one served; the service has no Hi-Res option
+    static const char* kQuality[3] = { "128", "320", "best" };
+    for (int q = (level < 2 ? level : 2); q >= 0; q--) {
+        std::string u = "http://127.0.0.1:3200/getMusicPlay/" + UriEnc(mid) + "?quality=" + kQuality[q] +
+                        QqSessionParam(cookie);
         JVal r;
         if (!Json(QqHttp(Wide(u)), r)) continue;
         const JVal* d = r.get("data");
@@ -971,7 +968,11 @@ std::wstring QqResolveUrl(const std::string& mid, const std::string& cookie,
         const JVal* one = pu ? pu->get(mid.c_str()) : nullptr;
         const JVal* url = one ? one->get("url") : nullptr;
         if (url && !url->str().empty()) {
-            if (gotLevel) *gotLevel = q;
+            if (gotLevel) {
+                const JVal* served = one->get("quality");
+                const std::string s = served ? served->str() : "";
+                *gotLevel = (s == "flac") ? 2 : (s == "320") ? 1 : (s == "128") ? 0 : q;
+            }
             return Wide(url->str());
         }
     }
