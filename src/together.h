@@ -86,6 +86,7 @@ enum class TogetherNotice {
     CantPlay,       // guest: the current track is not available on this platform; the host was told
     LinkDown,
     LinkUp,
+    PeerCantPlayAny,   // host: a guest cannot play several tracks in a row, so the host stopped moving on; noticeText: the name
 };
 
 struct TogetherView {

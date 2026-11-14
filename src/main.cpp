@@ -3509,7 +3509,8 @@ static std::wstring TogNoticeText(const TogetherView& v) {
     case TogetherNotice::PeerLeft:     return who + T(L"离开了房间", L" left the room");
     case TogetherNotice::HostEnded:    return T(L"房主结束了一起听", L"The host ended the session");
     case TogetherNotice::PeerCantPlay: return who + T(L"放不了这首歌，已跳到下一首", L" can't play this song, skipped to the next");
-    case TogetherNotice::CantPlay:     return T(L"你这边放不了这首歌，房主会跳到下一首", L"This song can't play here; the host will skip it");
+    case TogetherNotice::PeerCantPlayAny: return who + T(L"连续几首都放不了，不再自动跳过", L" can't play several songs in a row; no longer skipping");
+    case TogetherNotice::CantPlay:     return T(L"这首歌在你这边放不了，已告诉房主", L"This song can't play here; the host has been told");
     case TogetherNotice::LinkDown:     return T(L"连接断开，正在重新连接…", L"Connection lost, reconnecting…");
     case TogetherNotice::LinkUp:       return T(L"连接已恢复", L"Connection restored");
     case TogetherNotice::None:         break;

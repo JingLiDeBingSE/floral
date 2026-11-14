@@ -49,6 +49,7 @@ constexpr size_t kPartBytes = 32 * 1024;
 constexpr size_t kEnvelopeBytes = 1024;             // room kept in a part for the envelope and part fields
 constexpr int kMaxParts = 256;
 constexpr int kByeCopies = 3;                       // bye is the one message not repeated every period
+constexpr int kMaxSkips = 2;                        // tracks skipped in a row for a guest before the host stops skipping
 
 enum class Play { Paused, Playing, Buffering };
 enum class Health { Ok, Loading, Failed };
@@ -339,6 +340,7 @@ private:
     struct Guest {
         std::string id, name;
         unsigned long long heardAt = 0;
+        int skips = 0;                  // tracks skipped in a row because it could not play them
         Track track;                    // from its latest status, as are the fields below
         std::string want;
         std::vector<int> missing;
@@ -441,12 +443,20 @@ void HostSession::Execute(const JVal& req) {
     Log("执行了 %s 的请求：%s，参数 %lld", guest_->name.c_str(), kOpNames[op], arg);
 }
 
-/* Moves on once when the guest reports that it cannot play the current track */
+/* Moves on once when the guest cannot play the current track. After kMaxSkips in a row, as for a guest that is
+   signed out, the host stays on its tracks until the guest plays one again */
 void HostSession::SkipIfUnplayable() {
     const Track t = Current();
-    const Guest& g = *guest_;
-    if (g.health != Health::Failed || t.index < 0 || g.track.Key() != t.Key()) return;
-    if (!skipped_.insert(t.Key()).second) return;
+    Guest& g = *guest_;
+    if (t.index < 0 || g.track.Key() != t.Key()) return;
+    if (g.health == Health::Ok) g.skips = 0;
+    if (g.health != Health::Failed || !skipped_.insert(t.Key()).second) return;
+    if (g.skips == kMaxSkips) {
+        Log("%s 连续放不了，不再自动跳过", g.name.c_str());
+        notices_.Post(TogetherNotice::PeerCantPlayAny, g.name);
+        return;
+    }
+    g.skips++;
     Log("%s 放不了第 %d 首，跳到下一首", g.name.c_str(), t.index + 1);
     notices_.Post(TogetherNotice::PeerCantPlay, g.name);
     player_.Step(1);
