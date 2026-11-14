@@ -2,8 +2,8 @@
 
 #include <d2d1.h>
 
-/* Starts compiling the vinyl shader on a worker thread. The effect is registered with `factory` on the first
-   VinylDraw, which waits for the compiler if needed; if compiling or registering fails, VinylDraw returns false */
+/* Registers the vinyl effect with `factory` and starts compiling its shader on a worker thread. The first
+   VinylDraw waits for the compiler if needed; if compiling or registering fails, VinylDraw returns false */
 void VinylInit(ID2D1Factory* factory);
 
 /* Draws the vinyl of a record centered at (cx, cy), in DIPs. The label area, `label` times the radius,

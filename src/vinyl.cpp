@@ -11,8 +11,8 @@
 
 namespace {
 
-/* Lighting is computed in screen space, so the highlights stay where they are while the record turns.
-   The groove texture and the dust use the record's own angle and turn with it */
+/* Lighting is computed in screen space, so the highlights stay roughly in place while the record turns.
+   The groove texture, the dust and a slight warp of the surface use the record's own angle and turn with it */
 const char VINYL_HLSL[] = R"(
 cbuffer Params : register(b0) {
     float2 center;   // pixels
@@ -52,15 +52,11 @@ float Noise(float x, uint layer) {
     return lerp(Rand((uint)i, layer), Rand((uint)i + 1u, layer), f * f * (3.0 - 2.0 * f));
 }
 
-// Smooth value noise around the ring: u in [0, 1) wraps over `cells` cells, y >= 0 runs outward
-float RingNoise(float u, float y, uint cells, uint layer) {
-    float2 g = float2(u * cells, y);
-    float2 i = floor(g), f = g - i;
-    f = f * f * (3.0 - 2.0 * f);
-    uint x0 = (uint)i.x % cells, x1 = (x0 + 1u) % cells, row = (uint)i.y * cells;
-    float a = lerp(Rand(row + x0, layer), Rand(row + x1, layer), f.x);
-    float b = lerp(Rand(row + cells + x0, layer), Rand(row + cells + x1, layer), f.x);
-    return lerp(a, b, f.y);
+// Smooth value noise along groove line `ring`: u in [0, 1) goes once around and wraps over `cells` cells
+float Around(float u, uint ring, uint cells, uint layer) {
+    float x = u * cells, i = floor(x), f = x - i;
+    uint x0 = (uint)i % cells, x1 = (x0 + 1u) % cells;
+    return lerp(Rand(ring * cells + x0, layer), Rand(ring * cells + x1, layer), f * f * (3.0 - 2.0 * f));
 }
 
 // Share of the pixel footprint [x - w / 2, x + w / 2] inside [a, b]
@@ -92,30 +88,34 @@ float4 main(float4 pos : SV_POSITION, float4 scene : SCENE_POSITION) : SV_Target
     float tracks = 4.0 + (Hash(seed) & 3u);
     float t = (s - 0.17) / 0.76 * tracks;
     float k = round(t);
-    float edge = k + (Rand((uint)k, 1u) - 0.5) * 0.6;
+    // Edges between two tracks are shifted a little and leave a gap; the music starts and ends at fixed radii
+    bool between = k >= 1.0 && k < tracks;
+    float edge = k + (between ? (Rand((uint)k, 1u) - 0.5) * 0.6 : 0.0);
     float edgeS = 0.17 + edge / tracks * 0.76;
-    float gap = (k >= 1.0 && k < tracks) ? Cover(s, edgeS - 0.006, edgeS + 0.006, ps) : 0.0;
+    float gap = between ? Cover(s, edgeS - 0.006, edgeS + 0.006, ps) : 0.0;
     float grooves = Cover(s, 0.17, 0.93, ps) * (1.0 - gap)
                   + 0.4 * Cover(s, 0.93, 0.955, ps)
                   + 0.5 * (Cover(s, 0.105, 0.112, ps) + Cover(s, 0.135, 0.142, ps));
     float track = t < edge ? k - 1.0 : k;
-    float level = (0.75 + 0.5 * Rand((uint)(track + 1.0), 2u)) * (0.6 + 0.8 * Noise(s * 50.0, 3u));
-    float fine = lerp(1.0, 0.6 + 0.8 * Noise(s * 120.0, 4u), saturate(width / 120.0 - 1.0));
+    float level = (0.75 + 0.5 * Rand((uint)(track + 1.0), 2u)) * (0.7 + 0.6 * Noise(s * 12.0, 3u));
 
-    // Texture that turns with the record, faded out where its cells get smaller than a pixel
+    // Groove lines, each with its own brightness that also varies along it, so it turns with the record.
+    // A cosine across each line keeps the rings free of moire; it fades out as the lines near two pixels apart
     float2 q = float2(dot(p, spin), p.y * spin.x - p.x * spin.y);
     float u = frac(atan2(q.y, q.x) / TAU + 1.0);
-    float swirl = lerp(0.5, RingNoise(u, s * 70.0, 32u, 5u), saturate(width / 70.0 - 1.0));
+    float phase = s * 50.0, ring = floor(phase), period = width / 50.0;
+    float strand = (0.3 + 0.7 * Rand((uint)ring, 5u)) * (0.3 + 1.4 * Around(u, (uint)ring, 40u, 6u));
+    float crest = 0.5 - 0.5 * cos(TAU * phase);
+    float ridges = lerp(1.0, 0.45 + 1.7 * crest * strand, saturate(period - 2.0));
 
-    // Dust: rings of roughly square cells, one speck in about 256 of them
-    float row = s * 50.0, j = floor(row);
-    float cols = floor(TAU * (label / (1.0 - label) * 50.0 + j + 0.5));
+    // Dust: each groove line is split into roughly square cells, one speck in about 256 of them
+    float cols = floor(TAU * (label / (1.0 - label) * 50.0 + ring + 0.5));
     float col = u * cols, i = floor(col);
-    uint h = Cell((uint)(j * 4096.0 + i), 9u);
+    uint h = Cell((uint)(ring * 4096.0 + i), 9u);
     float2 at = float2(h & 255u, (h >> 8) & 255u) / 255.0 * 0.6 + 0.2;
     float size = 0.4 + (h >> 24) / 255.0 * 0.6;
     float dust = ((h >> 16) & 255u) == 0u
-               ? saturate(size + 0.5 - length((float2(col - i, row - j) - at) * width / 50.0)) * saturate(width / 50.0 - 1.5)
+               ? saturate(size + 0.5 - length((float2(col - i, phase - ring) - at) * period)) * saturate(period - 1.5)
                : 0.0;
 
     float3 P = float3(p / radius, 0.0);
@@ -124,22 +124,37 @@ float4 main(float4 pos : SV_POSITION, float4 scene : SCENE_POSITION) : SV_Target
     float3 hf = normalize(normalize(lf) + float3(0.0, 0.0, 1.0));
     float fk = dot(KEY, KEY) / dot(lk, lk), ff = dot(FILL, FILL) / dot(lf, lf);
 
-    // Grooves reflect a light where the half vector lies across them, which draws a streak through the center
+    // The record is not quite flat: its height rises and falls a few times around the circle, so as it turns
+    // the surface under the lights tilts slightly, and the streaks waver and grow brighter and dimmer
+    float2 e1 = q / d, e2 = float2(e1.x * e1.x - e1.y * e1.y, 2.0 * e1.x * e1.y);
+    float2 e3 = float2(e2.x * e1.x - e2.y * e1.y, e2.x * e1.y + e2.y * e1.x);
+    float2 e4 = float2(e2.x * e2.x - e2.y * e2.y, 2.0 * e2.x * e2.y);
+    float4 cosK = float4(e1.x, e2.x, e3.x, e4.x), sinK = float4(e1.y, e2.y, e3.y, e4.y);
+    float4 amp = float4(0.012, 0.012, 0.008, 0.005);
+    float4 wa = (float4(Rand(0u, 10u), Rand(1u, 10u), Rand(2u, 10u), Rand(3u, 10u)) - 0.5) * amp;
+    float4 wb = (float4(Rand(4u, 10u), Rand(5u, 10u), Rand(6u, 10u), Rand(7u, 10u)) - 0.5) * amp;
+    float r = d / radius;
+    float rise = 2.0 * r * (dot(wa, cosK) + dot(wb, sinK));                         // slope outward
+    float lean = r * dot(float4(1.0, 2.0, 3.0, 4.0), wb * cosK - wa * sinK);          // slope along the grooves
+
+    // Grooves reflect a light where the half vector lies across them, which draws a streak through the center.
+    // The lobes are as wide as those of large lights, so the streaks fade out softly on both sides
     float2 T = float2(-n.y, n.x);
-    float ak = dot(hk.xy, T), af = dot(hf.xy, T);
-    float sheen = fk * (exp(-700.0 * ak * ak) + 0.1 * exp(-50.0 * ak * ak))
-                + ff * (0.3 * exp(-300.0 * af * af) + 0.035 * exp(-35.0 * af * af));
+    float ak = dot(hk.xy, T) + hk.z * lean, af = dot(hf.xy, T) + hf.z * lean;
+    float sheen = (1.0 + 8.0 * rise)
+                * (fk * (0.45 * exp(-250.0 * ak * ak) + 0.05 * exp(-50.0 * ak * ak))
+                 + ff * (0.15 * exp(-150.0 * af * af) + 0.02 * exp(-35.0 * af * af)));
 
     // Smooth surfaces tilt outward at the raised ring beside the label and at the rounded rim
     float bead = saturate((s - 0.04) / 0.04), rim = saturate((s - 0.955) / 0.045);
-    float tilt = 0.3 * sin(TAU * bead) + 1.4 * rim * rim;
+    float tilt = 0.3 * sin(TAU * bead) + 1.4 * rim * rim - rise;
     float spread = ((bead > 0.0 && bead < 1.0 ? 47.0 * abs(cos(TAU * bead)) : 0.0) + 62.0 * rim) * ps;
     // On small records the ring and the rim are a few pixels wide, too narrow to show a highlight
     float gloss = saturate(0.02 * width - 1.0)
-                * (fk * Glint(hk, n, ak, tilt, spread) + 0.4 * ff * Glint(hf, n, af, tilt, spread));
+                * (0.6 * fk * Glint(hk, n, ak, tilt, spread) + 0.2 * ff * Glint(hf, n, af, tilt, spread));
 
-    float3 c = base * (1.0 + 0.3 * grooves * swirl)
-             + LIGHT * (grooves * level * fine * (0.55 + 0.9 * swirl) * sheen + gloss + dust * (0.02 + 0.5 * sheen));
+    float3 c = base * (1.0 + 0.3 * grooves * ridges)
+             + LIGHT * (grooves * level * ridges * sheen + gloss + dust * (0.02 + 0.5 * sheen));
     c = saturate(1.0 - exp(-c));
     float dither = (Rand((uint)pos.x + ((uint)pos.y << 16), 8u) - 0.5) / 255.0;
     return float4((pow(c, 1.0 / 2.2) + dither) * alpha, alpha);
@@ -170,8 +185,7 @@ struct Params {
 };
 
 std::future<std::string> g_compiling;   // pixel shader being compiled on a worker thread
-std::string    g_code;                  // compiled pixel shader, empty when the effect is unavailable
-ID2D1Factory*  g_factory = nullptr;
+std::string    g_code;                  // compiled pixel shader, empty when compiling failed
 ID2D1Effect*   g_fx = nullptr;
 
 class VinylEffect final : public ID2D1EffectImpl, public ID2D1DrawTransform {
@@ -266,45 +280,36 @@ std::string Compile() {
                                      "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
         bytecode.assign(static_cast<const char*>(code->GetBufferPointer()), code->GetBufferSize());
         code->Release();
-    } else if (errors) {
-        Logf("ERR", "唱片着色器编译失败：%s", static_cast<const char*>(errors->GetBufferPointer()));
+    } else {
+        Logf("ERR", "唱片着色器编译失败：%s",
+             errors ? static_cast<const char*>(errors->GetBufferPointer()) : "无法加载 d3dcompiler_47.dll");
     }
     if (errors) errors->Release();
     if (dll) FreeLibrary(dll);
     return bytecode;
 }
 
-/* Registers the effect when first needed, waiting for the compiler if it has not finished yet */
-bool Ready() {
-    if (g_compiling.valid()) {
-        g_code = g_compiling.get();
-        ID2D1Factory1* factory1 = nullptr;
-        HRESULT hr = E_FAIL;
-        if (!g_code.empty() && SUCCEEDED(g_factory->QueryInterface(IID_PPV_ARGS(&factory1)))) {
-            const D2D1_PROPERTY_BINDING bindings[] = {
-                { L"Params", VinylEffect::SetParams, VinylEffect::GetParams },
-            };
-            hr = factory1->RegisterEffectFromString(CLSID_Vinyl, VINYL_XML, bindings, 1, VinylEffect::Create);
-            factory1->Release();
-        }
-        if (FAILED(hr)) {
-            g_code.clear();
-            Logf("ERR", "唱片效果不可用（着色器编译或效果注册失败）");
-        }
-    }
-    return !g_code.empty();
-}
-
 }  // namespace
 
 void VinylInit(ID2D1Factory* factory) {
-    g_factory = factory;
     g_compiling = std::async(std::launch::async, Compile);
+
+    ID2D1Factory1* factory1 = nullptr;
+    HRESULT hr = factory->QueryInterface(IID_PPV_ARGS(&factory1));
+    if (SUCCEEDED(hr)) {
+        const D2D1_PROPERTY_BINDING bindings[] = {
+            { L"Params", VinylEffect::SetParams, VinylEffect::GetParams },
+        };
+        hr = factory1->RegisterEffectFromString(CLSID_Vinyl, VINYL_XML, bindings, 1, VinylEffect::Create);
+        factory1->Release();
+    }
+    if (FAILED(hr)) Logf("ERR", "唱片效果注册失败");
 }
 
 bool VinylDraw(ID2D1RenderTarget* rt, float cx, float cy, float radius, float label,
                float angleDeg, unsigned seed, UINT32 color, float opacity) {
-    if (!Ready()) return false;
+    if (g_compiling.valid()) g_code = g_compiling.get();   // the first draw waits for the compiler if needed
+    if (g_code.empty()) return false;
     ID2D1DeviceContext* dc = nullptr;
     if (FAILED(rt->QueryInterface(IID_PPV_ARGS(&dc)))) return false;
     if (!g_fx) dc->CreateEffect(CLSID_Vinyl, &g_fx);

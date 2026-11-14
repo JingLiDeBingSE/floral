@@ -3123,14 +3123,15 @@ static void DrawMorphDisc(const D2D1_RECT_F& r, const Song& s, int idx, float di
     const float cy = (r.top + r.bottom) * 0.5f;
     const float R  = st * 0.5f;
 
-    const float vr = R * e;                                     // vinyl radius: 0 → R
-    if (vr > 0.5f) DrawVinyl(cx, cy, vr, 0.0f, idx, 1.0f);
-
     // Cover: starts as the tile's own rectangle, ends as the disc's label
     const float artSide = R * 2.0f * LABEL;
     const float cw = w0 + (artSide - w0) * e;
     const float ch = h0 + (artSide - h0) * e;
     const float radius = UI::R_TILE + (artSide * 0.5f - UI::R_TILE) * e;
+
+    // The vinyl grows from 0 to R and is skipped while the opaque cover still hides all of it
+    const float vr = R * e;
+    if (vr + 1.0f > 0.5f * (std::min)(cw, ch)) DrawVinyl(cx, cy, vr, 0.0f, idx, 1.0f);
     DrawCoverArt(Rc(cx - cw * 0.5f, cy - ch * 0.5f, cw, ch), s, idx, radius);
 
     // While still close to a tile, the song info fades out with it
