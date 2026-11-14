@@ -1456,6 +1456,7 @@ static void ClearCache() {
     for (auto& entry : g_coverSrcs) if (entry.second) entry.second->Release();
     g_coverSrcs.clear();
     g_decRequested.clear();
+    g_plCovAsked.clear();
     for (auto& s : g_app.songs) s.cover.clear();
     std::fill(g_covFlag.begin(), g_covFlag.end(), 0);
 
@@ -4968,6 +4969,7 @@ static void PushLocalState(bool force) {
                       posMs, a.playing,
                       Narrow(s.title), Narrow(s.artist));
 }
+static void RefreshPlaylistsAsync();
 static bool Animate() {
 #ifndef FLORAL_NO_TOGETHER
     // ── Listen Together: consume events, push state ──
@@ -5086,6 +5088,7 @@ static bool Animate() {
             g_layoutWidth = -1;
             SettingsToast(changed ? T(L"已切换账号，正在拉取歌单…", L"Account switched, fetching playlist…") : T(L"登录成功，正在拉取歌单…", L"Signed in, fetching playlist…"));
             StartExport(tgUid, tgTok);
+            RefreshPlaylistsAsync();
             CheckLoginAsync();                    // Fetch nickname
             need = true;
         } else if (g_loginRunning && lgState == 4) {
