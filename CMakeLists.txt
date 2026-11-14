@@ -65,6 +65,7 @@ if(FLORAL_EMBED_SERVICES)
         file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gen_app.rc"
 "#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h\"
 
+IDI_APP         ICON    \"${CMAKE_CURRENT_SOURCE_DIR}/src/app.ico\"
 IDR_KUGOU_API   RCDATA  \"${KUGOU_EXE}\"
 IDR_SIDECARS    RCDATA  \"${SIDECARS_ZIP}\"
 ")

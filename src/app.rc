@@ -3,6 +3,8 @@
 /* DPI awareness manifest (per-monitor v2). Numeric id/type so no windows.h needed. */
 1 24 "app.manifest"
 
+IDI_APP         ICON    "app.ico"
+
 /* 只内嵌「程序」，不内嵌任何歌单数据 / 登录状态 */
 
 /* 酷狗接口服务（pkg 打好的单文件 exe） */

@@ -5774,105 +5774,6 @@ static void GfxRelease() {
 
 static NOTIFYICONDATAW g_nid{};
 static bool   g_trayAdded = false;
-static HICON  g_trayIcon  = nullptr;
-
-/* Draw our own 32×32 icon: rounded square + white F (same as the splash page) */
-static HICON MakeTrayIcon(UINT32 bg, UINT32 fg) {
-    const int S = 32;
-    BITMAPV5HEADER bi{};
-    bi.bV5Size        = sizeof(bi);
-    bi.bV5Width       = S;
-    bi.bV5Height      = -S;
-    bi.bV5Planes      = 1;
-    bi.bV5BitCount    = 32;
-    bi.bV5Compression = BI_BITFIELDS;
-    bi.bV5RedMask     = 0x00FF0000;
-    bi.bV5GreenMask   = 0x0000FF00;
-    bi.bV5BlueMask    = 0x000000FF;
-    bi.bV5AlphaMask   = 0xFF000000;
-
-    void* bits = nullptr;
-    HDC hdc = CreateCompatibleDC(nullptr);
-    if (!hdc) return nullptr;
-    HBITMAP dib = CreateDIBSection(hdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dib || !bits) { DeleteDC(hdc); return nullptr; }
-
-    const float br = (bg >> 16) & 0xFF, bgc = (bg >> 8) & 0xFF, bb = bg & 0xFF;
-    const float fr = (fg >> 16) & 0xFF, fgc = (fg >> 8) & 0xFF, fb = fg & 0xFF;
-    BYTE* px = (BYTE*)bits;
-
-    // Extent of the rounded square
-    const float x0 = 2.0f, y0 = 2.0f, x1 = (float)S - 2.0f, y1 = (float)S - 2.0f, rad = 8.0f;
-    const float fx0 = 10.0f, fy0 = 8.0f, fx1 = 22.0f, fy1 = 24.0f;   // bounding box of the F
-    const float stemW = 4.0f, barH = 3.6f;
-
-    auto inRoundRect = [&](float x, float y) {
-        float cx = (x < x0 + rad) ? x0 + rad : ((x > x1 - rad) ? x1 - rad : x);
-        float cy = (y < y0 + rad) ? y0 + rad : ((y > y1 - rad) ? y1 - rad : y);
-        float dx = x - cx, dy = y - cy;
-        if (x < x0 || x > x1 || y < y0 || y > y1) return false;
-        return (dx * dx + dy * dy) <= rad * rad || (cx > x0 + rad - 0.01f && cx < x1 - rad + 0.01f) ||
-               (cy > y0 + rad - 0.01f && cy < y1 - rad + 0.01f);
-    };
-    auto inF = [&](float x, float y) {
-        if (x >= fx0 && x < fx0 + stemW && y >= fy0 && y < fy1) return true;                  // vertical stem
-        if (x >= fx0 && x < fx1 && y >= fy0 && y < fy0 + barH) return true;                   // top bar
-        if (x >= fx0 && x < fx1 - 3.0f && y >= fy0 + 6.4f && y < fy0 + 6.4f + barH) return true; // middle bar
-        return false;
-    };
-
-    for (int y = 0; y < S; y++) {
-        for (int x = 0; x < S; x++) {
-            int coverBg = 0, coverFg = 0;
-            const int SS = 4;
-            for (int sy = 0; sy < SS; sy++) {
-                for (int sx = 0; sx < SS; sx++) {
-                    float px1 = (float)x + (sx + 0.5f) / SS;
-                    float py1 = (float)y + (sy + 0.5f) / SS;
-                    if (inRoundRect(px1, py1)) { coverBg++; if (inF(px1, py1)) coverFg++; }
-                }
-            }
-            float cb = coverBg / (float)(SS * SS);
-            float cf = coverFg / (float)(SS * SS);
-            if (cb <= 0.0f) continue;
-
-            float r = br, g = bgc, b = bb;
-            if (cf > 0.0f) {                       // glyph covers the background colour
-                float k = cf / cb;
-                if (k > 1.0f) k = 1.0f;
-                r = br + (fr - br) * k;
-                g = bgc + (fgc - bgc) * k;
-                b = bb + (fb - bb) * k;
-            }
-            BYTE* p = px + ((size_t)y * S + x) * 4;
-            p[0] = (BYTE)(b + 0.5f);
-            p[1] = (BYTE)(g + 0.5f);
-            p[2] = (BYTE)(r + 0.5f);
-            p[3] = (BYTE)(cb * 255.0f + 0.5f);
-        }
-    }
-
-    HBITMAP mask = CreateBitmap(S, S, 1, 1, nullptr);
-    ICONINFO ii{};
-    ii.fIcon    = TRUE;
-    ii.hbmColor = dib;
-    ii.hbmMask  = mask;
-    HICON icon = CreateIconIndirect(&ii);
-    DeleteObject(dib);
-    DeleteObject(mask);
-    DeleteDC(hdc);
-    return icon;
-}
-
-static void UpdateTrayIcon() {
-    if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = nullptr; }
-    g_trayIcon = MakeTrayIcon(UI::BTN_CLOSE, 0xFFFFFF);
-    if (g_trayAdded) {
-        g_nid.hIcon = g_trayIcon;
-        g_nid.uFlags = NIF_ICON;
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    }
-}
 
 static void AddTrayIcon(HWND hwnd) {
     if (g_trayAdded) return;
@@ -5882,8 +5783,8 @@ static void AddTrayIcon(HWND hwnd) {
     g_nid.uID              = 1;
     g_nid.uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    if (!g_trayIcon) g_trayIcon = MakeTrayIcon(UI::BTN_CLOSE, 0xFFFFFF);
-    g_nid.hIcon = g_trayIcon;
+    g_nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     wcscpy_s(g_nid.szTip, L"Floral");
     BOOL ok = Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_trayAdded = (ok != FALSE);
@@ -6328,7 +6229,6 @@ static void OnClick(POINT p) {
     case HK_SET_THEME: {
         ThemeNext();
         if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);   // colours changed, repaint immediately
-        UpdateTrayIcon();
         std::wstring msg = std::wstring(T(L"主题已切换：", L"Theme: ")) + ThemeName(ThemeCurrent());
         SettingsToast(msg.c_str());
         break;
@@ -6564,11 +6464,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_ERASEBKGND:
-        return 1;
+        if (g_hwndRt) return 1;   // Direct2D draws every pixel once its render target exists
+        break;
 
     case WM_NCCALCSIZE:
-        if (wp) return 0;
-        break;
+        return 0;   // the whole window is client area, also at creation when wParam is FALSE
+
+    case WM_NCACTIVATE:
+        // lParam -1 stops DefWindowProc from painting the classic border over the edges of the client area
+        return DefWindowProc(hwnd, msg, wp, -1);
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)lp;
@@ -7030,8 +6934,10 @@ static bool RenderToPng(const std::wstring& out) {
 static std::wstring WindowFile() { return LocalDir() + L"\\window.txt"; }
 
 static void SaveWindowRect(HWND hwnd) {
-    RECT r{};
-    if (!GetWindowRect(hwnd, &r)) return;
+    // rcNormalPosition is the restored rect, also while the window is minimized or maximized
+    WINDOWPLACEMENT wpl = { sizeof(wpl) };
+    if (!GetWindowPlacement(hwnd, &wpl)) return;
+    const RECT& r = wpl.rcNormalPosition;
     FILE* f = nullptr;
     _wfopen_s(&f, WindowFile().c_str(), L"wb");
     if (!f) return;
@@ -7350,7 +7256,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
+    wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    // Fills the window until Direct2D draws the first frame; without it the window shows white
+    wc.hbrBackground = CreateSolidBrush(RGB((UI::BG >> 16) & 0xFF, (UI::BG >> 8) & 0xFF, UI::BG & 0xFF));
     wc.lpszClassName = L"SongListWnd";
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     RegisterClassExW(&wc);
@@ -7378,7 +7287,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     {
         int wx, wy, ww, wh;
         if (LoadWindowRect(wx, wy, ww, wh)) {
-            SetWindowPos(hwnd, nullptr, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+            // The saved rect is in workspace coordinates, which SetWindowPlacement expects and SetWindowPos does not.
+            // SW_HIDE keeps the window hidden until ShowWindow below
+            WINDOWPLACEMENT wpl = { sizeof(wpl) };
+            wpl.showCmd = SW_HIDE;
+            wpl.rcNormalPosition = { wx, wy, wx + ww, wy + wh };
+            SetWindowPlacement(hwnd, &wpl);
             Logf("APP", "恢复窗口位置 %d,%d %dx%d", wx, wy, ww, wh);
         }
     }
