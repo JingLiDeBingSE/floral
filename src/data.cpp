@@ -108,3 +108,23 @@ std::vector<Song> ReadSongs(const std::wstring& name, int source) {
     }
     return songs;
 }
+
+bool WriteSongs(const std::wstring& path, const std::vector<Song>& songs) {
+    std::string out = "title\tartist\talbum\tseconds\tcover\thash\tmixsongid\talbum_id\tcoverUrl\n";
+    for (const Song& s : songs)
+        out += Narrow(s.title) + "\t" + Narrow(s.artist) + "\t" + Narrow(s.album) + "\t" +
+               std::to_string(s.durationSec) + "\t\t" + s.hash + "\t" + std::to_string(s.mixId) + "\t" +
+               std::to_string(s.albumId) + "\t" + s.coverUrl + "\n";
+
+    // A reader sees either the old file or the complete new one
+    const std::wstring part = path + L".part";
+    FILE* f = nullptr;
+    _wfopen_s(&f, part.c_str(), L"wb");
+    if (!f) return false;
+    const bool written = fwrite(out.data(), 1, out.size(), f) == out.size();
+    if (fclose(f) != 0 || !written || !MoveFileExW(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(part.c_str());
+        return false;
+    }
+    return true;
+}

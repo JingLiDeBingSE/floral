@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 
+#include "song.h"
+
 /*
  * Kugou API client (no Node dependency):
  *   QR-code login + fetch the "Liked" playlist
@@ -59,3 +61,31 @@ int KgExportPlaylist(const std::string& token, const std::string& userid, const 
 /** Fetch the "Liked" songs and write a tsv; returns the number of songs written (-1 on failure) */
 int  KgExportLikes(const std::string& token, const std::string& userid,
                    const std::wstring& outTsv, std::wstring& err);
+
+/** Add the song to the account's "Liked" playlist, or remove it from there */
+bool KgSetLiked(const std::string& token, const std::string& userid, const Song& song, bool liked,
+                std::wstring& err);
+
+/* ── Recommendations ── */
+struct KgDaily {
+    int date = 0;                // the day the list was made, as yyyymmdd
+    std::string coverUrl;
+    std::vector<Song> songs;
+};
+
+/** Fetch today's recommended songs */
+bool KgFetchDaily(const std::string& token, const std::string& userid, KgDaily& out, std::wstring& err);
+
+/* A Guess You Like request: it reports on a track, and returns more songs while few are left to play */
+struct KgFmCall {
+    std::string action = "play";  // play, login (first songs), garbage (dislike), click_red / cancel_red (like / unlike)
+    Song song;                    // the track reported on; no hash when the request only asks for songs
+    int  playSec = 0;             // how long that track played
+    bool ended = false;           // it played to its end
+    int  remain = 0;              // tracks after the current one; songs come back only when this is at most 4
+    std::string mark;             // cur_mark of the previous response
+};
+
+/** Send a Guess You Like request; songs receives what it recommends, mark the cur_mark for the next request */
+bool KgFmRequest(const std::string& token, const std::string& userid, const KgFmCall& call,
+                 std::vector<Song>& songs, std::string& mark, std::wstring& err);

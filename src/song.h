@@ -14,5 +14,6 @@ struct Song {
     std::string  hash;      // Song id on its platform: Kugou hash, NetEase id or QQ mid
     long long    mixId = 0; // mixsongid; use as album_audio_id when resolving stream URL
     long long    albumId = 0;
+    long long    songId = 0;    // Kugou songid, which Guess You Like reports carry; 0 when unknown
     int          source = -1;   // SRC_* of the platform the id belongs to, set when the list is loaded
 };
