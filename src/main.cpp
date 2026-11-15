@@ -31,6 +31,7 @@
 #include <climits>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -795,6 +796,7 @@ static int HitTile(POINT p) {
    So decoding runs on worker threads and the main thread only wraps the result into a D2D bitmap.
    ─────────────────────────────── */
 static std::mutex  g_decMutex;
+static std::condition_variable g_decCv;
 static std::deque<std::wstring> g_decQueue;
 static std::vector<std::pair<std::wstring, IWICBitmapSource*>> g_decDone;
 static std::vector<std::thread> g_decThreads;
@@ -848,18 +850,14 @@ static void DecodeWorkerMain() {
     IWICImagingFactory* wic = nullptr;
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
 
-    while (g_decRun.load()) {
+    for (;;) {
         std::wstring path;
         {
-            std::lock_guard<std::mutex> lk(g_decMutex);
-            if (!g_decQueue.empty()) {
-                path = std::move(g_decQueue.front());
-                g_decQueue.pop_front();
-            }
-        }
-        if (path.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
+            std::unique_lock<std::mutex> lk(g_decMutex);
+            g_decCv.wait(lk, [] { return !g_decRun || !g_decQueue.empty(); });
+            if (!g_decRun) break;
+            path = std::move(g_decQueue.front());
+            g_decQueue.pop_front();
         }
         IWICBitmapSource* bmp = wic ? DecodeScaled(wic, path, 320) : nullptr;
         {
@@ -877,17 +875,21 @@ static void QueueDecode(const std::wstring& path) {
     if (path.empty()) return;
     if (g_decRequested.count(path)) return;
     g_decRequested.insert(path);
-    std::lock_guard<std::mutex> lk(g_decMutex);
-    g_decQueue.push_back(path);
+    {
+        std::lock_guard<std::mutex> lk(g_decMutex);
+        g_decQueue.push_back(path);
+    }
+    g_decCv.notify_one();
 }
 
-/* ── On-demand cover download: songs whose cover is not local are fetched when they are about to be shown ── */
+/* ── On-demand cover download: covers missing on disk are fetched when they are about to be shown ── */
 static std::string  HttpGet(const std::wstring& url);
 
 /* The queue carries copies of url/hash; worker threads never touch g_app (avoids racing cache clears/reloads) */
 struct CovJob {
     std::string url;
-    std::string hash;
+    std::wstring path;      // where the image is saved
+    std::string hash;       // the song's hash; empty for a playlist cover
 };
 
 extern std::string g_token, g_userid;   // defined below
@@ -898,7 +900,8 @@ static std::vector<Playlist> g_plPending;
 static std::atomic<bool>   g_plReady{ false };
 
 static std::mutex        g_covMx;
-static std::vector<CovJob> g_covQueue;
+static std::condition_variable g_covCv;
+static std::vector<CovJob> g_covQueue;   // taken from the back, so the latest batch is fetched first
 static std::vector<CovJob> g_covDone;
 static std::unordered_set<std::string> g_covAsked;   // hashes queued since the grid list was replaced; UI thread only
 
@@ -979,26 +982,35 @@ static void CoverWorkerMain() {
     for (;;) {
         CovJob job;
         {
-            std::lock_guard<std::mutex> lk(g_covMx);
-            if (!g_covQueue.empty()) { job = g_covQueue.back(); g_covQueue.pop_back(); }
+            std::unique_lock<std::mutex> lk(g_covMx);
+            g_covCv.wait(lk, [] { return !g_covQueue.empty(); });
+            job = std::move(g_covQueue.back());
+            g_covQueue.pop_back();
         }
-        if (job.hash.empty()) { Sleep(50); continue; }
 
         std::string bytes = HttpGet(Widen(job.url));
         if (bytes.size() > 1000) {
-            std::wstring dir = AssetDir() + L"\\covers";
-            CreateDirectoryW(dir.c_str(), nullptr);
-            std::wstring path = dir + L"\\" + std::wstring(job.hash.begin(), job.hash.end()) + L".jpg";
+            CreateDirectoryW((AssetDir() + L"\\covers").c_str(), nullptr);
             FILE* f = nullptr;
-            _wfopen_s(&f, path.c_str(), L"wb");
+            _wfopen_s(&f, job.path.c_str(), L"wb");
             if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
         }
         {
             std::lock_guard<std::mutex> lk(g_covMx);
-            g_covDone.push_back(job);
+            g_covDone.push_back(std::move(job));
         }
         g_coverDirty = true;            // download finished, ask the UI to pick it up
     }
+}
+
+/* Queues a batch of downloads in one step, so that its first job is fetched first */
+static void QueueCoverDownloads(const std::vector<CovJob>& jobs) {
+    if (jobs.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_covMx);
+        g_covQueue.insert(g_covQueue.end(), jobs.rbegin(), jobs.rend());
+    }
+    g_covCv.notify_all();
 }
 
 /* ══════════════════════════════════════════
@@ -1089,39 +1101,20 @@ static std::wstring PlCoverPath(const Playlist& pl) {
 }
 
 static std::set<std::string> g_plCovAsked;
-static std::atomic<int>      g_plCovBusy{ 0 };
 
+/* Queues a download of the playlist's cover when the file is missing; the picker decodes the file when it draws it */
 static void RequestPlaylistCover(int i) {
     if (i < 0 || i >= (int)g_app.playlists.size()) return;
     const Playlist& pl = g_app.playlists[i];
-    if (pl.coverUrl.empty() || g_plCovAsked.count(pl.gcid)) return;
+    if (pl.coverUrl.empty() || !g_plCovAsked.insert(pl.gcid).second) return;
 
     std::wstring path = PlCoverPath(pl);
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        g_plCovAsked.insert(pl.gcid);
-        QueueDecode(path);
-        return;
-    }
-    if (g_plCovBusy.load() >= 4) return;      // at most 4 at a time
-
-    g_plCovAsked.insert(pl.gcid);
-    g_plCovBusy.fetch_add(1);
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
     std::string url = pl.coverUrl;
     // the URL from the API has a {size} placeholder; substitute the actual size
     size_t szp = url.find("{size}");
     if (szp != std::string::npos) url.replace(szp, 6, "400");
-    std::thread([url, path]() {
-        std::string bytes = HttpGet(Widen(url));
-        if (bytes.size() > 500) {
-            CreateDirectoryW((AssetDir() + L"\\covers").c_str(), nullptr);
-            FILE* f = nullptr;
-            _wfopen_s(&f, path.c_str(), L"wb");
-            if (f) { fwrite(bytes.data(), 1, bytes.size(), f); fclose(f); }
-            QueueDecode(path);
-        }
-        g_plCovBusy.fetch_sub(1);
-        g_coverDirty = true;
-    }).detach();
+    QueueCoverDownloads({ { url, path, "" } });
 }
 /* Worker thread: fetch all playlists from the API and write them to disk */
 static void FetchPlaylistsAsync(const std::string& token, const std::string& userid) {
@@ -1158,9 +1151,10 @@ static void DrainCovers() {
 
     std::unordered_map<std::string, std::wstring> files;   // hash -> downloaded cover
     for (const CovJob& job : done) {
-        std::wstring path = AssetDir() + L"\\covers\\" +
-            std::wstring(job.hash.begin(), job.hash.end()) + L".jpg";
-        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) files.emplace(job.hash, path);
+        if (GetFileAttributesW(job.path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        // The picker may have asked to decode a playlist cover before it was downloaded; clearing that request lets it decode now
+        if (job.hash.empty()) g_decRequested.erase(job.path);
+        else files.emplace(job.hash, job.path);
     }
     if (files.empty()) return;
 
@@ -1177,17 +1171,19 @@ static void DrainCovers() {
     g_coverDirty = true;                // a new cover entered the decode queue
 }
 
-/** Queue a download for a song without a cover (g_app is read only here; workers get copies) */
-static void RequestCover(const Song& s) {
+/** Add a download to the batch for a song without a cover (g_app is read only here; workers get copies) */
+static void RequestCover(const Song& s, std::vector<CovJob>& jobs) {
     if (!s.cover.empty() || s.coverUrl.empty() || s.hash.empty()) return;
     if (!g_covAsked.insert(s.hash).second) return;
-    std::lock_guard<std::mutex> lk(g_covMx);
-    g_covQueue.push_back({ s.coverUrl, s.hash });
+    jobs.push_back({ s.coverUrl, AssetDir() + L"\\covers\\" + std::wstring(s.hash.begin(), s.hash.end()) + L".jpg",
+                     s.hash });
 }
 
 static void RequestVisibleCovers() {
+    std::vector<CovJob> jobs;
     for (int i : g_vis)
-        if (i >= 0 && i < (int)g_app.songs.size()) RequestCover(g_app.songs[(size_t)i]);
+        if (i >= 0 && i < (int)g_app.songs.size()) RequestCover(g_app.songs[(size_t)i], jobs);
+    QueueCoverDownloads(jobs);
 }
 
 static void StartDecoder() {
@@ -1203,7 +1199,11 @@ static void StartDecoder() {
 }
 
 static void StopDecoder() {
-    g_decRun.store(false);
+    {
+        std::lock_guard<std::mutex> lk(g_decMutex);
+        g_decRun = false;
+    }
+    g_decCv.notify_all();
     for (auto& th : g_decThreads) if (th.joinable()) th.join();
     g_decThreads.clear();
     std::lock_guard<std::mutex> lk(g_decMutex);
@@ -1221,9 +1221,10 @@ static void DrainDecoded() {
         tmp.swap(g_decDone);
     }
     for (auto& p : tmp) {
+        if (!p.second) continue;        // not cached, so a file that is downloaded later can still be decoded
         // a decode queued before the cache was cleared can arrive after the first one, even after its upload
         const bool have = g_coverBmps.count(p.first) || !g_coverSrcs.try_emplace(p.first, p.second).second;
-        if (have && p.second) p.second->Release();
+        if (have) p.second->Release();
     }
     g_mouseDirty = true;              // a new cover is available, trigger a redraw
 }
@@ -3908,7 +3909,9 @@ static void DrawPlayerPage() {
 
     int prevIdx = (a.current - 1 + n) % n;
     int nextIdx = (a.current + 1) % n;
-    for (int i : { prevIdx, a.current, nextIdx }) RequestCover(a.queue[(size_t)i]);
+    std::vector<CovJob> jobs;
+    for (int i : { a.current, nextIdx, prevIdx }) RequestCover(a.queue[(size_t)i], jobs);
+    QueueCoverDownloads(jobs);
 
     D2D1_RECT_F discRect = Rc(cx - dd * 0.5f, cy - dd * 0.5f, dd, dd);
 
@@ -5423,7 +5426,8 @@ static bool Animate() {
     } else if (!g_introDone) {
         g_introT += dt;
         need = true;
-        // Don't pre-decode song covers during the splash: the picker only shows playlist covers; song covers wait until inside
+        // The picker comes next, so its missing covers download during the splash; song covers wait until a playlist opens
+        for (int i = 0; i < (int)g_app.playlists.size(); i++) RequestPlaylistCover(i);
         // End the splash when the logo finishes fading and go straight to the picker (no waiting for covers, no flying cards)
         if (g_introT > SPLASH_OUT + 0.05f) {
             g_introDone = true;
@@ -6956,6 +6960,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     // The first screen waits for the playlist list only when none is cached; a cached list shows at once
     // and the refresh below replaces it if it changed
     if (!g_token.empty() && g_app.playlists.empty()) g_bootRefreshPending = true;
+    // WinInet opens at most two connections per server by default, so parallel requests would wait in line
+    DWORD conns = 8;
+    InternetSetOptionW(nullptr, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &conns, sizeof(conns));
     std::thread([token = g_token, userid = g_userid]() {
         EnsureSidecar();
         CheckLoginAsync();
@@ -6976,8 +6983,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     // Start the background decode thread and queue up all the covers
     StartDecoder();
 
-    // Download covers for songs that lack one, on demand
-    std::thread(CoverWorkerMain).detach();
+    // Covers missing on disk download six at a time
+    for (int i = 0; i < 6; i++) std::thread(CoverWorkerMain).detach();
 
     // Command line
     std::wstring outPath, mode, page, audioTest;
