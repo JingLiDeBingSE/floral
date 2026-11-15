@@ -372,8 +372,6 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
 
     // Pages are requested in parallel, four at a time, so the wait is about as long as the slowest page.
     // The count in the responses decides whether more pages remain; if any page fails, nothing is written
-    DWORD conns = 8;     // WinInet allows two connections per server by default; this raises it for the whole process
-    InternetSetOptionW(nullptr, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &conns, sizeof(conns));
     std::vector<TrackPage> pages;
     int want = countHint > 0 ? (std::min)((countHint + kTrackPageSize - 1) / kTrackPageSize, kMaxTrackPages) : 1;
     long long total = -1;
