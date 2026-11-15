@@ -65,7 +65,9 @@ enum HitKind {
     HK_PL_PICK,     // Title bar "Songs": back to playlist page
     HK_PICKER,      // Title bar button: back to playlist picker
     HK_QUAL,        // Quality button
-    HK_QUAL_ITEM    // Quality option
+    HK_QUAL_ITEM,   // Quality option
+    HK_FM_LIKE,     // Guess You Like: like or unlike the track
+    HK_FM_DISLIKE   // Guess You Like: dislike the track and skip it
 };
 struct Hit {
     D2D1_RECT_F r{};
@@ -126,6 +128,9 @@ enum { WB_MIN = 0, WB_MAX = 1, WB_CLOSE = 2 };
 /* Songs listed in a track list TSV, found the same way as other data files, with `source` as their platform;
    callable from worker threads */
 std::vector<Song> ReadSongs(const std::wstring& name, int source);
+
+/* Writes songs to path as a track list TSV that ReadSongs reads back; the file is replaced in one step */
+bool WriteSongs(const std::wstring& path, const std::vector<Song>& songs);
 extern std::wstring g_likesName;
 
 /* Embedded resource: default playlist data (used by data.cpp) */

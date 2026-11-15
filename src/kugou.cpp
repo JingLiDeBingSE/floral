@@ -60,6 +60,14 @@ static std::string UriEnc(const std::string& s) {
     return o;
 }
 
+/* Query parameters that sign a kugou-api request in as the account; the timestamp makes every URL unique, so the
+   service does not answer from its cache */
+static std::string Auth(const std::string& token, const std::string& userid) {
+    const std::string cookie = "token=" + token + ";userid=" + userid;
+    return "&cookie=" + UriEnc(cookie) + "&userid=" + userid + "&token=" + UriEnc(token) +
+           "&timestamp=" + std::to_string(GetTickCount64());
+}
+
 /* ══════════════ base64 → png ══════════════ */
 static bool SaveBase64Png(const std::string& b64, const std::wstring& path) {
     static const char* tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -203,10 +211,7 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
 int KgFetchPlaylists(const std::string& token, const std::string& userid,
                      std::vector<KgPlaylist>& out, std::wstring& err) {
     out.clear();
-    std::string cookie = "token=" + token + ";userid=" + userid;
-    const std::string auth = "&cookie=" + UriEnc(cookie) + "&userid=" + userid +
-                             "&token=" + UriEnc(token) + "&timestamp=" +
-                             std::to_string(GetTickCount64());
+    const std::string auth = Auth(token, userid);
     auto api = [&](const std::string& path) {
         return Http(Widen("http://127.0.0.1:3000" + path + auth));
     };
@@ -329,6 +334,7 @@ struct TrackPage {
     int listed = 0;                                          // tracks in the response, rows without a title included
     long long total = -1;                                    // track count of the whole playlist; -1 when absent
     std::vector<std::pair<std::string, std::string>> rows;   // (hash, TSV row)
+    std::vector<std::pair<std::string, long long>> fileids;  // (hash, fileid) of every track listed
 };
 
 /* Fetches one page with up to 3 attempts. The service occasionally returns an empty list for a page
@@ -350,10 +356,14 @@ static bool FetchTrackPage(const std::string& url, int page, TrackPage& out) {
         out.listed = songs->count();
         out.total = total;
         out.rows.clear();
+        out.fileids.clear();
         for (int i = 0; i < songs->count(); i++) {
             std::string hash;
             std::string row = TrackRow(songs->at(i), hash);
             if (!row.empty()) out.rows.emplace_back(std::move(hash), std::move(row));
+            const JVal* h = songs->at(i)->get("hash");
+            const JVal* id = songs->at(i)->get("fileid");
+            if (h && id) out.fileids.emplace_back(h->str(), id->ll());
         }
         return true;
     }
@@ -433,12 +443,34 @@ static int KgExportTracksByGcid(const std::string& token, const std::string& use
 }
 
 
+/* The "Liked" playlist in a /user/playlist list, found by its name, then by the default-list flag, then by a name
+   that contains it. listid is what the edit calls take, gcid what the track list takes */
+static bool FindLikes(const JVal* list, std::string& listid, std::string& gcid) {
+    auto matches = [](int rule, const JVal* p) {
+        const JVal* nm = p->get("listname");
+        const JVal* def = p->get("is_def");
+        const std::string name = nm ? nm->str() : "";
+        if (rule == 0) return name == "我喜欢";
+        if (rule == 1) return def && def->ll() == 2;
+        return name.find("我喜欢") != std::string::npos;
+    };
+    for (int rule = 0; rule < 3; rule++) {
+        for (int i = 0; i < (list ? list->count() : 0); i++) {
+            const JVal* p = list->at(i);
+            const JVal* g = p->get("global_collection_id");
+            if (!g || g->str().empty() || !matches(rule, p)) continue;
+            const JVal* id = p->get("listid");
+            listid = id ? std::to_string(id->ll()) : "0";
+            gcid = g->str();
+            return true;
+        }
+    }
+    return false;
+}
+
 int KgExportLikes(const std::string& token, const std::string& userid,
                   const std::wstring& outTsv, std::wstring& err) {
-    std::string cookie = "token=" + token + ";userid=" + userid;
-    const std::string auth = "&cookie=" + UriEnc(cookie) + "&userid=" + userid +
-                             "&token=" + UriEnc(token) + "&timestamp=" +
-                             std::to_string(GetTickCount64());
+    const std::string auth = Auth(token, userid);
     auto api = [&](const std::string& path) {
         return Http(Widen("http://127.0.0.1:3000" + path + auth));
     };
@@ -450,36 +482,146 @@ int KgExportLikes(const std::string& token, const std::string& userid,
     const JVal* list = pd ? (pd->get("info") ? pd->get("info") : pd->get("list")) : nullptr;
     if (!list) { err = L"歌单列表为空（登录可能失效）"; return -1; }
 
-    std::string gcid, name;
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 1) exact name match
-        const JVal* p = list->at(i);
-        const JVal* nm = p ? p->get("listname") : nullptr;
-        const JVal* g = p ? p->get("global_collection_id") : nullptr;
-        if (nm && g && nm->str() == "我喜欢" && !g->str().empty()) { name = nm->str(); gcid = g->str(); }
-    }
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 2) is_def == 2
-        const JVal* p = list->at(i);
-        const JVal* def = p ? p->get("is_def") : nullptr;
-        const JVal* g = p ? p->get("global_collection_id") : nullptr;
-        if (def && def->ll() == 2 && g && !g->str().empty()) { gcid = g->str(); }
-    }
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 3) name contains "Likes"
-        const JVal* p = list->at(i);
-        const JVal* nm = p ? p->get("listname") : nullptr;
-        const JVal* g = p ? p->get("global_collection_id") : nullptr;
-        if (nm && g && nm->str().find("我喜欢") != std::string::npos && !g->str().empty()) {
-            name = nm->str(); gcid = g->str();
+    std::string listid, gcid;
+    if (!FindLikes(list, listid, gcid)) {           // fall back on the first playlist
+        for (int i = 0; i < list->count() && gcid.empty(); i++) {
+            const JVal* g = list->at(i)->get("global_collection_id");
+            if (g) gcid = g->str();
         }
-    }
-    for (int i = 0; i < list->count() && gcid.empty(); i++) {      // 4) fallback: first playlist
-        const JVal* p = list->at(i);
-        const JVal* g = p ? p->get("global_collection_id") : nullptr;
-        if (g && !g->str().empty()) gcid = g->str();
     }
     if (gcid.empty()) { err = L"没找到可用的歌单"; return -1; }
 
     // hand off to the shared helper to fetch tracks by gcid
     return KgExportTracksByGcid(token, userid, gcid, 0, outTsv, err);
+}
+
+/* kugou-api reports success with status 1 */
+static bool Ok(const JVal& r) {
+    const JVal* st = r.get("status");
+    return st && st->ll() == 1;
+}
+
+/* fileid of the song in the "Liked" playlist, searching the first `pages` pages, which hold the newest additions;
+   0 when it is not there, -1 when a page cannot be read */
+static long long FindInLikes(const std::string& auth, const std::string& gcid, const std::string& hash, int pages) {
+    const std::string url = "http://127.0.0.1:3000/playlist/track/all?id=" + UriEnc(gcid) +
+                            "&pagesize=" + std::to_string(kTrackPageSize) + auth;
+    for (int page = 1; page <= pages; page++) {
+        TrackPage p;
+        if (!FetchTrackPage(url, page, p)) return -1;
+        for (const auto& [h, fileid] : p.fileids)
+            if (h == hash) return fileid;
+        if (p.listed < kTrackPageSize) break;
+    }
+    return 0;
+}
+
+bool KgSetLiked(const std::string& token, const std::string& userid, const Song& song, bool liked,
+                std::wstring& err) {
+    const std::string auth = Auth(token, userid);
+    JVal lists;
+    const JVal* d = Json(Http(Widen("http://127.0.0.1:3000/user/playlist?pagesize=100&page=1" + auth)), lists)
+                        ? lists.get("data") : nullptr;
+    std::string listid, gcid;
+    if (!FindLikes(d ? d->get("info") : nullptr, listid, gcid) || listid == "0") {
+        err = L"没找到「我喜欢」歌单";
+        return false;
+    }
+    // Liking checks only the newest page: a song added just now, or by the Guess You Like report, is on it
+    const long long fileid = FindInLikes(auth, gcid, song.hash, liked ? 1 : kMaxTrackPages);
+    if (fileid < 0) { err = L"读不出「我喜欢」歌单"; return false; }
+    if (liked == (fileid > 0)) return true;
+
+    std::string path;
+    if (liked) {
+        std::string name = Narrow(song.artist) + " - " + Narrow(song.title);
+        for (char& c : name) if (c == ',' || c == '|') c = ' ';     // they separate songs and fields in data
+        path = "/playlist/tracks/add?listid=" + listid + "&data=" +
+               UriEnc(name + "|" + song.hash + "|" + std::to_string(song.albumId) + "|" + std::to_string(song.mixId));
+    } else {
+        path = "/playlist/tracks/del?listid=" + listid + "&fileids=" + std::to_string(fileid);
+    }
+    JVal r;
+    if (!Json(Http(Widen("http://127.0.0.1:3000" + path + auth)), r) || !Ok(r)) {
+        err = liked ? L"收藏失败" : L"取消收藏失败";
+        return false;
+    }
+    return true;
+}
+
+/* ══════════════ Recommendations ══════════════ */
+
+/* A song of the recommendation lists; the daily recommendations and Guess You Like share these fields */
+static Song RecSong(const JVal& t) {
+    auto str = [&](const char* key) { const JVal* v = t.get(key); return v ? v->str() : std::string(); };
+    auto num = [&](const char* key) { const JVal* v = t.get(key); return v ? v->ll() : 0LL; };
+    Song s;
+    s.source = SRC_KUGOU;
+    s.title = Widen(Clean(str("songname")));
+    const std::string artist = str("author_name");
+    s.artist = Widen(Clean(artist.empty() ? JoinNames(t.get("singerinfo")) : artist));
+    s.album = Widen(Clean(str("album_name")));
+    s.durationSec = (int)num("time_length");
+    s.hash = str("hash");
+    s.mixId = num("mixsongid");
+    s.albumId = num("album_id");
+    s.songId = num("songid");
+    s.coverUrl = str("sizable_cover");
+    if (s.coverUrl.empty()) {                     // Guess You Like has its cover only here
+        const JVal* tp = t.get("trans_param");
+        const JVal* cover = tp ? tp->get("union_cover") : nullptr;
+        if (cover) s.coverUrl = cover->str();
+    }
+    size_t p = s.coverUrl.find("{size}");
+    if (p != std::string::npos) s.coverUrl.replace(p, 6, "400");
+    return s;
+}
+
+static std::vector<Song> RecSongs(const JVal* list) {
+    std::vector<Song> songs;
+    for (int i = 0; list && i < list->count(); i++) {
+        Song s = RecSong(*list->at(i));
+        if (!s.title.empty() && !s.hash.empty()) songs.push_back(std::move(s));
+    }
+    return songs;
+}
+
+bool KgFetchDaily(const std::string& token, const std::string& userid, KgDaily& out, std::wstring& err) {
+    JVal r;
+    if (!Json(Http(Widen("http://127.0.0.1:3000/everyday/recommend?platform=ios" + Auth(token, userid))), r) ||
+        !Ok(r)) {
+        err = L"拉每日推荐失败";
+        return false;
+    }
+    const JVal* d = r.get("data");
+    const JVal* date = d ? d->get("creation_date") : nullptr;
+    const JVal* cover = d ? d->get("cover_img_url") : nullptr;
+    out.date = date ? (int)date->ll() : 0;
+    out.coverUrl = cover ? cover->str() : "";
+    out.songs = RecSongs(d ? d->get("song_list") : nullptr);
+    if (out.date <= 0 || out.songs.empty()) { err = L"每日推荐是空的"; return false; }
+    return true;
+}
+
+bool KgFmRequest(const std::string& token, const std::string& userid, const KgFmCall& call,
+                 std::vector<Song>& songs, std::string& mark, std::wstring& err) {
+    // The service treats any value it is given as set, "0" included, so a false flag or an unknown id is left out
+    std::string path = "/personal/fm?action=" + call.action + "&remain_songcnt=" + std::to_string(call.remain);
+    if (!call.song.hash.empty()) path += "&hash=" + call.song.hash + "&playtime=" + std::to_string(call.playSec);
+    if (call.song.songId) path += "&songid=" + std::to_string(call.song.songId);
+    if (call.ended) path += "&is_overplay=1";
+    if (!call.mark.empty()) path += "&cur_mark=" + UriEnc(call.mark);
+
+    JVal r;
+    if (!Json(Http(Widen("http://127.0.0.1:3000" + path + Auth(token, userid))), r) || !Ok(r)) {
+        err = L"猜你喜欢没有响应";
+        return false;
+    }
+    const JVal* d = r.get("data");
+    const JVal* m = d ? d->get("cur_mark") : nullptr;
+    songs = RecSongs(d ? d->get("song_list") : nullptr);
+    mark = !m ? "" : m->t == JVal::STR ? m->str() : std::to_string(m->ll());
+    return true;
 }
 
 

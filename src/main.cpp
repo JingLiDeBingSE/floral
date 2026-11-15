@@ -39,6 +39,7 @@
 #include <atomic>
 #include <algorithm>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <tuple>
 
@@ -71,7 +72,6 @@ static int   g_plPhase  = 0;
 static float g_plT      = 0.0f;
 static float g_plSpin   = 0.0f;    // spinner angle accumulator
 static bool  g_swapDone = false;   // playlist data arrived
-static float g_plEnterX = 0.0f, g_plEnterY = 0.0f;   // where the card was clicked (origin of the dissolve)
 
 /* Page curtain: covers the window with the background colour, swaps the page, then reveals.
    0 idle, 1 covering (old page out), 2 revealing (new page in) */
@@ -1006,6 +1006,17 @@ static void CoverWorkerMain() {
    ══════════════════════════════════════════ */
 static std::wstring PlaylistsFile() { return AssetDir() + L"\\playlists.tsv"; }
 
+/* Kugou's recommendations, listed among the playlists under ids of their own */
+static const char kDailyGcid[] = "rec-daily";   // versioned by the date the list was made
+static const char kFmGcid[]    = "rec-fm";      // Guess You Like: opens straight into the player, adding songs as it plays
+
+/* Name shown for a playlist; Floral names the recommendations itself, so their names follow the UI language */
+static std::wstring PlTitle(const Playlist& pl) {
+    if (pl.gcid == kDailyGcid) return T(L"每日推荐", L"Daily Picks");
+    if (pl.gcid == kFmGcid) return T(L"猜你喜欢", L"Guess You Like");
+    return pl.name;
+}
+
 /* ── UI language ── */
 static std::wstring LangFile() { return AssetDir() + L"\\lang.txt"; }
 static void LoadLang() {
@@ -1084,6 +1095,8 @@ static void SavePlaylists() {
 /* ── Playlist covers: path derived from gcid, decode directly if the file exists ── */
 static std::wstring PlCoverPath(const Playlist& pl) {
     std::string h = pl.gcid;
+    // Guess You Like shows the cover of its latest track, so its file name includes the image's own name
+    if (pl.gcid == kFmGcid) h += "_" + pl.coverUrl.substr(pl.coverUrl.find_last_of('/') + 1);
     for (char& c : h) if (!(isalnum((unsigned char)c) || c == '_' || c == '-')) c = '_';
     return AssetDir() + L"\\covers\\pl_" + std::wstring(h.begin(), h.end()) + L".jpg";
 }
@@ -1123,16 +1136,33 @@ static void RequestPlaylistCover(int i) {
         g_coverDirty = true;
     }).detach();
 }
+static bool SaveDaily(const KgDaily& d, Playlist& pl);
+
 /* Worker thread: fetch all playlists from the API and write them to disk */
 static void FetchPlaylistsAsync(const std::string& token, const std::string& userid) {
+    KgDaily today;
+    std::wstring dailyErr;
+    bool dailyOk = false;
+    std::thread dailyFetch([&] { dailyOk = KgFetchDaily(token, userid, today, dailyErr); });
     std::vector<KgPlaylist> got;
     std::wstring err;
     int n = KgFetchPlaylists(token, userid, got, err);
+    dailyFetch.join();
     if (n <= 0) {
         g_bootRefreshPending = false;   // never hold up the splash screen, even on failure
         Logf("ERR", "拉歌单列表失败: %s", Narrow(err).c_str());
         return;
     }
+
+    // Kept only now that the playlists arrived, which shows the Kugou session works: with any other session the
+    // service still answers, but with recommendations that are not this account's
+    Playlist daily, fm;
+    daily.name = L"每日推荐";
+    daily.gcid = kDailyGcid;
+    fm.name = L"猜你喜欢";
+    fm.gcid = kFmGcid;
+    if (!dailyOk) Logf("ERR", "拉每日推荐失败: %s", Narrow(dailyErr).c_str());
+    else if (!SaveDaily(today, daily)) Logf("ERR", "写不进每日推荐");
 
     std::lock_guard<std::mutex> lk(g_plMx);
     g_plPending.clear();
@@ -1145,6 +1175,10 @@ static void FetchPlaylistsAsync(const std::string& token, const std::string& use
         pl.ver = kp.ver;
         g_plPending.push_back(std::move(pl));
     }
+    // The recommendations go right after "Liked"
+    const auto likes = std::find_if(g_plPending.begin(), g_plPending.end(),
+                                    [](const Playlist& pl) { return pl.name == L"我喜欢"; });
+    g_plPending.insert(likes == g_plPending.end() ? g_plPending.begin() : likes + 1, { daily, fm });
     g_plReady = true;
     g_bootRefreshPending = false;       // the first screen waits on this alone
     Logf("APP", "歌单列表拉取完成 %d 个", n);
@@ -3088,6 +3122,18 @@ static void LoadAudioFor(int idx, bool useLocal = true) {
     }).detach();
 }
 
+/* Guess You Like: a play queue that Kugou keeps extending at its end. It never shrinks or reorders, since listening
+   together and the switch animation refer to its tracks by position */
+static bool g_fmOn = false;          // the play queue is the Guess You Like stream
+static int  g_fmSession = 0;         // counts streams, so that replies meant for an earlier one are dropped
+static void FmReport();
+
+/* Whether the queue holds a track dir steps from position i; the Guess You Like queue does not wrap around */
+static bool HasTrack(int i, int dir) {
+    const int n = (int)g_app.queue.size();
+    return n > 0 && (!g_fmOn || (i + dir >= 0 && i + dir < n));
+}
+
 static void SwitchTrack(int dir);
 
 static void SwitchTrackNow(int dir) {
@@ -3119,6 +3165,7 @@ static void SwitchTrackNow(int dir) {
 
 /** Track-switch entry: fade out first if audio is playing, then switch, avoiding a hard-cut pop */
 static void SwitchTrack(int dir) {
+    if (!HasTrack(g_app.current, g_pendingDir + dir)) return;
     if (g_audioOk && g_pendingDir == 0 && g_fadeDir >= 0) {
         g_pendingDir = dir;
         g_fadeDir = -1;
@@ -3146,8 +3193,10 @@ static void StopPlayback() {
    -1 selects nothing and stops playback */
 static void SetPlayQueue(std::vector<Song> songs, int selected) {
     App& a = g_app;
+    if (g_fmOn) FmReport();             // leaving Guess You Like: report the track it was playing
     a.queue = std::move(songs);
     a.current = selected;
+    g_fmOn = false;
     g_textCur = selected;
     g_switchT = 1.0f;                   // the switch animation draws discs of the old queue
     { std::lock_guard<std::mutex> lk(g_preMx); g_urlCache.clear(); }
@@ -3190,6 +3239,216 @@ static void SeekTo(int ms) {
     g_app.pos = ms / 1000.0;
     if (g_audioOk && !g_pendingLoad) AudioSeekMS(ms);
     else g_pendingSeekMs = ms;
+}
+
+/* Runs jobs one at a time in the order they were posted, on a thread that lives while jobs are waiting */
+class SerialJobs {
+public:
+    void Post(std::function<void()> job) {
+        std::lock_guard<std::mutex> lk(mx_);
+        jobs_.push_back(std::move(job));
+        if (running_) return;
+        running_ = true;
+        std::thread([this] {
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::lock_guard<std::mutex> lk(mx_);
+                    if (jobs_.empty()) { running_ = false; return; }
+                    job = std::move(jobs_.front());
+                    jobs_.pop_front();
+                }
+                job();
+            }
+        }).detach();
+    }
+    bool Busy() {
+        std::lock_guard<std::mutex> lk(mx_);
+        return running_;
+    }
+private:
+    std::mutex mx_;
+    std::deque<std::function<void()>> jobs_;
+    bool running_ = false;
+};
+
+/* Guess You Like requests go out in order, so the songs arrive in the order asked for. Likes have a queue of their
+   own: unliking may page through all of "Liked" */
+static SerialJobs g_fmRequests, g_fmLikes;
+
+struct FmReply {
+    int session = 0;
+    std::vector<Song> songs;        // recommendations to append to the queue
+    std::string mark;               // cur_mark to send next
+    std::string likeFailed;         // hash of a song whose like or unlike did not go through
+    bool liked = false;             // what that like or unlike tried to set
+};
+static std::mutex           g_fmMx;
+static std::vector<FmReply> g_fmReplies;            // taken by the UI thread
+static std::string          g_fmMark;               // cur_mark of the current stream's latest response
+
+/* UI thread only */
+static int    g_fmCur = -1;                   // queue position reported on once another track becomes current
+static double g_fmPos = 0.0;                  // how far that track has played, in seconds
+static bool   g_fmEnded = false;              // it played to its end
+static bool   g_fmSkipping = false;           // a disliked last track waits, paused, for the next songs
+static ULONGLONG g_fmAskedAt = 0;             // when the latest request was queued
+static std::set<std::string> g_fmLiked;       // hashes in "Liked", as far as this stream knows
+static std::set<std::string> g_fmDisliked;    // hashes reported as disliked, whose plays are not reported again
+
+static void FmReplyArrived(FmReply reply) {
+    std::lock_guard<std::mutex> lk(g_fmMx);
+    g_fmReplies.push_back(std::move(reply));
+}
+
+static void FmSend(KgFmCall call) {
+    g_fmAskedAt = GetTickCount64();
+    const int session = g_fmSession;
+    g_fmRequests.Post([call, session, token = g_token, userid = g_userid]() mutable {
+        { std::lock_guard<std::mutex> lk(g_fmMx); call.mark = g_fmMark; }
+        FmReply reply;
+        reply.session = session;
+        std::wstring err;
+        if (KgFmRequest(token, userid, call, reply.songs, reply.mark, err))
+            Logf("APP", "猜你喜欢 %s [%s] 播放 %d 秒%s，返回 %d 首", call.action.c_str(), call.song.hash.c_str(),
+                 call.playSec, call.ended ? "（播完）" : "", (int)reply.songs.size());
+        else
+            Logf("ERR", "猜你喜欢 %s: %s", call.action.c_str(), Narrow(err).c_str());
+        FmReplyArrived(std::move(reply));
+        if (call.action != "click_red" && call.action != "cancel_red") return;
+
+        // Edited only after the report, so a song the report itself put into "Liked" is not added twice
+        g_fmLikes.Post([song = call.song, liked = call.action == "click_red", session, token, userid] {
+            std::wstring likeErr;
+            if (KgSetLiked(token, userid, song, liked, likeErr)) return;
+            Logf("ERR", "%s", Narrow(likeErr).c_str());
+            FmReply failed;
+            failed.session = session;
+            failed.likeFailed = song.hash;
+            failed.liked = liked;
+            FmReplyArrived(std::move(failed));
+        });
+    });
+}
+
+/* A request about queue position i (none when out of range), counting the tracks after the current one */
+static KgFmCall FmCall(const char* action, int i) {
+    const App& a = g_app;
+    KgFmCall c;
+    c.action = action;
+    if (i >= 0 && i < (int)a.queue.size()) c.song = a.queue[(size_t)i];
+    c.remain = (int)a.queue.size() - 1 - a.current;
+    return c;
+}
+
+/* Reports how long the track at g_fmCur played, unless it was reported as disliked */
+static void FmReport() {
+    const App& a = g_app;
+    if (g_fmCur < 0 || g_fmCur >= (int)a.queue.size() || g_fmDisliked.count(a.queue[(size_t)g_fmCur].hash)) return;
+    KgFmCall c = FmCall("play", g_fmCur);
+    c.playSec = (int)g_fmPos;
+    c.ended = g_fmEnded;
+    FmSend(std::move(c));
+}
+
+/* Guess You Like's circle in the playlist picker shows the cover of the stream's latest track */
+static void FmShowCover(const Song& s) {
+    for (Playlist& pl : g_app.playlists) {
+        if (pl.gcid != kFmGcid || s.coverUrl.empty() || pl.coverUrl == s.coverUrl) continue;
+        DeleteFileW(PlCoverPath(pl).c_str());
+        pl.coverUrl = s.coverUrl;
+        g_plCovAsked.erase(pl.gcid);
+        SavePlaylists();
+    }
+}
+
+/* Makes the songs the queue of a new Guess You Like stream and plays the first */
+static void StartFm(std::vector<Song> songs) {
+    AdoptLocalCovers(songs);
+    SetPlayQueue(std::move(songs), -1);
+    g_fmOn = true;
+    g_fmSession++;
+    g_fmCur = -1;
+    g_fmSkipping = false;
+    g_fmAskedAt = 0;
+    g_fmLiked.clear();
+    for (const Song& s : ReadSongs(L"kugou-likes.tsv", SRC_KUGOU)) g_fmLiked.insert(s.hash);
+    g_fmDisliked.clear();
+    OpenTrack(0, true);
+}
+
+/* Adds the songs that arrived and reports on a track once another one is current. Returns whether the queue or the
+   like state changed */
+static bool FmTick() {
+    App& a = g_app;
+    std::vector<FmReply> replies;
+    { std::lock_guard<std::mutex> lk(g_fmMx); replies.swap(g_fmReplies); }
+    if (!g_fmOn) return false;
+
+    bool changed = false;
+    for (FmReply& r : replies) {
+        if (r.session != g_fmSession) continue;
+        if (!r.mark.empty()) { std::lock_guard<std::mutex> lk(g_fmMx); g_fmMark = r.mark; }
+        AdoptLocalCovers(r.songs);
+        for (Song& s : r.songs) {
+            if (std::any_of(a.queue.begin(), a.queue.end(), [&](const Song& q) { return q.hash == s.hash; })) continue;
+            a.queue.push_back(std::move(s));
+            changed = true;
+        }
+        if (!r.likeFailed.empty()) {
+            if (r.liked) g_fmLiked.erase(r.likeFailed);
+            else g_fmLiked.insert(r.likeFailed);
+            TogToast(r.liked ? T(L"收藏失败", L"Couldn't like the song") : T(L"取消收藏失败", L"Couldn't unlike the song"));
+            changed = true;
+        }
+    }
+    if (g_fmSkipping && HasTrack(a.current, 1)) {
+        g_fmSkipping = false;
+        SwitchTrack(1);
+    }
+
+    if (a.current != g_fmCur) {
+        FmReport();
+        g_fmCur = a.current;
+        g_fmPos = 0.0;
+        g_fmEnded = false;
+        g_fmSkipping = false;
+        if (a.current >= 0 && a.current < (int)a.queue.size()) FmShowCover(a.queue[(size_t)a.current]);
+    } else if (!g_pendingLoad) {
+        g_fmPos = a.pos;
+    }
+
+    // Few tracks left and nothing on its way, say after a failed request: ask again, at most every 5 seconds
+    if ((int)a.queue.size() - 1 - a.current <= 4 && !g_fmRequests.Busy() && GetTickCount64() - g_fmAskedAt > 5000)
+        FmSend(FmCall("play", -1));
+    return changed;
+}
+
+/* Likes the current track, or unlikes it when it is liked */
+static void FmToggleLike() {
+    const App& a = g_app;
+    KgFmCall c = FmCall("click_red", a.current);
+    c.playSec = (int)a.pos;
+    if (!g_fmLiked.insert(c.song.hash).second) {
+        g_fmLiked.erase(c.song.hash);
+        c.action = "cancel_red";
+    }
+    FmSend(std::move(c));
+}
+
+/* Reports the current track as disliked and moves on to the next, which the last track pauses to wait for */
+static void FmDislike() {
+    const App& a = g_app;
+    KgFmCall c = FmCall("garbage", a.current);
+    c.playSec = (int)a.pos;
+    g_fmDisliked.insert(c.song.hash);
+    FmSend(std::move(c));
+    if (HasTrack(a.current, 1)) {
+        SwitchTrack(1);
+    } else {
+        g_fmSkipping = true;
+        SetPlaying(false);
+    }
 }
 
 /** Song info on a tile (scrim + title + artist) */
@@ -3839,6 +4098,59 @@ static void DrawExiting() {
     // DrawUI draws the title bar opaquely on top; don't duplicate it with a translucent one here
 }
 
+/* Heart icon w wide, outlined or filled */
+static void DrawHeart(float cx, float cy, float w, bool filled, UINT32 col) {
+    ID2D1PathGeometry* geo = nullptr;
+    if (!g_d2d || !g_brush || FAILED(g_d2d->CreatePathGeometry(&geo)) || !geo) return;
+    ID2D1GeometrySink* sk = nullptr;
+    if (FAILED(geo->Open(&sk)) || !sk) { geo->Release(); return; }
+    // The heart curve is 32 units wide and 28.8 high, with its middle 2.6 units below the origin
+    const float u = w / 32.0f;
+    for (int i = 0; i < 48; i++) {
+        const float t = 6.2831853f * (float)i / 48.0f, s = sinf(t);
+        const D2D1_POINT_2F p = D2D1::Point2F(
+            cx + u * 16.0f * s * s * s,
+            cy - u * (13.0f * cosf(t) - 5.0f * cosf(2.0f * t) - 2.0f * cosf(3.0f * t) - cosf(4.0f * t) + 2.6f));
+        if (i == 0) sk->BeginFigure(p, D2D1_FIGURE_BEGIN_FILLED);
+        else sk->AddLine(p);
+    }
+    sk->EndFigure(D2D1_FIGURE_END_CLOSED);
+    sk->Close();
+    sk->Release();
+    g_brush->SetColor(Col(col));
+    if (filled) g_rt->FillGeometry(geo, g_brush);
+    else g_rt->DrawGeometry(geo, g_brush, 1.5f);
+    geo->Release();
+}
+
+/* Like and dislike for the Guess You Like track, on a row of their own starting at (x, y) */
+static void DrawFmButtons(float x, float y) {
+    App& a = g_app;
+    const bool liked = g_fmLiked.count(a.queue[(size_t)a.current].hash) > 0;
+    const struct { int kind; const wchar_t* label; } btns[2] = {
+        { HK_FM_LIKE,    liked ? T(L"已收藏", L"Liked") : T(L"收藏", L"Like") },
+        { HK_FM_DISLIKE, T(L"不喜欢", L"Dislike") },
+    };
+    IDWriteTextFormat* f = Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    for (const auto& b : btns) {
+        // The like button keeps the width of its longer label, so neither button moves when it toggles
+        const float textW = TextWidth(b.kind == HK_FM_LIKE ? T(L"已收藏", L"Liked") : b.label, f);
+        const D2D1_RECT_F r = Rc(x, y, 44.0f + textW, 32.0f);
+        if (Inside(r, a.mouse)) FillRound(r, 16.0f, UI::HOVER);
+        const float ix = r.left + 18.0f, iy = y + 16.0f;
+        if (b.kind == HK_FM_LIKE) {
+            DrawHeart(ix, iy, 15.0f, liked, liked ? UI::ACCENT : UI::TEXT2);
+        } else {                                  // a circle crossed by a slash
+            StrokeCircle(ix, iy, 7.0f, UI::TEXT2, 1.0f, 1.5f);
+            Line(ix - 4.9f, iy + 4.9f, ix + 4.9f, iy - 4.9f, UI::TEXT2, 1.5f);
+        }
+        Text(b.label, f, Rc(r.left + 32.0f, y, r.right - r.left - 32.0f, 32.0f), UI::TEXT2);
+        Hit h; h.r = r; h.kind = b.kind;
+        if (g_alpha > 0.5f) a.hits.push_back(h);
+        x = r.right + 8.0f;
+    }
+}
+
 static void DrawPlayerPage() {
     App& a = g_app;
     const float W = a.width, H = a.height;
@@ -3963,9 +4275,11 @@ static void DrawPlayerPage() {
         float angIn  = g_discAngle + 360.0f * (1.0f - e);
 
         // 1) Oldest corner disc: yields, spins off-screen
-        DrawDisc(LerpRect(pushOut, outOff, e), a.queue[(size_t)pushedIdx], pushedIdx, angOut, 1.0f);
+        if (HasTrack(g_switchFrom, fwd ? -1 : 1))
+            DrawDisc(LerpRect(pushOut, outOff, e), a.queue[(size_t)pushedIdx], pushedIdx, angOut, 1.0f);
         // 2) New disc: comes in from off-screen to the corner
-        DrawDisc(LerpRect(inOff, slideIn, e), a.queue[(size_t)slideIdx], slideIdx, angIn, 1.0f);
+        if (HasTrack(a.current, fwd ? 1 : -1))
+            DrawDisc(LerpRect(inOff, slideIn, e), a.queue[(size_t)slideIdx], slideIdx, angIn, 1.0f);
         // 3) Centered disc: shrinks into the corner
         DrawDisc(LerpRect(discRect, toCorner, e), a.queue[(size_t)g_switchFrom],
                  g_switchFrom, angOut, 1.0f);
@@ -3974,13 +4288,14 @@ static void DrawPlayerPage() {
     } else {
         if (cornerK > 0.01f) {
             // Corner mini discs stay still; click one to switch to that song
-            DrawDisc(discPrev, a.queue[(size_t)prevIdx], prevIdx, 0.0f, 1.0f);
-            DrawDisc(discNext, a.queue[(size_t)nextIdx], nextIdx, 0.0f, 1.0f);
+            const bool hasPrev = HasTrack(a.current, -1), hasNext = HasTrack(a.current, 1);
+            if (hasPrev) DrawDisc(discPrev, a.queue[(size_t)prevIdx], prevIdx, 0.0f, 1.0f);
+            if (hasNext) DrawDisc(discNext, a.queue[(size_t)nextIdx], nextIdx, 0.0f, 1.0f);
             if (g_alpha > 0.5f && !switching) {
                 Hit hp; hp.r = discPrev; hp.kind = HK_PREV;
-                a.hits.push_back(hp);
+                if (hasPrev) a.hits.push_back(hp);
                 Hit hn; hn.r = discNext; hn.kind = HK_NEXT;
-                a.hits.push_back(hn);
+                if (hasNext) a.hits.push_back(hn);
             }
         }
         DrawDisc(discRect, s, a.current, g_discAngle, 1.0f);
@@ -4124,6 +4439,7 @@ static void DrawPlayerPage() {
         Hit hnx; hnx.r = nx; hnx.kind = HK_NEXT;
         if (g_alpha > 0.5f) a.hits.push_back(hnx);
 
+        if (g_fmOn) DrawFmButtons(px + 6.0f, by + 56.0f);   // before the volume and quality panels, which may cover it
         DrawVolume(px, by, cy);
     }
     g_alphaMul = 1.0f;      // Restore, so the title bar isn't affected
@@ -4196,6 +4512,20 @@ static int         g_plShownVer = 0;                      // and the version of 
 static std::string g_plWantGcid;                          // playlist on screen or being opened,
 static int         g_plWantVer = 0;                       // and the newest version requested for it
 
+/* Writes the recommendations to the track file of their date and deletes earlier days' files; fills in the entry's
+   version, count and cover */
+static bool SaveDaily(const KgDaily& d, Playlist& pl) {
+    static std::mutex mx;                // the playlist refresh and an open of the playlist may save at once
+    std::lock_guard<std::mutex> lk(mx);
+    if (!WriteSongs(AssetDir() + L"\\" + PlTracksFile(kDailyGcid, d.date), d.songs)) return false;
+    for (const std::wstring& name : PlCachedTracks(kDailyGcid))
+        if (PlFileVer(name) < d.date) DeleteFileW((AssetDir() + L"\\" + name).c_str());
+    pl.ver = d.date;
+    pl.count = (int)d.songs.size();
+    pl.coverUrl = d.coverUrl;
+    return true;
+}
+
 /* seq > 0 opens the playlist; seq == 0 only fetches its current version for the playlist on screen */
 static void LoadPlaylistAsync(int idx, int seq) {
     const Playlist& pl = g_app.playlists[(size_t)idx];
@@ -4215,6 +4545,30 @@ static void LoadPlaylistAsync(int idx, int seq) {
             g_plArrived.push_back(std::move(t));
             g_coverDirty = true;
         };
+
+        if (gcid == kFmGcid) {          // Guess You Like keeps no track file: its first songs come straight from Kugou
+            EnsureSidecar(0);
+            // "Liked" is fetched again alongside, so that the like button starts from what it holds now
+            std::thread likes([&] {
+                std::wstring likesErr;
+                if (KgExportLikes(token, userid, AssetDir() + L"\\kugou-likes.tsv", likesErr) < 0)
+                    Logf("ERR", "拉「我喜欢」失败: %s", Narrow(likesErr).c_str());
+            });
+            KgFmCall call;
+            call.action = "login";
+            std::vector<Song> songs;
+            std::string mark;
+            std::wstring err;
+            const bool ok = KgFmRequest(token, userid, call, songs, mark, err);
+            likes.join();
+            if (!ok) deliver(0, L"", {}, err);
+            else if (songs.empty()) deliver(0, L"", {}, L"猜你喜欢没有推荐歌曲");
+            else {
+                { std::lock_guard<std::mutex> lk(g_fmMx); g_fmMark = mark; }
+                deliver(0, L"", std::move(songs), L"");
+            }
+            return;
+        }
 
         // Version 0 means unknown, so no cached copy counts as current
         const std::wstring file = PlTracksFile(gcid, ver);
@@ -4243,6 +4597,17 @@ static void LoadPlaylistAsync(int idx, int seq) {
         }
         EnsureSidecar(0);               // the Kugou service may still be starting right after launch
         std::wstring err;
+        if (gcid == kDailyGcid) {       // the list fetched is today's, whatever version was asked for
+            KgDaily d;
+            Playlist daily;
+            if (!KgFetchDaily(token, userid, d, err) || !SaveDaily(d, daily)) {
+                Logf("ERR", "拉每日推荐失败: %s", Narrow(err).c_str());
+                deliver(ver, L"", {}, err.empty() ? L"写不进每日推荐" : err);
+                return;
+            }
+            deliver(daily.ver, PlTracksFile(gcid, daily.ver), std::move(d.songs), L"");
+            return;
+        }
         const ULONGLONG start = GetTickCount64();
         const int n = KgExportPlaylist(token, userid, gcid, count, AssetDir() + L"\\" + file, err);
         std::vector<Song> songs = (n > 0) ? ReadSongs(file, SRC_KUGOU) : std::vector<Song>();
@@ -4384,11 +4749,22 @@ static void DrainPlaylistSwap() {
         g_plOpened.reset();
         if (!t.err.empty()) {
             Logf("ERR", "切换歌单失败: %s", Narrow(t.err).c_str());
+            TogToast(T(L"歌单打开失败", L"Couldn't open the playlist"));
             g_plWantGcid = g_plShownGcid;
             g_plWantVer = g_plShownVer;
             g_plPhase = 0;                 // abort the transition, stay on the picker
             g_plT = 0.0f;
             g_gridEnter = 1.0f;
+            return;
+        }
+        if (t.gcid == kFmGcid) {           // Guess You Like starts playing on the player page, without the song grid
+            g_plWantGcid = g_plShownGcid;
+            g_plWantVer = g_plShownVer;
+            StartFm(std::move(t.songs));
+            g_playerFromPicker = true;
+            GoPlayerPageNow(true);
+            if (g_plPhase == 0) { g_curtainPhase = 2; g_curtainT = 1.0f; }   // the picker has faded out: reveal the player
+            g_swapDone = true;
             return;
         }
         ShowTracks(t);
@@ -4708,20 +5084,23 @@ static void DrawPlaylistPicker() {
         if (tw > 40.0f) {
             float ta = clamp01((selE - 0.15f) / 0.55f);
             if (ta > 0.01f) {
-                TextEllipsis(spl.name, Fmt(19.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+                TextEllipsis(PlTitle(spl), Fmt(19.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
                              Rc(tx, cardCY - 44.0f - (1.0f - ta) * 6.0f, tw, 28.0f), UI::TEXT, ta);
             }
+            const bool fm = spl.gcid == kFmGcid;
             float tb = clamp01((selE - 0.42f) / 0.40f);
             if (tb > 0.01f) {
                 wchar_t sub[128];
                 swprintf(sub, 128, T(L"%d 首", L"%d songs"), spl.count);
-                Text(sub, Fmt(13.0f, DWRITE_FONT_WEIGHT_NORMAL),
+                Text(fm ? T(L"按你的口味一首接一首推荐", L"Picks for your taste, one after another") : sub,
+                     Fmt(13.0f, DWRITE_FONT_WEIGHT_NORMAL),
                      Rc(tx, cardCY - 8.0f - (1.0f - tb) * 6.0f, tw, 20.0f), UI::TEXT2,
                      DWRITE_TEXT_ALIGNMENT_LEADING, tb);
             }
             float tc = clamp01((selE - 0.60f) / 0.32f);
             if (tc > 0.01f) {
-                Text(T(L"再点一次进入", L"Click again to open"), Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
+                Text(fm ? T(L"再点一次开始播放", L"Click again to play") : T(L"再点一次进入", L"Click again to open"),
+                     Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL),
                      Rc(tx, cardCY + 20.0f - (1.0f - tc) * 6.0f, tw, 18.0f), UI::TEXT3,
                      DWRITE_TEXT_ALIGNMENT_LEADING, tc * 0.9f);
             }
@@ -4766,8 +5145,9 @@ static void DrawPlaylistPicker() {
             } else {
                 FillCircle(cx, cy, rad, UI::SELECT, 0.8f * alpha);
             }
-            if (!pl.name.empty()) {
-                std::wstring ch(1, pl.name[0]);
+            const std::wstring title = PlTitle(pl);
+            if (!title.empty()) {
+                std::wstring ch(1, title[0]);
                 Text(ch, Fmt(26.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
                      Rc(cx - rad, cy - rad, rad * 2, rad * 2), 0xFFFFFF,
                      DWRITE_TEXT_ALIGNMENT_CENTER, 0.65f * alpha);
@@ -5120,6 +5500,8 @@ static bool Animate() {
             g_loginState = 1;                     // Login succeeded, valid
             g_loginAsked = false;
             ClearCache();                         // Cache isn't shared across platforms
+            for (const std::wstring& name : PlCachedTracks(kDailyGcid))   // nor are one account's recommendations
+                DeleteFileW((AssetDir() + L"\\" + name).c_str());
             SettingsToast(changed ? T(L"已切换账号，正在拉取歌单…", L"Account switched, fetching playlist…") : T(L"登录成功，正在拉取歌单…", L"Signed in, fetching playlist…"));
             StartExport(tgUid, tgTok);
             RefreshPlaylistsAsync();
@@ -5256,6 +5638,11 @@ static bool Animate() {
                 if (g_curtainAction == 1) {
                     GoPickerNow();
                 } else if (g_curtainAction == 2) {
+                    if (g_playerFromPicker) {   // drop any leftover loading overlay, and the playlist it was loading
+                        g_plPhase = 0;
+                        g_plT = 0.0f;
+                        CancelPlaylistOpen();
+                    }
                     GoPlayerPageNow(g_playerFromPicker);
                 }
                 g_curtainPhase = 2;
@@ -5302,6 +5689,16 @@ static bool Animate() {
         std::vector<Playlist> got;
         { std::lock_guard<std::mutex> lk(g_plMx); got.swap(g_plPending); }
         g_plReady = false;
+        // The fetch leaves out Guess You Like's cover, and the daily entry when today's list could not be fetched.
+        // The daily cover keeps its first image, since the service picks one of several at random every time
+        for (Playlist& pl : got) {
+            const auto old = std::find_if(a.playlists.begin(), a.playlists.end(),
+                                          [&](const Playlist& o) { return o.gcid == pl.gcid; });
+            if (old == a.playlists.end()) continue;
+            if (pl.gcid == kFmGcid) pl.coverUrl = old->coverUrl;
+            else if (pl.gcid == kDailyGcid && pl.ver == 0) pl = *old;
+            else if (pl.gcid == kDailyGcid && !old->coverUrl.empty()) pl.coverUrl = old->coverUrl;
+        }
         if (!got.empty() && got != a.playlists) {
             // Selections are positions in the list; move them to where their playlists are in the new one
             auto follow = [&](int& i) {
@@ -5641,8 +6038,11 @@ static bool Animate() {
                     g_audioOk = false;
                     g_audioError = true;
                     g_audioErrKind = 3;
-                } else if (AudioIsEnded() && g_fadeDir >= 0) {   // a fade-out in progress already leads elsewhere
+                } else if (AudioIsEnded() && g_fadeDir >= 0 && HasTrack(a.current, 1)) {
+                    // A fade-out in progress already leads elsewhere; at the end of Guess You Like, playback waits
+                    // for more songs
                     Logf("AUD", "自动连播：ms=%d", ms);
+                    g_fmEnded = true;
                     if (TogetherHoldsTrackEnd()) SetPlaying(false);
                     else SwitchTrackNow(1);        // the track is over, so there is nothing to fade out
                 }
@@ -5650,6 +6050,7 @@ static bool Animate() {
         }
         if (a.page == Page::Player) need = true;
     }
+    if (FmTick()) need = true;
 
     // Grid tiles follow their targets on springs; only the tiles near the viewport animate, the rest snap into place
     if (g_draw.size() == g_target.size()) {
@@ -5797,11 +6198,6 @@ static void GoPlayerPageNow(bool fromPicker) {
     g_discAngle = 0.0f;                 // spin starts from 0 degrees on entry so the hand-off doesn't jump
     g_enterT = fromPicker ? 1.0f : 0.0f;
     g_enterOn = !fromPicker;            // no entry transition when coming from the picker
-    if (fromPicker) {                   // drop any leftover loading overlay, and the playlist it was loading
-        g_plPhase = 0;
-        g_plT = 0.0f;
-        CancelPlaylistOpen();
-    }
     g_exitOn = false;
     g_exitT = 0.0f;
     g_settingsOpen = false;
@@ -5981,6 +6377,27 @@ public:
     void Retry() override { LoadAudioFor(g_app.current); }
 };
 static PlayerSide g_playerSide;
+
+/* Opens the selected playlist. Guess You Like plays rather than lists, so a listening room's guest cannot start it,
+   and once it plays, opening it again only shows the player page */
+static void EnterPlaylist(int idx) {
+    const std::string& gcid = g_app.playlists[(size_t)idx].gcid;
+    if ((gcid == kDailyGcid || gcid == kFmGcid) && (g_source != 0 || g_token.empty() || g_loginState == 2)) {
+        TogToast(T(L"每日推荐和猜你喜欢需要登录酷狗", L"Sign in to Kugou for its recommendations"));
+        return;
+    }
+    if (gcid == kFmGcid) {
+        if (TogetherRoutesControls()) {
+            TogToast(T(L"正在一起听，退出房间后才能播放这里的歌", L"Leave the room to play from this list"));
+            return;
+        }
+        if (g_fmOn) { GoPlayerPage(); return; }
+    }
+    g_plPhase = 1;
+    g_plT = 0.0f;
+    g_swapDone = false;
+    SelectPlaylistAsync(idx);
+}
 
 static void OnClick(POINT p) {
     App& a = g_app;
@@ -6176,6 +6593,7 @@ static void OnClick(POINT p) {
     case HK_SET_LOGIN: {
         // Sign in again: clear the cache and every platform's sign-in data, then pick a platform
         TogetherLeave();
+        SetPlayQueue({}, -1);                   // first, while a Guess You Like report can still sign in
         ClearCache();
         DeleteFileW((AssetDir() + L"\\kugou-session.json").c_str());
         DeleteFileW((AssetDir() + L"\\netease-session.json").c_str());
@@ -6188,7 +6606,6 @@ static void OnClick(POINT p) {
         g_loginAsked = false;
         g_loginRunning = false;                 // cancel the previous poll, which may still be running
         { std::lock_guard<std::mutex> lk(g_lgMx); g_lgState = 0; g_lgMsg.clear(); }
-        SetPlayQueue({}, -1);
         SettingsToast(T(L"已清空缓存和登录信息", L"Cache and sign-in cleared"));
         g_loginChoose = !g_loginChoose;
         break;
@@ -6218,6 +6635,8 @@ static void OnClick(POINT p) {
         if (TogetherRoutesControls()) TogetherRequest(TogetherOp::Next);
         else SwitchTrack(1);
         break;
+    case HK_FM_LIKE:    FmToggleLike(); break;
+    case HK_FM_DISLIKE: FmDislike(); break;
     case HK_PROGRESS: {
         if (a.current < 0) break;
         g_seekDrag = true;          // start dragging as soon as it's pressed
@@ -6612,13 +7031,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     bool inCard = (mp.x >= card.left - 6 && mp.x <= card.right + 6 &&
                                    mp.y >= card.top - 6 && mp.y <= card.bottom + 6);
                     if (inCard && g_app.plSelT > 0.9f) {
-                        // Start the transition: the page breaks apart, then the loading ring
-                        g_plPhase = 1;
-                        g_plEnterX = (float)g_app.mouse.x;
-                        g_plEnterY = (float)g_app.mouse.y;
-                        g_plT = 0.0f;
-                        g_swapDone = false;
-                        SelectPlaylistAsync(g_app.plActive);
+                        EnterPlaylist(g_app.plActive);
                     } else {
                         g_app.plActive = -1;
                         g_app.plTargetX = 0.0f;
@@ -6631,12 +7044,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
                 if (hit >= 0) {
                     if (g_app.plActive == hit && g_app.plSelT > 0.9f) {
-                        g_plPhase = 1;              // clicked again: enter the playlist
-                        g_plEnterX = (float)g_app.mouse.x;
-                        g_plEnterY = (float)g_app.mouse.y;
-                        g_plT = 0.0f;
-                        g_swapDone = false;
-                        SelectPlaylistAsync(hit);
+                        EnterPlaylist(hit);         // clicked again: enter the playlist
                     } else {
                         // First click: select it + move this card to the centre of the window
                         g_app.plActive = hit;

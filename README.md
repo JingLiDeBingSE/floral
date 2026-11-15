@@ -17,6 +17,9 @@ English | [简体中文](README.zh-CN.md)
   neighbours aside; scrolling applies motion blur
 - **Player page** — spinning record, sliding album cases, draggable progress bar,
   volume and quality panels
+- **Kugou picks** — Daily Recommendations and Guess You Like sit among the playlists;
+  Guess You Like starts playing at once, lets you like or dislike a track, and reports
+  what you play back to Kugou
 - **Listen together** — two-person synced playback, host is authoritative and the
   guest follows automatically
 - **Themes** — 7 colour schemes; UI available in Chinese and English
