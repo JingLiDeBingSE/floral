@@ -2,6 +2,7 @@
 #include "resource.h"
 #include "kugou.h"
 #include "together.h"
+#include "friends.h"
 #include "relay.h"
 #include "json.h"
 #include "log.h"
@@ -1381,6 +1382,12 @@ static float g_volT  = 0.0f;
 static float g_togT  = 0.0f;
 static std::wstring g_qrPath;            // QR code file for this login (renamed each time to avoid an old bitmap)
 static bool         g_togOpen = false;      // listen-together panel
+
+/* Friends panel */
+static bool         g_friendsOpen = false;
+static float        g_friendsT = 0.0f;      // 0..1 open animation
+static bool         g_friInput = false;     // the code field has focus
+static std::wstring g_friInputText;
 static bool         g_togInput = false;     // input field focused
 static std::wstring g_togInputText;         // room code being typed
 static std::wstring g_togMsg;               // listen-together toast, shown on every page
@@ -1559,7 +1566,7 @@ static void StartExport(const std::string& uid, const std::string& tok) {
 static std::wstring SidecarRoot() { return LocalDir() + L"\\sidecars"; }
 
 /* Sidecars version: bump it whenever the content changes to trigger re-extraction */
-#define SIDECARS_VERSION L"2026-11-14-2"
+#define SIDECARS_VERSION L"2026-11-21-1"
 
 static bool ExtractSidecars() {
     // The listen-together helper and the NetEase/QQ services may start on different threads at once
@@ -1929,6 +1936,169 @@ static D2D1_RECT_F LoginPillRect(float W) {
     return Rc(rightEdge - tw - 12.0f, UI::TITLE_H * 0.5f - 11.0f, tw, 22.0f);
 }
 
+/* Anchor of the add-friend button in the title bar; shared by drawing and the panel */
+static D2D1_RECT_F FriendsButtonRect(float W) {
+    float bxf = BtnRect(0, W).left - 40.0f - 44.0f - 44.0f - 44.0f;
+    return Rc(bxf, 13.0f, 32.0f, 26.0f);
+}
+
+/* Friends panel: my code, add by code, the list, and pending requests */
+static void DrawFriendsPanel(float W, float H) {
+    FriendsView v = FriendsStatus();
+    const float pw = 306.0f;
+    D2D1_RECT_F btn = FriendsButtonRect(W);
+
+    float left = btn.left - 24.0f;
+    if (left + pw > W - 12.0f) left = W - 12.0f - pw;
+    if (left < 12.0f) left = 12.0f;
+
+    const int nOnline = (int)std::count_if(v.friends.begin(), v.friends.end(),
+                                           [](const FriendEntry& f) { return f.online; });
+    const float listH = (float)v.friends.size() * 30.0f;
+    const float pendH = (float)v.pending.size() * 30.0f;
+    float h = 150.0f + listH + (pendH > 0 ? pendH + 26.0f : 0.0f);
+    if (!v.inviteFrom.empty()) h += 34.0f;
+
+    D2D1_RECT_F card = Rc(left, btn.bottom + 6.0f, pw, h);
+    PanelFx fx(g_friendsT, btn.left + 16.0f, btn.bottom);
+    FillRound(Rc(card.left + 2.0f, card.top + 10.0f, pw, h), 14.0f, UI::SHADOW, 0.18f);
+    FillRound(card, 14.0f, UI::CARD, 0.99f);
+    StrokeRound(card, 14.0f, UI::BORDER, 1.0f, 0.9f);
+
+    const float px = card.left + 16.0f;
+    const float pwid = pw - 32.0f;
+    float y = card.top + 12.0f;
+
+    // Title
+    Text(T(L"好友", L"Friends"), Fmt(14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+         Rc(px, y, pwid, 20.0f), UI::TEXT);
+    {
+        std::wstring st;
+        if (!v.connected) st = T(L"未连接", L"Offline");
+        else if (!v.ready) st = T(L"连接中…", L"Connecting…");
+        else st = std::to_wstring(nOnline) + T(L" 人在线", L" online");
+        Text(st, Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL), Rc(px, y, pwid, 20.0f), UI::TEXT3,
+             DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    y += 26.0f;
+
+    // My identity
+    if (v.myId.empty()) {
+        Text(T(L"登录一个平台账号后会自动建立身份", L"Sign in to a music platform to get an identity"),
+             Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), Rc(px, y, pwid, 18.0f), UI::TEXT3);
+        y += 22.0f;
+    } else {
+        std::wstring name = std::wstring(v.myName.begin(), v.myName.end());
+        Text(name, Fmt(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), Rc(px, y, pwid - 60.0f, 18.0f), UI::TEXT);
+        y += 20.0f;
+        std::wstring code = std::wstring(v.myId.begin(), v.myId.end());
+        if (code.size() == 8) code = code.substr(0, 4) + L"-" + code.substr(4);
+        Text(code, Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL), Rc(px, y, pwid - 60.0f, 18.0f), UI::TEXT2);
+        D2D1_RECT_F copy = Rc(px + pwid - 52.0f, y - 3.0f, 52.0f, 22.0f);
+        bool hcv = Inside(copy, g_app.mouse);
+        FillRound(copy, 7.0f, hcv ? UI::HOVER : UI::SELECT);
+        Text(T(L"复制", L"Copy"), Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL), copy, UI::TEXT,
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+        Hit hc; hc.r = copy; hc.kind = HK_FRI_COPY;
+        g_app.hits.push_back(hc);
+        y += 26.0f;
+    }
+
+    // Add by code
+    {
+        D2D1_RECT_F box = Rc(px, y, pwid - 58.0f, 26.0f);
+        FillRound(box, 8.0f, UI::SELECT);
+        if (g_friInput) StrokeRound(box, 8.0f, UI::ACCENT, 1.2f, 0.9f);
+        std::wstring shown = g_friInputText.empty()
+            ? T(L"输入好友码", L"Friend code") : g_friInputText;
+        Text(shown, Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL),
+             Rc(box.left + 9.0f, box.top, box.right - box.left - 14.0f, 26.0f),
+             g_friInputText.empty() ? UI::TEXT3 : UI::TEXT);
+        Hit hi; hi.r = box; hi.kind = HK_FRI_INPUT;
+        g_app.hits.push_back(hi);
+
+        D2D1_RECT_F add = Rc(px + pwid - 50.0f, y, 50.0f, 26.0f);
+        bool hav = Inside(add, g_app.mouse);
+        FillRound(add, 8.0f, hav ? UI::BTN_HOVER : UI::HOVER);
+        Text(T(L"添加", L"Add"), Fmt(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), add, UI::TEXT,
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+        Hit ha; ha.r = add; ha.kind = HK_FRI_ADD;
+        g_app.hits.push_back(ha);
+        y += 34.0f;
+    }
+
+    // Incoming invite
+    if (!v.inviteFrom.empty()) {
+        std::wstring who = std::wstring(v.inviteName.begin(), v.inviteName.end());
+        Text(who + T(L" 邀请一起听", L" invites you"), Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL),
+             Rc(px, y, pwid - 60.0f, 26.0f), UI::ACCENT_TEXT);
+        D2D1_RECT_F go = Rc(px + pwid - 52.0f, y + 2.0f, 52.0f, 22.0f);
+        FillRound(go, 7.0f, Inside(go, g_app.mouse) ? UI::BTN_HOVER : UI::SELECT);
+        Text(T(L"接受", L"Join"), Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL), go, UI::TEXT,
+             DWRITE_TEXT_ALIGNMENT_CENTER);
+        Hit hg; hg.r = go; hg.kind = HK_FRI_ACCEPT_INVITE;
+        g_app.hits.push_back(hg);
+        y += 34.0f;
+    }
+
+    // Friend list
+    if (v.friends.empty()) {
+        Text(T(L"还没有好友，把上面的码发给朋友", L"No friends yet - share your code"),
+             Fmt(11.0f, DWRITE_FONT_WEIGHT_NORMAL), Rc(px, y, pwid, 18.0f), UI::TEXT3);
+        y += 22.0f;
+    }
+    for (size_t i = 0; i < v.friends.size(); i++) {
+        const FriendEntry& f = v.friends[i];
+        FillRound(Rc(px + 2.0f, y + 11.0f, 5.0f, 5.0f), 2.5f,
+                  f.online ? UI::ACCENT : UI::TEXT3, f.online ? 1.0f : 0.45f);
+        std::wstring nm = std::wstring(f.name.begin(), f.name.end());
+        if (nm.empty()) nm = std::wstring(f.id.begin(), f.id.end());
+        Text(nm, Fmt(12.0f, DWRITE_FONT_WEIGHT_NORMAL), Rc(px + 14.0f, y, pwid - 80.0f, 28.0f),
+             f.online ? UI::TEXT : UI::TEXT2);
+        if (f.online) {
+            D2D1_RECT_F inv = Rc(px + pwid - 62.0f, y + 4.0f, 62.0f, 22.0f);
+            bool hin = Inside(inv, g_app.mouse);
+            FillRound(inv, 7.0f, hin ? UI::HOVER : UI::SELECT, 0.0f);
+            Text(T(L"邀请一起听", L"Invite"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL), inv,
+                 hin ? UI::TEXT : UI::TEXT2, DWRITE_TEXT_ALIGNMENT_CENTER);
+            Hit hi2; hi2.r = inv; hi2.kind = HK_FRI_INVITE; hi2.index = (int)i;
+            g_app.hits.push_back(hi2);
+        }
+        y += 30.0f;
+    }
+
+    // Pending requests
+    if (!v.pending.empty()) {
+        y += 4.0f;
+        Text(T(L"待处理", L"Requests"), Fmt(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+             Rc(px, y, pwid, 18.0f), UI::TEXT3);
+        y += 20.0f;
+        for (size_t i = 0; i < v.pending.size(); i++) {
+            const FriendEntry& p = v.pending[i];
+            std::wstring nm = std::wstring(p.name.begin(), p.name.end());
+            if (nm.empty()) nm = std::wstring(p.id.begin(), p.id.end());
+            Text(nm, Fmt(11.5f, DWRITE_FONT_WEIGHT_NORMAL), Rc(px, y, pwid - 110.0f, 26.0f), UI::TEXT);
+            D2D1_RECT_F ok = Rc(px + pwid - 104.0f, y + 2.0f, 48.0f, 22.0f);
+            FillRound(ok, 7.0f, Inside(ok, g_app.mouse) ? UI::BTN_HOVER : UI::SELECT);
+            Text(T(L"同意", L"Accept"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL), ok, UI::TEXT,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+            Hit ho; ho.r = ok; ho.kind = HK_FRI_ACCEPT; ho.index = (int)i;
+            g_app.hits.push_back(ho);
+
+            D2D1_RECT_F no = Rc(px + pwid - 52.0f, y + 2.0f, 48.0f, 22.0f);
+            FillRound(no, 7.0f, Inside(no, g_app.mouse) ? UI::HOVER : UI::CARD);
+            Text(T(L"拒绝", L"Decline"), Fmt(10.5f, DWRITE_FONT_WEIGHT_NORMAL), no, UI::TEXT2,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+            Hit hn; hn.r = no; hn.kind = HK_FRI_DECLINE; hn.index = (int)i;
+            g_app.hits.push_back(hn);
+            y += 30.0f;
+        }
+    }
+
+    // The card itself swallows clicks so they don't reach the page behind
+    Hit hcard; hcard.r = card; hcard.kind = HK_FRI_CARD;
+    g_app.hits.push_back(hcard);
+}
 static void DrawTitleBar(float W) {
 
 
@@ -1943,6 +2113,25 @@ static void DrawTitleBar(float W) {
     }
 
     float rightEdge = W - (UI::BTN_W * UI::BTN_COUNT + 76.0f);
+
+    // add friend: two figures, left of the playlist button; same box and hover as the others
+    {
+        float bxf = BtnRect(0, W).left - 40.0f - 44.0f - 44.0f - 44.0f;
+        D2D1_RECT_F pf = Rc(bxf, 13.0f, 32.0f, 26.0f);
+        bool hvf = Inside(pf, g_app.mouse);
+        if (hvf) FillRound(pf, 8.0f, UI::HOVER);
+        float cx = (pf.left + pf.right) * 0.5f, cy = (pf.top + pf.bottom) * 0.5f;
+        UINT32 icf = hvf ? UI::TEXT : UI::TEXT2;
+        // the second person sits behind and to the right
+        FillRound(Rc(cx + 1.7f, cy - 6.9f, 5.0f, 5.0f), 2.5f, icf);
+        FillRound(Rc(cx + 0.8f, cy - 0.2f, 7.0f, 5.2f), 2.6f, icf);
+        // the first person is in front, slightly larger
+        FillRound(Rc(cx - 7.0f, cy - 8.6f, 6.8f, 6.8f), 3.4f, icf);
+        FillRound(Rc(cx - 8.8f, cy - 0.9f, 10.2f, 6.6f), 3.3f, icf);
+        Hit hpf; hpf.r = pf; hpf.kind = HK_FRIENDS;
+        g_app.hits.push_back(hpf);
+        rightEdge = (std::min)(rightEdge, bxf - 12.0f);   // keep the song count clear of it
+    }
 
     // back to the playlist picker: 2×2 small squares, left of the disc button
     {
@@ -1965,7 +2154,7 @@ static void DrawTitleBar(float W) {
             Hit hp3; hp3.r = pb2; hp3.kind = HK_PICKER;
             g_app.hits.push_back(hp3);
         }
-        if (!onPicker) rightEdge = pb2.left - 12.0f;   // keep the song count off the button
+        if (!onPicker) rightEdge = (std::min)(rightEdge, pb2.left - 12.0f);   // keep the song count off the button
     }
 
     // go to the player page: small disc icon, left of the settings button
@@ -2012,6 +2201,9 @@ static void DrawTitleBar(float W) {
              DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
     DrawWindowButtons(W);
+
+    // Friends panel floats under its button, above whatever page is showing
+    if (g_friendsOpen || g_friendsT > 0.01f) DrawFriendsPanel(W, g_app.height);
 }
 
 /* ══════════════════════════════════════════
@@ -2566,10 +2758,11 @@ static bool StartNodeSidecar(const wchar_t* sub, const wchar_t* script,
 }
 
 #ifndef FLORAL_NO_TOGETHER
-static const RelayBroker kRelayBroker = {
-    "k9bf6e3a.ala.cn-shenzhen.emqxsl.cn", 8883, "Floral", "qwertyuiop!@#$%^&*()"
+/* Tried in order: our own relay first. It forwards frames without looking at them; the payload is
+   encrypted end to end with a key derived from the room code (see sidecars/together-mqtt). */
+static const RelayEndpoints kRelayEndpoints = {
+    { "47.108.201.112", 443 },
 };
-
 /* RelayLaunch for the listen-together helper */
 static bool LaunchRelayHelper(HANDLE* toHelper, HANDLE* fromHelper, HANDLE* process) {
     if (!ExtractSidecars()) {
@@ -5096,9 +5289,24 @@ static bool SpringStep(float& value, float& velocity, float target, float dt) {
 static void RefreshPlaylistsAsync();
 static bool Animate() {
     TogetherTick(GetTickCount64());
+    FriendsTick(GetTickCount64());
     App& a = g_app;
     bool need = false;
     const float dt = DeltaSeconds();
+
+    // Hand the platform session to the friends module once it becomes valid
+    {
+        static int lastLoginState = -1;
+        static std::string lastUid;
+        if (g_loginState != lastLoginState || g_userid != lastUid) {
+            lastLoginState = g_loginState;
+            lastUid = g_userid;
+            if (g_loginState == 1 && !g_userid.empty() && !g_token.empty())
+                FriendsAttachAccount(g_source, g_userid, g_token, Nickname());
+            else if (g_loginState != 1)
+                FriendsDetachAccount();
+        }
+    }
 
     // Login / export state machine (worker threads only write state; UI-related work happens here)
     {
@@ -5394,6 +5602,18 @@ static bool Animate() {
     g_plBlur = D2D1::Vector2F((a.plX - g_plLastX) * SHUTTER, (a.plY - g_plLastY) * SHUTTER);
     g_plLastX = a.plX;
     g_plLastY = a.plY;
+
+    // Friends panel open/close
+    {
+        const float target = g_friendsOpen ? 1.0f : 0.0f;
+        if (fabsf(g_friendsT - target) > 0.002f) {
+            g_friendsT += (target - g_friendsT) * Ease(0.2f, dt);
+            need = true;
+        } else if (g_friendsT != target) {
+            g_friendsT = target;
+            need = true;
+        }
+    }
 
     // Panel enter/exit progress
     {
@@ -6010,6 +6230,7 @@ static void OnClick(POINT p) {
             if (hs->kind == HK_PLAYER)    GoPlayerPage();
             if (hs->kind == HK_PICKER || hs->kind == HK_PL_PICK) GoPicker();
             if (hs->kind == HK_LOGIN_TIP) { g_settingsOpen = true; g_loginChoose = true; }
+            if (hs->kind == HK_FRIENDS) { g_friendsOpen = !g_friendsOpen; g_friInput = false; }
         }
         return;
     }
@@ -6018,6 +6239,10 @@ static void OnClick(POINT p) {
     if (g_volOpen && (!h || (h->kind != HK_VOL && h->kind != HK_VOL_TRACK))) g_volOpen = false;
     if (g_qualOpen && (!h || (h->kind != HK_QUAL && h->kind != HK_QUAL_ITEM))) g_qualOpen = false;
     if (g_togOpen && (!h || (h->kind < HK_TOG || h->kind > HK_TOG_CARD))) g_togOpen = false;
+    if (g_friendsOpen && (!h || (h->kind < HK_FRI_CARD || h->kind > HK_FRI_ACCEPT_INVITE))) {
+        g_friendsOpen = false;
+        g_friInput = false;
+    }
     if (!h) return;
 
     switch (h->kind) {
@@ -6030,6 +6255,64 @@ static void OnClick(POINT p) {
         GoPlayer(h->index);
         break;
     case HK_BACK:  ExitPlayer(); break;
+    case HK_FRI_INPUT:
+        g_friInput = !g_friInput;
+        break;
+    case HK_FRI_COPY: {
+        FriendsView fv = FriendsStatus();
+        std::wstring code = std::wstring(fv.myId.begin(), fv.myId.end());
+        if (code.size() == 8) code = code.substr(0, 4) + L"-" + code.substr(4);
+        if (OpenClipboard(GetActiveWindow())) {
+            EmptyClipboard();
+            const size_t bytes = (code.size() + 1) * sizeof(wchar_t);
+            HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if (mem) {
+                void* dst = GlobalLock(mem);
+                if (dst) { memcpy(dst, code.c_str(), bytes); GlobalUnlock(mem); SetClipboardData(CF_UNICODETEXT, mem); }
+            }
+            CloseClipboard();
+        }
+        TogToast(T(L"好友码已复制", L"Friend code copied"));
+        break;
+    }
+    case HK_FRI_ADD: {
+        std::wstring code = g_friInputText;
+        std::wstring clean;
+        for (wchar_t c : code) if (iswalnum(c)) clean += (wchar_t)towupper(c);
+        if (clean.size() >= 4) FriendsAdd(Narrow(clean));
+        g_friInputText.clear();
+        g_friInput = false;
+        break;
+    }
+    case HK_FRI_INVITE: {
+        FriendsView fv = FriendsStatus();
+        TogetherView tv = TogetherStatus();
+        if (h->index >= 0 && h->index < (int)fv.friends.size()) {
+            if (!tv.code.empty()) FriendsInvite(fv.friends[(size_t)h->index].id, tv.code);
+            else TogToast(T(L"先开一个一起听房间，再邀请好友", L"Open a listen-together room first"));
+        }
+        break;
+    }
+    case HK_FRI_ACCEPT: {
+        FriendsView fv = FriendsStatus();
+        if (h->index >= 0 && h->index < (int)fv.pending.size()) FriendsAccept(fv.pending[(size_t)h->index].id);
+        break;
+    }
+    case HK_FRI_DECLINE: {
+        FriendsView fv = FriendsStatus();
+        if (h->index >= 0 && h->index < (int)fv.pending.size()) FriendsDecline(fv.pending[(size_t)h->index].id);
+        break;
+    }
+    case HK_FRI_ACCEPT_INVITE: {
+        FriendsView fv = FriendsStatus();
+        if (!fv.inviteRoom.empty()) {
+            TogetherJoin(fv.inviteRoom);
+            TogToast(T(L"正在加入好友的房间…", L"Joining the room…"));
+        }
+        FriendsConsumeInvite();
+        g_friendsOpen = false;
+        break;
+    }
     case HK_PICKER:
     case HK_PL_PICK:
         GoPicker();
@@ -6473,6 +6756,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // otherwise it falls into the HTCAPTION branch above and is treated as a window drag
             float pickX = pbX - 44.0f;
             if (p.x >= pickX - 4.0f && p.x <= pickX + 36.0f) return HTCLIENT;
+            // Add-friend button (another 44px left): same reason as the others
+            float friendX = pickX - 44.0f;
+            if (p.x >= friendX - 4.0f && p.x <= friendX + 36.0f) return HTCLIENT;
             if (g_loginState == 2 || g_loginState == 3) {
                 D2D1_RECT_F pill = LoginPillRect((float)rc.right);
                 if (p.x >= pill.left - 4.0f && p.x <= pill.right + 4.0f) return HTCLIENT;
@@ -6741,6 +7027,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_CHAR: {
+        if (g_friendsOpen && g_friInput) {
+            const wchar_t c = (wchar_t)wp;
+            if (c == 8) { if (!g_friInputText.empty()) g_friInputText.pop_back(); }
+            else if (c == 13) { /* Enter adds, handled on click for simplicity */ }
+            else if (iswalnum(c) && g_friInputText.size() < 12) g_friInputText += (wchar_t)towupper(c);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_togOpen && g_togInput) {
             const wchar_t c[2] = { (wchar_t)wp, 0 };
             if (c[0] == 8) {                               // backspace
@@ -6941,6 +7235,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     LogInit();
     AssetDir();                      // resolve/create the data directory before anything reads it
     ThemeLoad();
+
+    // Unpack the sidecars in the background: it takes ~10s the first time a version changes, and
+    // blocking the UI for that made the friends panel sit on "connecting" for ages.
+    std::thread([] {
+        const ULONGLONG t0 = GetTickCount64();
+        ExtractSidecars();
+        Logf("APP", "sidecars 预热完成，用时 %llu ms", GetTickCount64() - t0);
+    }).detach();
     Logf("APP", "==== Floral 启动 ====");
     {
         OSVERSIONINFOW vi = { sizeof(vi) };
@@ -6972,8 +7274,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }).detach();
 #ifndef FLORAL_NO_TOGETHER
-    static Relay relay(LaunchRelayHelper, kRelayBroker);
+    static Relay relay(LaunchRelayHelper, kRelayEndpoints);
     TogetherInit(&g_playerSide, &relay);
+    relay.CtlOpen(kRelayEndpoints);      // accounts / friends run on a second connection
+    FriendsInit(&relay);
 #endif
     if (!GfxInit()) {
         MessageBoxW(nullptr, T(L"图形初始化失败", L"Graphics init failed"), T(L"错误", L"Error"), MB_ICONERROR);

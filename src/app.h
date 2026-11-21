@@ -65,7 +65,16 @@ enum HitKind {
     HK_PL_PICK,     // Title bar "Songs": back to playlist page
     HK_PICKER,      // Title bar button: back to playlist picker
     HK_QUAL,        // Quality button
-    HK_QUAL_ITEM    // Quality option
+    HK_QUAL_ITEM,   // Quality option
+    HK_FRIENDS,     // Title bar: add friend
+    HK_FRI_CARD,    // Friends panel blank area
+    HK_FRI_COPY,    // Copy my friend code
+    HK_FRI_INPUT,   // Friend code input field
+    HK_FRI_ADD,     // Add by code
+    HK_FRI_INVITE,  // Invite a friend to listen together
+    HK_FRI_ACCEPT,  // Accept a request
+    HK_FRI_DECLINE, // Decline a request
+    HK_FRI_ACCEPT_INVITE
 };
 struct Hit {
     D2D1_RECT_F r{};

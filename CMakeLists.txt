@@ -31,6 +31,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(FLORAL_SOURCES
     src/main.cpp
+    src/identity.cpp
+    src/friends.cpp
+    src/rscrypt.cpp
     src/together.cpp
     src/relay.cpp
     src/json.cpp
@@ -81,7 +84,8 @@ endif()
 
 # ── Libraries ──
 target_link_libraries(floral PRIVATE
-    d2d1 dwrite windowscodecs ole32 uuid shell32 gdi32 dwmapi winmm wininet ws2_32 iphlpapi
+    d2d1 dwrite windowscodecs ole32 uuid shell32 gdi32 dwmapi winmm wininet ws2_32
+        bcrypt iphlpapi
 )
 
 # ── Per-compiler flags ──

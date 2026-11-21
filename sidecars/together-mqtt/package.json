@@ -1,8 +1,7 @@
-﻿{
-    "private":  true,
-    "name":  "floral-together",
-    "version":  "1.0.0",
-    "dependencies":  {
-                         "mqtt":  "^5.10.1"
-                     }
+{
+    "private": true,
+    "name": "floral-together",
+    "version": "2.0.0",
+    "description": "Listen-together relay client: plain TCP to the relay server, payload encrypted end to end",
+    "dependencies": {}
 }

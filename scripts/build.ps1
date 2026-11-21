@@ -48,10 +48,10 @@ try {
     }
 
     # 2) 链接
-    $src = @('main.cpp','together.cpp','relay.cpp','json.cpp','log.cpp','theme.cpp','data.cpp','audio.cpp','kugou.cpp','lang.cpp','tiles.cpp','vinyl.cpp')
+    $src = @('main.cpp','together.cpp','relay.cpp','json.cpp','log.cpp','theme.cpp','data.cpp','audio.cpp','kugou.cpp','lang.cpp','tiles.cpp','vinyl.cpp','identity.cpp','friends.cpp','rscrypt.cpp')
     if ($res) { $src += $res }
     $libs = @('-ld2d1','-ldwrite','-lwindowscodecs','-lole32','-luuid','-lshell32',
-              '-lgdi32','-ldwmapi','-lwinmm','-lwininet','-lws2_32','-liphlpapi')
+              '-lgdi32','-ldwmapi','-lwinmm','-lwininet','-lws2_32','-liphlpapi','-lbcrypt')
 
     $gpp = @('-std=c++17','-O2','-municode','-mwindows')
     if ($NoTogether) { $gpp += '-DFLORAL_NO_TOGETHER' }

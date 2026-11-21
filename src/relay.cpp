@@ -20,29 +20,38 @@ struct Line {
     bool message;   // a send, which the queue may drop
 };
 
-std::string JoinCommand(long long id, const std::string& code, const RelayBroker& broker) {
+/* The helper tries these in order, so the room opens through the first reachable relay */
+std::string JoinCommand(long long id, const std::string& code, const RelayEndpoints& relays) {
+    std::string list;
+    for (const RelayEndpoint& r : relays) {
+        if (!list.empty()) list += ',';
+        list += "{\"host\":" + JsonQuote(r.host) + ",\"port\":" + std::to_string(r.port) + "}";
+    }
     return "{\"cmd\":\"join\",\"id\":" + std::to_string(id) + ",\"code\":" + JsonQuote(code) +
-           ",\"host\":" + JsonQuote(broker.host) + ",\"port\":" + std::to_string(broker.port) +
-           ",\"user\":" + JsonQuote(broker.user) + ",\"pass\":" + JsonQuote(broker.pass) + "}";
+           ",\"relays\":[" + list + "]}";
 }
-
 }  // namespace
 
 /* The worker thread starts the helper, writes the queued lines to it and restarts it after an unexpected
    exit; a reader thread per helper process turns its output into events. mx guards the state they share */
 struct Relay::Impl {
     RelayLaunch launch = nullptr;
-    RelayBroker broker;
+    RelayEndpoints relays;
 
     std::mutex mx;
     std::condition_variable wake;
     std::deque<Event> events;
+    std::deque<CtlEvent> ctlEvents;   // control channel events, kept apart from the room's
+    long long ctlId = 0;
     std::deque<Line> lines;   // for the helper, in order
     size_t messages = 0;      // sends among lines
     bool quit = false;
 
     long long id = 0;         // of the current Join; the helper tags its events with it
     bool inRoom = false;      // from Join until Leave or Failed
+    bool ctlWanted = false;   // the control channel asked for the helper
+    bool ctlNeedsOpen = false; // reconnect the control channel once the helper is back
+    RelayEndpoints ctlRelays;
     bool joined = false;      // Joined reported
     bool down = false;        // Down reported and Up not yet
     bool rejoin = false;      // the room is to be joined again at retryAt
@@ -109,6 +118,16 @@ struct Relay::Impl {
         std::string text = textVal ? textVal->str() : "";
 
         std::lock_guard<std::mutex> lk(mx);
+        // Control events carry their own id and never touch the room state
+        if (kind.rfind("ctl-", 0) == 0) {
+            if (!tag || tag->ll() != ctlId) return;
+            CtlEvent ce;
+            ce.kind = kind == "ctl-open" ? CtlEvent::Open
+                    : kind == "ctl-down" ? CtlEvent::Down : CtlEvent::Message;
+            ce.text = std::move(text);
+            ctlEvents.push_back(std::move(ce));
+            return;
+        }
         if (!tag || tag->ll() != id) return;
         if (kind == "message") {
             Report(Event::Message, std::move(text), atMs);
@@ -148,6 +167,7 @@ struct Relay::Impl {
         const unsigned long long now = GetTickCount64();
         running = false;
         DropLines();
+        if (ctlWanted) ctlNeedsOpen = true;      // the helper died; reconnect once it is back
         if (inRoom && joined) {
             RejoinLater(now);
         } else if (inRoom) {
@@ -174,7 +194,8 @@ struct Relay::Impl {
 
             const unsigned long long now = GetTickCount64();
             const bool rejoinDue = rejoin && now >= retryAt;
-            if (inRoom && !process && (!rejoin || rejoinDue)) {
+            const bool needHelper = inRoom || ctlWanted;
+            if (needHelper && !process && (!rejoin || rejoinDue)) {
                 lk.unlock();
                 HANDLE to = nullptr, from = nullptr, proc = nullptr;
                 const bool started = launch(&to, &from, &proc);
@@ -191,12 +212,16 @@ struct Relay::Impl {
                     inRoom = false;
                     DropLines();
                     Report(Event::Failed, "relay helper could not start", GetTickCount64());
+                } else if (ctlWanted) {
+                    // Try again shortly: the sidecars may still be unpacking
+                    rejoin = true;
+                    retryAt = GetTickCount64() + kRetryMs;
                 }
                 continue;
             }
             if (rejoinDue && running) {
                 rejoin = false;
-                Queue(JoinCommand(id, code, broker), false);
+                Queue(JoinCommand(id, code, relays), false);
             }
             if (running && !lines.empty()) {
                 const std::string text = lines.front().text + '\n';
@@ -223,9 +248,9 @@ struct Relay::Impl {
     }
 };
 
-Relay::Relay(RelayLaunch launch, RelayBroker broker) : impl_(new Impl) {
+Relay::Relay(RelayLaunch launch, RelayEndpoints relays) : impl_(new Impl) {
     impl_->launch = launch;
-    impl_->broker = std::move(broker);
+    impl_->relays = std::move(relays);
     impl_->worker = std::thread(&Impl::Work, impl_.get());
 }
 
@@ -242,7 +267,7 @@ void Relay::Join(const std::string& code) {
     std::lock_guard<std::mutex> lk(impl_->mx);
     impl_->ResetRoom();
     impl_->inRoom = true;
-    impl_->Queue(JoinCommand(impl_->id, code, impl_->broker), false);
+    impl_->Queue(JoinCommand(impl_->id, code, impl_->relays), false);
 }
 
 void Relay::Leave() {
@@ -255,6 +280,35 @@ void Relay::Leave() {
 void Relay::Send(const std::string& json) {
     std::lock_guard<std::mutex> lk(impl_->mx);
     if (impl_->inRoom) impl_->Queue("{\"cmd\":\"send\",\"text\":" + JsonQuote(json) + "}", true);
+}
+
+void Relay::CtlOpen(RelayEndpoints relays) {
+    std::lock_guard<std::mutex> lk(impl_->mx);
+    impl_->ctlWanted = true;      // start the helper even when no room is joined
+    impl_->ctlNeedsOpen = false;
+    impl_->ctlRelays = relays;
+    impl_->ctlId++;
+    impl_->ctlEvents.clear();
+    std::string list;
+    for (const RelayEndpoint& r : relays) {
+        if (!list.empty()) list += ',';
+        list += "{\"host\":" + JsonQuote(r.host) + ",\"port\":" + std::to_string(r.port) + "}";
+    }
+    impl_->Queue("{\"cmd\":\"ctl-open\",\"id\":" + std::to_string(impl_->ctlId) +
+                 ",\"relays\":[" + list + "]}", false);
+}
+
+void Relay::CtlSend(const std::string& json) {
+    std::lock_guard<std::mutex> lk(impl_->mx);
+    impl_->Queue("{\"cmd\":\"ctl-send\",\"text\":" + JsonQuote(json) + "}", true);
+}
+
+bool Relay::CtlPoll(CtlEvent& ev) {
+    std::lock_guard<std::mutex> lk(impl_->mx);
+    if (impl_->ctlEvents.empty()) return false;
+    ev = std::move(impl_->ctlEvents.front());
+    impl_->ctlEvents.pop_front();
+    return true;
 }
 
 bool Relay::Poll(Event& ev) {
