@@ -10,6 +10,7 @@
  * FLORAL_VERIFY_STUB=1 accepts any credentials; local protocol tests only.
  */
 #include "control.h"
+#include "../src/json.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -48,7 +49,7 @@ std::string UrlEncode(const std::string& s) {
 }
 
 /* Plain GET over WinHTTP; returns the body, or an empty string on failure */
-std::string HttpGet(const std::wstring& url, int timeoutMs = 8000) {
+std::string HttpGet(const std::wstring& url, const std::wstring& headers = std::wstring(), int timeoutMs = 8000) {
     std::string body;
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
@@ -72,7 +73,9 @@ std::string HttpGet(const std::wstring& url, int timeoutMs = 8000) {
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!req) { WinHttpCloseHandle(conn); WinHttpCloseHandle(session); return body; }
 
-    if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+    const wchar_t* hdr = headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str();
+    const DWORD hdrLen = headers.empty() ? 0 : (DWORD)-1L;
+    if (WinHttpSendRequest(req, hdr, hdrLen, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
         WinHttpReceiveResponse(req, nullptr)) {
         for (;;) {
             DWORD avail = 0;
@@ -151,19 +154,28 @@ VerifyResult VerifyNetease(const std::string& uid, const std::string& cookie) {
     VerifyResult r;
     if (StubEnabled()) { r.ok = true; r.name = "网易云测试用户"; return r; }
 
-    // NetEase needs no request signing: the cookie alone identifies the account
-    const std::string raw = HttpGet(Widen("https://music.163.com/api/nuser/account/get?cookie=" + UrlEncode(cookie)));
+    // NetEase needs no request signing, but the session must travel as a Cookie header:
+    // the same cookie the client keeps in netease-session.json.
+    const std::string raw = HttpGet(Widen("https://music.163.com/api/nuser/account/get"),
+                                    Widen("Cookie: " + cookie + "\r\n"));
     if (raw.empty()) { r.error = "netease-unreachable"; return r; }
-    if (raw.find("\"account\":null") != std::string::npos || raw.find("\"code\":200") == std::string::npos) {
-        r.error = "token-rejected";
+
+    const JVal* account = nullptr;
+    JVal root;
+    if (Json(raw, root)) {
+        account = root.get("account");
+        if (!account || account->t != JVal::OBJ) { r.error = "token-rejected"; return r; }
+        const std::string uid2 = account->get("id") ? std::to_string(account->get("id")->ll()) : "";
+        if (!uid2.empty() && !uid.empty() && uid2 != uid) { r.error = "uid-mismatch"; return r; }
+        if (const JVal* profile = root.get("profile")) {
+            if (const JVal* nick = profile->get("nickname")) r.name = nick->str();
+        }
+    } else {
+        if (raw.find("\"account\":null") != std::string::npos) { r.error = "token-rejected"; return r; }
+        r.error = "netease-bad-response";
         return r;
     }
-    const std::string uid2 = JsonField(raw, "id");
-    if (!uid2.empty() && uid2 != uid) { r.error = "uid-mismatch"; return r; }
-
-    r.name = JsonField(raw, "nickname");
     r.ok = true;
     return r;
 }
-
 }  // namespace ctl
